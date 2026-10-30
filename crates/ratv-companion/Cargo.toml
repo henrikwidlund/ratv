@@ -1,0 +1,25 @@
+[package]
+name = "ratv-companion"
+description = "Apple TV Companion protocol (framing, encryption, messages), sans-IO"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ratv-codec.workspace = true
+ratv-hap.workspace = true
+bytes = "1"
+thiserror = "2"
+
+[dev-dependencies]
+criterion.workspace = true
+ratv-hap = { workspace = true, features = ["accessory"] }
+proptest = "1"
+
+[[bench]]
+name = "connection"
+harness = false
+
+[lints]
+workspace = true

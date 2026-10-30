@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f88224d69244295b71734bd84a9d4330307b28fca617409b03bc95c23b3e07a6 # shrinks to v = Dict([(Dict([(Str(""), Null), (Float(0.0), Null), (Float(0.0), Null)]), Null)])

@@ -1,0 +1,21 @@
+[package]
+name = "ratv-codec"
+description = "Wire formats used by Apple TV protocols (OPACK, TLV8, binary plist)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+criterion.workspace = true
+proptest = "1"
+
+[[bench]]
+name = "codec"
+harness = false
+
+[lints]
+workspace = true

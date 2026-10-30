@@ -1,0 +1,138 @@
+# ratv
+
+Rust library to control Apple TV devices on the local network.
+
+Protocols:
+
+- **Companion**: pairing, buttons, apps, power, volume, accounts, text input, touch.
+- **MRP over AirPlay 2**: now playing, artwork, playback, languages, chapters,
+  Up Next, volume, output devices, Siri voice input.
+
+`AppleTv` connects with both protocols. Each method uses the protocol that
+supports it.
+
+The protocol crates do no I/O. They take bytes and return bytes. The `ratv`
+crate runs them with tokio.
+
+## Platforms
+
+Linux, macOS and Windows on x64 and arm64. ARM Linux:
+`aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`.
+No C dependencies.
+
+Minimum Rust version: 1.88.
+
+## Usage
+
+```toml
+[dependencies]
+ratv = { git = "https://github.com/henrikwidlund/ratv" }
+tokio = { version = "1", features = ["macros", "rt"] }
+```
+
+Pair one time with the PIN that the TV shows. Save the credentials.
+They work for Companion and MRP.
+
+```rust
+use ratv::companion::{self, PairOptions};
+
+let addr = "192.168.1.20:49153".parse()?; // _companion-link._tcp
+let prompt = companion::pair(addr, &PairOptions::default()).await?;
+let credentials = prompt.finish("1234").await?;
+std::fs::write("tv.credentials", credentials.to_string())?;
+```
+
+Find the device and connect:
+
+```rust
+use ratv::discovery::{ScanOptions, scan};
+use ratv::{AppleTv, ConnectOptions, Endpoints, Key};
+
+let devices = scan(&ScanOptions::default()).await?;
+let credentials = std::fs::read_to_string("tv.credentials")?.parse()?;
+let tv = AppleTv::connect(&Endpoints::from(&devices[0]), &credentials, &ConnectOptions::default()).await?;
+
+tv.press(Key::Select).await?;
+tv.pause().await?;
+tv.launch_app("com.netflix.Netflix").await?;
+if let Some(mut np) = tv.now_playing() {
+    np.changed().await?;
+    println!("{:?}", np.borrow().title);
+}
+```
+
+Siri voice input. Audio is Opus, 16 kHz, mono, 20 ms per packet:
+
+```rust
+let mut siri = tv.start_siri().await?; // returns when the TV records
+for packet in packets {
+    siri.send(packet).await?;          // send each packet after 20 ms
+}
+siri.finish().await?;                  // the TV then answers
+```
+
+## Features
+
+| Feature     | Default | Content            |
+|-------------|---------|--------------------|
+| `companion` | yes     | Companion protocol |
+| `mrp`       | yes     | MRP over AirPlay 2 |
+| `discovery` | yes     | mDNS scan          |
+
+`AppleTv` needs `companion` and `mrp`. Small build for ARM:
+
+```sh
+cargo build -p ratv --no-default-features --features companion --profile embedded --target armv7-unknown-linux-gnueabihf
+```
+
+## Crates
+
+| Crate            | Content                                        |
+|------------------|------------------------------------------------|
+| `ratv`           | Public API, tokio                              |
+| `ratv-codec`     | TLV8, OPACK, binary plist                      |
+| `ratv-hap`       | HAP pairing and encryption                     |
+| `ratv-companion` | Companion frames and messages                  |
+| `ratv-airplay`   | AirPlay 2 RTSP, encrypted channel, data stream |
+| `ratv-mrp`       | MRP messages and player state                  |
+| `ratv-discovery` | mDNS queries and TXT records                   |
+
+## Examples
+
+```sh
+cargo run --example scan                                   # list devices
+cargo run --example companion -- 192.168.1.20:49153 pair   # pair, print credentials
+cargo run --example remote -- "$CREDENTIALS" play          # send a command to the first device
+cargo run --example remote -- "$CREDENTIALS" watch         # print now playing changes
+```
+
+Each file in [`crates/ratv/examples`](crates/ratv/examples) lists its commands at the top.
+
+## Development
+
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets --all-features
+cargo test --workspace --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+cargo deny check
+```
+
+Fuzz targets: [`fuzz`](fuzz), for example `cargo +nightly fuzz run opack`.
+`cargo run -p proto-gen` creates `crates/ratv-mrp/src/generated.rs` from the `.proto` files.
+
+## Credits
+
+- [bunatv](https://github.com/JarekToro/bunatv) by JarekToro (MIT, from its
+  `package.json`): main protocol reference. The `.proto` files in
+  [`crates/ratv-mrp/proto`](crates/ratv-mrp/proto) are from bunatv. They
+  describe Apple's message formats and come from Apple frameworks on macOS.
+- [pyatv](https://github.com/postlund/pyatv) (MIT): second protocol reference.
+
+This project is not made or supported by Apple. Apple TV, AirPlay and Siri
+are trademarks of Apple Inc.
+
+## License
+
+MIT ([LICENSE-MIT](LICENSE-MIT)) or Apache-2.0 ([LICENSE-APACHE](LICENSE-APACHE)).
+You can choose one.

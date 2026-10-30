@@ -1,0 +1,76 @@
+[package]
+name = "ratv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+ratv-codec = { path = "../crates/ratv-codec" }
+ratv-companion = { path = "../crates/ratv-companion" }
+ratv-airplay = { path = "../crates/ratv-airplay" }
+ratv-mrp = { path = "../crates/ratv-mrp" }
+ratv-discovery = { path = "../crates/ratv-discovery" }
+
+# Not part of the main workspace: needs nightly and cargo-fuzz.
+[workspace]
+
+[[bin]]
+name = "opack"
+path = "fuzz_targets/opack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tlv8"
+path = "fuzz_targets/tlv8.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bplist"
+path = "fuzz_targets/bplist.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http"
+path = "fuzz_targets/http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "companion"
+path = "fuzz_targets/companion.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mrp"
+path = "fuzz_targets/mrp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "txt"
+path = "fuzz_targets/txt.rs"
+test = false
+doc = false
+bench = false

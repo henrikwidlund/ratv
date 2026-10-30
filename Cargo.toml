@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "tools/proto-gen"]
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+ratv-codec = { path = "crates/ratv-codec", version = "0.1.0" }
+ratv-hap = { path = "crates/ratv-hap", version = "0.1.0" }
+ratv-companion = { path = "crates/ratv-companion", version = "0.1.0" }
+ratv-discovery = { path = "crates/ratv-discovery", version = "0.1.0" }
+ratv-airplay = { path = "crates/ratv-airplay", version = "0.1.0" }
+ratv-mrp = { path = "crates/ratv-mrp", version = "0.1.0" }
+bytes = "1"
+thiserror = "2"
+proptest = "1"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+# `expect` is only used for invariants that cannot fail.
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Size-optimized profile for embedded targets: `cargo build --profile embedded`.
+[profile.embedded]
+inherits = "release"
+opt-level = "s"
+strip = true

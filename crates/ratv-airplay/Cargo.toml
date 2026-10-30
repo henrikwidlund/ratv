@@ -1,0 +1,20 @@
+[package]
+name = "ratv-airplay"
+description = "AirPlay 2 control transport (RTSP, HAP framing, event and data streams), sans-IO"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ratv-codec.workspace = true
+ratv-hap.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ratv-hap = { workspace = true, features = ["accessory"] }
+proptest.workspace = true
+
+[lints]
+workspace = true

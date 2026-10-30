@@ -1,0 +1,24 @@
+[package]
+name = "ratv-mrp"
+description = "Apple Media Remote Protocol (MRP) messages and player state, sans-IO"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ratv-codec.workspace = true
+prost = { version = "0.14", default-features = false, features = ["std", "derive"] }
+bytes.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "mrp"
+harness = false
+
+[lints]
+workspace = true

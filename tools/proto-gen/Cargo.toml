@@ -1,0 +1,10 @@
+[package]
+name = "proto-gen"
+description = "Generates Rust code for the MRP protobuf messages"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+prost-build = "0.14"
+protox = "0.10"

@@ -1,0 +1,72 @@
+[package]
+name = "ratv"
+description = "Control Apple TV devices: pairing, remote control, media, apps and power"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["apple-tv", "airplay", "companion", "remote", "homekit"]
+categories = ["network-programming", "api-bindings"]
+
+[features]
+default = ["companion", "discovery", "mrp"]
+companion = ["dep:ratv-companion"]
+discovery = ["dep:ratv-discovery"]
+mrp = ["dep:ratv-airplay", "dep:ratv-mrp"]
+
+[dependencies]
+ratv-codec.workspace = true
+ratv-hap.workspace = true
+ratv-companion = { workspace = true, optional = true }
+ratv-discovery = { workspace = true, optional = true }
+ratv-airplay = { workspace = true, optional = true }
+ratv-mrp = { workspace = true, optional = true }
+bytes.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "sync", "time", "rt", "macros"] }
+getrandom = { version = "0.4", features = ["sys_rng"] }
+rand_core = "0.10"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+ratv-hap = { workspace = true, features = ["accessory"] }
+ratv-companion.workspace = true
+tokio = { version = "1", features = ["full", "test-util"] }
+ed25519-dalek = "3"
+prost = { version = "0.14", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "companion"
+required-features = ["companion"]
+
+[[example]]
+name = "mrp"
+required-features = ["mrp"]
+
+[[example]]
+name = "item_probe"
+required-features = ["mrp"]
+
+[[example]]
+name = "voice_probe"
+required-features = ["companion", "mrp", "discovery"]
+
+[[example]]
+name = "remote"
+required-features = ["companion", "mrp", "discovery"]
+
+[[example]]
+name = "scan"
+required-features = ["discovery"]
+
+[[test]]
+name = "companion"
+required-features = ["companion"]
+
+[[test]]
+name = "mrp"
+required-features = ["mrp"]
+
+[lints]
+workspace = true
