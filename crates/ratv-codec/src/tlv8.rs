@@ -145,13 +145,13 @@ impl<'a> Tlv8<'a> {
 
     /// Number of items after joining fragments.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.items.len()
     }
 
     /// Returns true if there are no items.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 }

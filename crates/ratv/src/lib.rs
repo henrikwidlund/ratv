@@ -48,4 +48,8 @@ mod touch;
 #[cfg(all(feature = "companion", feature = "mrp"))]
 pub use apple_tv::{AppleTv, ConnectOptions, Endpoints, Key};
 pub use error::Error;
+
+#[cfg(all(doctest, feature = "companion", feature = "mrp", feature = "discovery"))]
+#[doc = include_str!("../../../README.md")]
+struct ReadmeDoctests;
 pub use ratv_hap::Credentials;

@@ -21,7 +21,7 @@ pub enum Flow {
 impl Flow {
     /// Frame type for the first (`first == true`) or a later message.
     #[must_use]
-    pub fn frame_type(self, first: bool) -> FrameType {
+    pub const fn frame_type(self, first: bool) -> FrameType {
         match (self, first) {
             (Self::Setup, true) => FrameType::PAIR_SETUP_START,
             (Self::Setup, false) => FrameType::PAIR_SETUP_NEXT,

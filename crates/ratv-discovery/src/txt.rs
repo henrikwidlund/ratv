@@ -18,10 +18,10 @@ impl Txt {
             if item.is_empty() {
                 continue;
             }
-            let (k, v) = match item.iter().position(|&b| b == b'=') {
-                Some(i) => (&item[..i], &item[i + 1..]),
-                None => (item, &[][..]),
-            };
+            let (k, v) = item
+                .iter()
+                .position(|&b| b == b'=')
+                .map_or((item, &[][..]), |i| (&item[..i], &item[i + 1..]));
             entries.push((
                 String::from_utf8_lossy(k).into_owned(),
                 String::from_utf8_lossy(v).into_owned(),
@@ -46,13 +46,13 @@ impl Txt {
 
     /// Number of entries.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Returns true if there are no entries.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }

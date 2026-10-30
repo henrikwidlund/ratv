@@ -1014,7 +1014,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "criterion",
- "proptest",
  "ratv-codec",
  "ratv-hap",
  "thiserror",
@@ -1037,7 +1036,6 @@ dependencies = [
  "ed25519-dalek",
  "hkdf",
  "num-bigint",
- "proptest",
  "rand_core 0.10.1",
  "ratv-codec",
  "sha2",

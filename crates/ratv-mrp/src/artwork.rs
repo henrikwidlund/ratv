@@ -52,7 +52,7 @@ pub fn artwork(env: &Envelope) -> Result<Option<Artwork>, Error> {
 }
 
 /// MIME type from the first bytes of an image.
-fn sniff(data: &[u8]) -> Option<&'static str> {
+const fn sniff(data: &[u8]) -> Option<&'static str> {
     match data {
         [0xff, 0xd8, 0xff, ..] => Some("image/jpeg"),
         [0x89, b'P', b'N', b'G', ..] => Some("image/png"),

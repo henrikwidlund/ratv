@@ -7,11 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-thiserror = "2"
+thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-proptest = "1"
+proptest.workspace = true
 
 [[bench]]
 name = "codec"

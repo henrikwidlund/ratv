@@ -25,15 +25,15 @@ bytes.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["net", "io-util", "sync", "time", "rt", "macros"] }
 getrandom = { version = "0.4", features = ["sys_rng"] }
-rand_core = "0.10"
+rand_core.workspace = true
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 ratv-hap = { workspace = true, features = ["accessory"] }
 ratv-companion.workspace = true
 tokio = { version = "1", features = ["full", "test-util"] }
-ed25519-dalek = "3"
-prost = { version = "0.14", default-features = false, features = ["std"] }
+ed25519-dalek.workspace = true
+prost.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[example]]

@@ -200,18 +200,15 @@ impl Session {
             ("Client-Instance", self.dacp_id.as_str()),
             ("Content-Type", ""),
         ];
-        let n = match content_type {
-            Some(t) => {
-                headers[5].1 = t;
-                6
-            }
-            None => 5,
-        };
+        let n = content_type.map_or(5, |t| {
+            headers[5].1 = t;
+            6
+        });
         ch.send_request(method, &self.url, RTSP, &headers[..n], body);
         cseq
     }
 
-    fn next(&mut self) -> u32 {
+    const fn next(&mut self) -> u32 {
         let c = self.cseq;
         self.cseq = self.cseq.wrapping_add(1);
         c
@@ -219,7 +216,7 @@ impl Session {
 }
 
 /// Checks the status and returns the decoded plist body.
-fn plist_body(resp: &Message) -> Result<bplist::Value<'static>, Error> {
+fn plist_body(resp: &Message) -> Result<Value<'static>, Error> {
     check(resp)?;
     Ok(bplist::decode(&resp.body())?.into_owned())
 }

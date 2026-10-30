@@ -28,7 +28,7 @@ impl ServiceKind {
 
     /// mDNS service name, for example `_airplay._tcp.local`.
     #[must_use]
-    pub fn service_name(self) -> &'static str {
+    pub const fn service_name(self) -> &'static str {
         match self {
             Self::Companion => "_companion-link._tcp.local",
             Self::AirPlay => "_airplay._tcp.local",
@@ -267,21 +267,22 @@ impl Collector {
                 port: *port,
                 txt: inst.txt.clone().unwrap_or_default(),
             };
-            let index = if let Some(i) = devices.iter().position(|d| d.host == *host) {
-                i
-            } else {
-                let mut addresses = self.addresses.get(host).cloned().unwrap_or_default();
-                if addresses.is_empty() {
-                    addresses.extend(inst.source);
-                }
-                addresses.sort_by_key(IpAddr::is_ipv6);
-                devices.push(Device {
-                    host: host.clone(),
-                    addresses,
-                    services: Vec::new(),
+            let index = devices
+                .iter()
+                .position(|d| d.host == *host)
+                .unwrap_or_else(|| {
+                    let mut addresses = self.addresses.get(host).cloned().unwrap_or_default();
+                    if addresses.is_empty() {
+                        addresses.extend(inst.source);
+                    }
+                    addresses.sort_by_key(IpAddr::is_ipv6);
+                    devices.push(Device {
+                        host: host.clone(),
+                        addresses,
+                        services: Vec::new(),
+                    });
+                    devices.len() - 1
                 });
-                devices.len() - 1
-            };
             devices[index].services.push(service);
         }
         devices
@@ -378,7 +379,7 @@ mod tests {
         let d = &c.devices()[0];
         assert_eq!(d.identifier(), Some("U1"));
         assert_eq!(d.model(), Some("Apple TV"));
-        assert!(d.addresses.is_empty());
+        assert_eq!(d.addresses, Vec::<IpAddr>::new());
         assert_eq!(d.socket_addr(ServiceKind::MediaRemote), None);
 
         let d = Device {
@@ -402,7 +403,7 @@ mod tests {
         c.add(&info.finish(), None).unwrap();
         assert!(c.follow_up_query().is_none());
         c.add(&r.finish(), None).unwrap();
-        assert!(c.devices().is_empty());
+        assert_eq!(c.devices(), []);
         assert!(!c.is_complete());
         let q = c.follow_up_query().unwrap();
         assert_eq!(q[4..6], [0, 2]);

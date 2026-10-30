@@ -176,7 +176,7 @@ impl Client {
 
     /// Sends a request and returns the raw response payload.
     /// Decode it with [`Message::decode`]. Device errors are returned as `Err`.
-    pub async fn request<M: Outgoing>(&self, msg: &M) -> Result<Bytes, Error> {
+    pub async fn request<M: Outgoing + Sync>(&self, msg: &M) -> Result<Bytes, Error> {
         let xid = self.next_xid();
         let mut payload = Vec::with_capacity(64);
         message::encode(msg, xid, &mut payload);
@@ -200,7 +200,7 @@ impl Client {
     }
 
     /// Sends an event (no response).
-    pub async fn send_event<M: Outgoing>(&self, msg: &M) -> Result<(), Error> {
+    pub async fn send_event<M: Outgoing + Sync>(&self, msg: &M) -> Result<(), Error> {
         let mut payload = Vec::with_capacity(64);
         message::encode(msg, self.next_xid(), &mut payload);
         self.commands
@@ -217,7 +217,7 @@ impl Client {
 
     /// Combined session id.
     #[must_use]
-    pub fn session_id(&self) -> u64 {
+    pub const fn session_id(&self) -> u64 {
         self.session_id
     }
 

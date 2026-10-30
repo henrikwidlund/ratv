@@ -69,15 +69,15 @@ pub enum Value<'a> {
     /// Keyed archiver UID.
     Uid(u64),
     /// Array.
-    Array(Vec<Value<'a>>),
+    Array(Vec<Self>),
     /// Dictionary with string keys, in plist order.
-    Dict(Vec<(Cow<'a, str>, Value<'a>)>),
+    Dict(Vec<(Cow<'a, str>, Self)>),
 }
 
 impl<'a> Value<'a> {
     /// Value for `key` if this is a dictionary.
     #[must_use]
-    pub fn get(&self, key: &str) -> Option<&Value<'a>> {
+    pub fn get(&self, key: &str) -> Option<&Self> {
         self.as_dict()?
             .iter()
             .find_map(|(k, v)| (k == key).then_some(v))
@@ -85,7 +85,7 @@ impl<'a> Value<'a> {
 
     /// Boolean value.
     #[must_use]
-    pub fn as_bool(&self) -> Option<bool> {
+    pub const fn as_bool(&self) -> Option<bool> {
         match *self {
             Value::Bool(b) => Some(b),
             _ => None,
@@ -94,7 +94,7 @@ impl<'a> Value<'a> {
 
     /// Integer value.
     #[must_use]
-    pub fn as_i64(&self) -> Option<i64> {
+    pub const fn as_i64(&self) -> Option<i64> {
         match *self {
             Value::Int(v) => Some(v),
             _ => None,
@@ -110,7 +110,7 @@ impl<'a> Value<'a> {
     /// Number as `f64`. Integers are converted.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
-    pub fn as_f64(&self) -> Option<f64> {
+    pub const fn as_f64(&self) -> Option<f64> {
         match *self {
             Value::Real(v) => Some(v),
             Value::Int(v) => Some(v as f64),
@@ -138,7 +138,7 @@ impl<'a> Value<'a> {
 
     /// Array items.
     #[must_use]
-    pub fn as_array(&self) -> Option<&[Value<'a>]> {
+    pub fn as_array(&self) -> Option<&[Self]> {
         match self {
             Value::Array(a) => Some(a),
             _ => None,
@@ -147,7 +147,7 @@ impl<'a> Value<'a> {
 
     /// Dictionary entries.
     #[must_use]
-    pub fn as_dict(&self) -> Option<&[(Cow<'a, str>, Value<'a>)]> {
+    pub fn as_dict(&self) -> Option<&[(Cow<'a, str>, Self)]> {
         match self {
             Value::Dict(d) => Some(d),
             _ => None,
@@ -257,8 +257,8 @@ impl From<f64> for Value<'_> {
     }
 }
 
-impl<'a> From<Vec<Value<'a>>> for Value<'a> {
-    fn from(v: Vec<Value<'a>>) -> Self {
+impl From<Vec<Self>> for Value<'_> {
+    fn from(v: Vec<Self>) -> Self {
         Value::Array(v)
     }
 }
@@ -326,7 +326,7 @@ impl Writer<'_> {
         }
     }
 
-    fn alloc(&mut self, n: usize) -> usize {
+    const fn alloc(&mut self, n: usize) -> usize {
         let first = self.next;
         self.next += n;
         first
@@ -367,7 +367,7 @@ impl Writer<'_> {
 }
 
 /// Smallest of 1, 2, 4 or 8 bytes that holds `v`.
-fn int_size(v: u64) -> usize {
+const fn int_size(v: u64) -> usize {
     match v {
         0..=0xFF => 1,
         0x100..=0xFFFF => 2,
@@ -460,7 +460,7 @@ impl<'a> Reader<'a> {
             0x6 => {
                 let len = self.len(low, &mut pos)?;
                 let b = self.bytes(pos, len.checked_mul(2).ok_or(Error::UnexpectedEof)?)?;
-                let units = b.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]]));
+                let units = b.as_chunks::<2>().0.iter().map(|&c| u16::from_be_bytes(c));
                 let s = char::decode_utf16(units)
                     .collect::<Result<String, _>>()
                     .map_err(|_| Error::InvalidString)?;
@@ -567,7 +567,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn next_depth(depth: usize) -> Result<usize, Error> {
+const fn next_depth(depth: usize) -> Result<usize, Error> {
     if depth >= MAX_DEPTH {
         Err(Error::TooDeep)
     } else {

@@ -35,6 +35,9 @@ pub enum Error {
     /// No text field has focus on the device.
     #[error("no text field has focus")]
     NoTextField,
+    /// Another Siri session is active.
+    #[error("Siri is already active")]
+    SiriActive,
     /// The item has no next or previous chapter.
     #[error("no such chapter")]
     NoChapter,

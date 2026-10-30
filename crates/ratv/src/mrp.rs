@@ -21,7 +21,7 @@
 //! ```
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -61,7 +61,8 @@ pub struct Siri<'a> {
     client: &'a Client,
     /// Sample number of the next packet.
     sample: u32,
-    finished: bool,
+    /// True while the button is held.
+    held: bool,
 }
 
 impl Siri<'_> {
@@ -76,16 +77,18 @@ impl Siri<'_> {
 
     /// Releases Siri. The device then answers.
     pub async fn finish(mut self) -> Result<(), Error> {
-        self.finished = true;
-        self.client.button(Button::Siri, false).await
+        let result = self.client.button(Button::Siri, false).await;
+        self.held = false;
+        result
     }
 }
 
 impl Drop for Siri<'_> {
     fn drop(&mut self) {
-        if !self.finished {
-            self.client.try_send(&Button::Siri.event(false));
+        if self.held {
+            self.client.send_now(&Button::Siri.event(false));
         }
+        self.client.siri_active.store(false, Ordering::Release);
     }
 }
 
@@ -277,6 +280,8 @@ pub struct Client {
     task: JoinHandle<()>,
     /// Voice input device id, registered on first use of Siri.
     voice_device: tokio::sync::OnceCell<i32>,
+    /// True while a [`Siri`] exists.
+    siri_active: AtomicBool,
 }
 
 impl Client {
@@ -368,6 +373,7 @@ impl Client {
             output_uid,
             next_id: AtomicU32::new(6),
             voice_device: tokio::sync::OnceCell::new(),
+            siri_active: AtomicBool::new(false),
             timeout: options.timeout,
             task,
         })
@@ -375,7 +381,7 @@ impl Client {
 
     /// Device info from the connection handshake.
     #[must_use]
-    pub fn device_info(&self) -> &proto::DeviceInfoMessage {
+    pub const fn device_info(&self) -> &proto::DeviceInfoMessage {
         &self.device
     }
 
@@ -443,10 +449,21 @@ impl Client {
     /// [`Siri::send`] and release Siri with [`Siri::finish`].
     ///
     /// Registers a voice input device on first use.
+    /// Fails with [`Error::SiriActive`] while another [`Siri`] exists.
     pub async fn start_siri(&self) -> Result<Siri<'_>, Error> {
+        if self.siri_active.swap(true, Ordering::AcqRel) {
+            return Err(Error::SiriActive);
+        }
+        // Releases the button and the flag if a step fails or the future is dropped.
+        let mut siri = Siri {
+            client: self,
+            sample: 0,
+            held: false,
+        };
         self.voice_device().await?;
         let mut messages = self.messages();
         self.button(Button::Siri, true).await?;
+        siri.held = true;
         // Audio sent before the device asks for it is lost.
         let recording = async {
             loop {
@@ -457,21 +474,8 @@ impl Client {
                 }
             }
         };
-        let result = match tokio::time::timeout(self.timeout, recording).await {
-            Ok(r) => r,
-            Err(e) => Err(e.into()),
-        };
-        match result {
-            Ok(()) => Ok(Siri {
-                client: self,
-                sample: 0,
-                finished: false,
-            }),
-            Err(err) => {
-                let _ = self.button(Button::Siri, false).await;
-                Err(err)
-            }
-        }
+        tokio::time::timeout(self.timeout, recording).await??;
+        Ok(siri)
     }
 
     async fn voice_device(&self) -> Result<i32, Error> {
@@ -492,16 +496,22 @@ impl Client {
             .copied()
     }
 
-    /// Queues a message without waiting. Returns `false` if the queue is full or closed.
-    fn try_send<P: Payload>(&self, msg: &P) -> bool {
+    /// Queues a message without waiting. If the queue is full, a task sends it.
+    fn send_now<P: Payload>(&self, msg: &P) {
         let mut payload = BytesMut::new();
         encode(msg, None, &mut payload);
-        self.requests
-            .try_send(Request::Send {
-                payload,
-                reply: None,
-            })
-            .is_ok()
+        let request = Request::Send {
+            payload,
+            reply: None,
+        };
+        if let Err(mpsc::error::TrySendError::Full(request)) = self.requests.try_send(request)
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let requests = self.requests.clone();
+            runtime.spawn(async move {
+                let _ = requests.send(request).await;
+            });
+        }
     }
 
     /// Sends a button down or up event.

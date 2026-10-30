@@ -63,7 +63,7 @@ fn write_rest(headers: &[(&str, &str)], body: &[u8], out: &mut BytesMut) {
 }
 
 /// Formats a number without allocating on the heap for the digits.
-pub(crate) fn itoa(mut v: u64) -> Digits {
+pub(crate) const fn itoa(mut v: u64) -> Digits {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
     loop {

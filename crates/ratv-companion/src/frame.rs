@@ -39,7 +39,7 @@ pub struct Frame {
     pub payload: Bytes,
 }
 
-pub(crate) fn header(ty: FrameType, len: usize) -> [u8; HEADER_LEN] {
+pub(crate) const fn header(ty: FrameType, len: usize) -> [u8; HEADER_LEN] {
     let l = (len as u32).to_be_bytes();
     [ty.0, l[1], l[2], l[3]]
 }

@@ -140,7 +140,7 @@ pub struct ClientIdentity<'a> {
 impl Verified {
     /// Returns true if pairing was started as transient.
     #[must_use]
-    pub fn is_transient(&self) -> bool {
+    pub const fn is_transient(&self) -> bool {
         self.transient
     }
 

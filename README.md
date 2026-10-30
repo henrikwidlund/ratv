@@ -16,8 +16,8 @@ crate runs them with tokio.
 
 ## Platforms
 
-Linux, macOS and Windows on x64 and arm64. ARM Linux:
-`aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`.
+Linux, macOS and Windows on x64 and arm64, including ARM Linux boards
+(`aarch64-unknown-linux-gnu`).
 No C dependencies.
 
 Minimum Rust version: 1.88.
@@ -36,39 +36,48 @@ They work for Companion and MRP.
 ```rust
 use ratv::companion::{self, PairOptions};
 
-let addr = "192.168.1.20:49153".parse()?; // _companion-link._tcp
-let prompt = companion::pair(addr, &PairOptions::default()).await?;
-let credentials = prompt.finish("1234").await?;
-std::fs::write("tv.credentials", credentials.to_string())?;
+async fn pair() -> Result<(), Box<dyn std::error::Error>> {
+    let addr = "192.168.1.20:49153".parse()?; // _companion-link._tcp
+    let prompt = companion::pair(addr, &PairOptions::default()).await?;
+    let credentials = prompt.finish("1234").await?;
+    std::fs::write("tv.credentials", credentials.to_string())?;
+    Ok(())
+}
 ```
 
 Find the device and connect:
 
 ```rust
 use ratv::discovery::{ScanOptions, scan};
-use ratv::{AppleTv, ConnectOptions, Endpoints, Key};
+use ratv::{AppleTv, ConnectOptions, Credentials, Endpoints, Key};
 
-let devices = scan(&ScanOptions::default()).await?;
-let credentials = std::fs::read_to_string("tv.credentials")?.parse()?;
-let tv = AppleTv::connect(&Endpoints::from(&devices[0]), &credentials, &ConnectOptions::default()).await?;
+async fn control() -> Result<(), Box<dyn std::error::Error>> {
+    let devices = scan(&ScanOptions::default()).await?;
+    let credentials: Credentials = std::fs::read_to_string("tv.credentials")?.parse()?;
+    let endpoints = Endpoints::from(&devices[0]);
+    let tv = AppleTv::connect(&endpoints, &credentials, &ConnectOptions::default()).await?;
 
-tv.press(Key::Select).await?;
-tv.pause().await?;
-tv.launch_app("com.netflix.Netflix").await?;
-if let Some(mut np) = tv.now_playing() {
-    np.changed().await?;
-    println!("{:?}", np.borrow().title);
+    tv.press(Key::Select).await?;
+    tv.pause().await?;
+    tv.launch_app("com.netflix.Netflix").await?;
+    if let Some(mut np) = tv.now_playing() {
+        np.changed().await?;
+        println!("{:?}", np.borrow().title);
+    }
+    Ok(())
 }
 ```
 
 Siri voice input. Audio is Opus, 16 kHz, mono, 20 ms per packet:
 
 ```rust
-let mut siri = tv.start_siri().await?; // returns when the TV records
-for packet in packets {
-    siri.send(packet).await?;          // send each packet after 20 ms
+async fn ask_siri(tv: &ratv::AppleTv, packets: Vec<Vec<u8>>) -> Result<(), ratv::Error> {
+    let mut siri = tv.start_siri().await?; // returns when the TV records
+    for packet in packets {
+        siri.send(packet).await?;          // send each packet after 20 ms
+    }
+    siri.finish().await                    // the TV then answers
 }
-siri.finish().await?;                  // the TV then answers
 ```
 
 ## Features
@@ -79,10 +88,10 @@ siri.finish().await?;                  // the TV then answers
 | `mrp`       | yes     | MRP over AirPlay 2 |
 | `discovery` | yes     | mDNS scan          |
 
-`AppleTv` needs `companion` and `mrp`. Small build for ARM:
+`AppleTv` needs `companion` and `mrp`. Small build for ARM boards:
 
 ```sh
-cargo build -p ratv --no-default-features --features companion --profile embedded --target armv7-unknown-linux-gnueabihf
+cargo build -p ratv --no-default-features --features companion --profile embedded --target aarch64-unknown-linux-gnu
 ```
 
 ## Crates

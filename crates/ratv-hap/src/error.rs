@@ -29,7 +29,7 @@ pub enum DeviceError {
 }
 
 impl DeviceError {
-    pub(crate) fn from_code(code: u8, backoff: Option<u16>) -> Self {
+    pub(crate) const fn from_code(code: u8, backoff: Option<u16>) -> Self {
         match code {
             1 => Self::Unknown,
             2 => Self::Authentication,
@@ -44,7 +44,7 @@ impl DeviceError {
 
     /// Returns the TLV error code.
     #[must_use]
-    pub fn code(self) -> u8 {
+    pub const fn code(self) -> u8 {
         match self {
             Self::Unknown => 1,
             Self::Authentication => 2,

@@ -95,7 +95,7 @@ pub enum Key {
 }
 
 impl Key {
-    fn hid(self) -> Option<HidCommand> {
+    const fn hid(self) -> Option<HidCommand> {
         Some(match self {
             Self::Up => HidCommand::Up,
             Self::Down => HidCommand::Down,
@@ -120,7 +120,7 @@ impl Key {
         })
     }
 
-    fn button(self) -> Option<Button> {
+    const fn button(self) -> Option<Button> {
         Some(match self {
             Self::Up => Button::Up,
             Self::Down => Button::Down,
@@ -191,13 +191,13 @@ impl AppleTv {
 
     /// Companion client, if connected.
     #[must_use]
-    pub fn companion(&self) -> Option<&companion::Client> {
+    pub const fn companion(&self) -> Option<&companion::Client> {
         self.companion.as_ref()
     }
 
     /// MRP client, if connected.
     #[must_use]
-    pub fn mrp(&self) -> Option<&mrp::Client> {
+    pub const fn mrp(&self) -> Option<&mrp::Client> {
         self.mrp.as_ref()
     }
 

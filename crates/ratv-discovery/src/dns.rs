@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(&msg[12..21], b"\x08_airplay");
         assert_eq!(&msg[msg.len() - 4..], &[0, 12, 0, 1]);
         // A query has no records.
-        assert!(parse(&msg).unwrap().is_empty());
+        assert_eq!(parse(&msg).unwrap(), []);
     }
 
     #[test]

@@ -30,7 +30,7 @@ impl Channel {
 
     /// True after [`Channel::enable_encryption`].
     #[must_use]
-    pub fn is_encrypted(&self) -> bool {
+    pub const fn is_encrypted(&self) -> bool {
         self.cipher.is_some()
     }
 

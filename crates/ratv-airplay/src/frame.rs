@@ -94,8 +94,7 @@ mod tests {
         let mut tx = FrameCipher::new(&[0x42; 32], &[0; 32]);
         let mut wire = BytesMut::new();
         tx.seal(b"hi", &mut wire);
-        let mut c =
-            ratv_hap::cipher::SessionCipher::new(&[0; 32], &[0x42; 32], NonceLayout::CounterLast);
+        let mut c = SessionCipher::new(&[0; 32], &[0x42; 32], NonceLayout::CounterLast);
         let mut data = [wire[2], wire[3]];
         let tag: [u8; 16] = wire[4..].try_into().unwrap();
         c.open_in_place(&wire[..2], &mut data, &tag).unwrap();

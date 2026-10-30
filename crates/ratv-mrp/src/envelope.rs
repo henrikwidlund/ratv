@@ -68,7 +68,7 @@ impl Envelope {
 
     /// `ProtocolMessage.type`.
     #[must_use]
-    pub fn kind(&self) -> i32 {
+    pub const fn kind(&self) -> i32 {
         self.kind
     }
 
@@ -82,7 +82,7 @@ impl Envelope {
 
     /// `ErrorCode` value, 0 for no error.
     #[must_use]
-    pub fn error_code(&self) -> i32 {
+    pub const fn error_code(&self) -> i32 {
         self.error_code
     }
 
@@ -96,7 +96,7 @@ impl Envelope {
 
     /// Sender timestamp.
     #[must_use]
-    pub fn timestamp(&self) -> Option<u64> {
+    pub const fn timestamp(&self) -> Option<u64> {
         self.timestamp
     }
 
@@ -188,7 +188,7 @@ fn write_header(kind: i32, identifier: Option<&str>, rest: usize, out: &mut Byte
 }
 
 /// Splits length-prefixed messages.
-pub fn frames(data: Bytes) -> Frames {
+pub const fn frames(data: Bytes) -> Frames {
     Frames { buf: data }
 }
 
@@ -235,7 +235,7 @@ fn utf8(b: Bytes) -> Result<Bytes, Error> {
 }
 
 /// Protobuf `int32` and enums are sign-extended to 64 bits.
-fn to_i32(v: u64) -> i32 {
+const fn to_i32(v: u64) -> i32 {
     v.cast_signed() as i32
 }
 

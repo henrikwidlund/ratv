@@ -62,15 +62,15 @@ pub enum Value<'a> {
     /// Raw bytes.
     Data(Cow<'a, [u8]>),
     /// Ordered list.
-    Array(Vec<Value<'a>>),
+    Array(Vec<Self>),
     /// Ordered key/value pairs. Duplicate keys are kept as-is.
-    Dict(Vec<(Value<'a>, Value<'a>)>),
+    Dict(Vec<(Self, Self)>),
 }
 
-impl<'a> Value<'a> {
+impl Value<'_> {
     /// Looks up a string key in a dictionary.
     #[must_use]
-    pub fn get(&self, key: &str) -> Option<&Value<'a>> {
+    pub fn get(&self, key: &str) -> Option<&Self> {
         match self {
             Value::Dict(entries) => entries
                 .iter()
@@ -82,7 +82,7 @@ impl<'a> Value<'a> {
 
     /// Returns the integer value.
     #[must_use]
-    pub fn as_i64(&self) -> Option<i64> {
+    pub const fn as_i64(&self) -> Option<i64> {
         match *self {
             Value::Int(v) => Some(v),
             _ => None,
@@ -91,7 +91,7 @@ impl<'a> Value<'a> {
 
     /// Returns the integer value reinterpreted as unsigned.
     #[must_use]
-    pub fn as_u64(&self) -> Option<u64> {
+    pub const fn as_u64(&self) -> Option<u64> {
         match *self {
             Value::Int(v) => Some(v.cast_unsigned()),
             _ => None,
@@ -100,7 +100,7 @@ impl<'a> Value<'a> {
 
     /// Returns a float, converting integers.
     #[must_use]
-    pub fn as_f64(&self) -> Option<f64> {
+    pub const fn as_f64(&self) -> Option<f64> {
         match *self {
             Value::Float(v) => Some(v),
             #[allow(clippy::cast_precision_loss)]
@@ -111,7 +111,7 @@ impl<'a> Value<'a> {
 
     /// Returns the boolean value.
     #[must_use]
-    pub fn as_bool(&self) -> Option<bool> {
+    pub const fn as_bool(&self) -> Option<bool> {
         match *self {
             Value::Bool(v) => Some(v),
             _ => None,
@@ -138,7 +138,7 @@ impl<'a> Value<'a> {
 
     /// Returns the array elements.
     #[must_use]
-    pub fn as_array(&self) -> Option<&[Value<'a>]> {
+    pub fn as_array(&self) -> Option<&[Self]> {
         match self {
             Value::Array(a) => Some(a),
             _ => None,
@@ -147,7 +147,7 @@ impl<'a> Value<'a> {
 
     /// Returns the dictionary entries.
     #[must_use]
-    pub fn as_dict(&self) -> Option<&[(Value<'a>, Value<'a>)]> {
+    pub fn as_dict(&self) -> Option<&[(Self, Self)]> {
         match self {
             Value::Dict(d) => Some(d),
             _ => None,
@@ -259,7 +259,7 @@ pub struct Encoder<'b> {
 
 impl<'b> Encoder<'b> {
     /// Creates an encoder that appends to `out`.
-    pub fn new(out: &'b mut Vec<u8>) -> Self {
+    pub const fn new(out: &'b mut Vec<u8>) -> Self {
         Self {
             out,
             objects: Vec::new(),
@@ -590,7 +590,7 @@ impl<'a> Decoder<'a> {
         Ok(Value::Str(Cow::Borrowed(s)))
     }
 
-    fn reference(&mut self, index: usize) -> Result<Value<'a>, Error> {
+    fn reference(&self, index: usize) -> Result<Value<'a>, Error> {
         let span = *self
             .objects
             .get(index)

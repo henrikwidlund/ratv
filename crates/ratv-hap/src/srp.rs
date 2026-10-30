@@ -131,13 +131,13 @@ impl SrpClient {
 
     /// Client public value `A`.
     #[must_use]
-    pub fn public_key(&self) -> &[u8; GROUP_LEN] {
+    pub const fn public_key(&self) -> &[u8; GROUP_LEN] {
         &self.a_pub
     }
 
     /// Client proof `M1`.
     #[must_use]
-    pub fn proof(&self) -> &[u8; 64] {
+    pub const fn proof(&self) -> &[u8; 64] {
         &self.m1
     }
 
@@ -179,7 +179,7 @@ impl SrpServer {
 
     /// Server public value `B`.
     #[must_use]
-    pub fn public_key(&self) -> &[u8; GROUP_LEN] {
+    pub const fn public_key(&self) -> &[u8; GROUP_LEN] {
         &self.b_pub
     }
 

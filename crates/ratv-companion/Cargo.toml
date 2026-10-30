@@ -9,13 +9,12 @@ license.workspace = true
 [dependencies]
 ratv-codec.workspace = true
 ratv-hap.workspace = true
-bytes = "1"
-thiserror = "2"
+bytes.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 ratv-hap = { workspace = true, features = ["accessory"] }
-proptest = "1"
 
 [[bench]]
 name = "connection"

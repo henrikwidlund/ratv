@@ -28,6 +28,10 @@ const CLIENT_ID: &[u8] = b"client-1";
 struct Log {
     buttons: Vec<(u32, u32, bool)>,
     commands: Vec<i32>,
+    /// Positions of seek commands.
+    seeks: Vec<f64>,
+    /// `language_option` of language commands.
+    language_options: Vec<bytes::Bytes>,
     /// Voice registrations.
     voice_devices: usize,
     /// Sample time and size of each voice packet.
@@ -204,7 +208,10 @@ async fn data_stream(listener: TcpListener, secret: SharedSecret, seed: u64, log
     let (mut s, _) = listener.accept().await.unwrap();
     let mut ds = DataStream::new(keys::data_stream(&secret, seed, Side::Device), 500);
     loop {
-        let n = s.read_buf(ds.receive_buffer(4096)).await.unwrap();
+        // Windows reports a closed connection as a reset.
+        let Ok(n) = s.read_buf(ds.receive_buffer(4096)).await else {
+            return;
+        };
         if n == 0 {
             return;
         }
@@ -245,33 +252,7 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
         return Some(out);
     }
     if env.is::<proto::ClientUpdatesConfigMessage>() {
-        let client = proto::NowPlayingClient {
-            bundle_identifier: Some("com.apple.TVMusic".into()),
-            display_name: Some("Music".into()),
-            ..Default::default()
-        };
-        let mut out = mrp(
-            &proto::SetNowPlayingClientMessage {
-                client: Some(client.clone()),
-            },
-            None,
-            0,
-        );
-        let state = proto::SetStateMessage {
-            player_path: Some(proto::PlayerPath {
-                client: Some(client),
-                ..Default::default()
-            }),
-            playback_state: Some(PlaybackState::Playing as i32),
-            now_playing_info: Some(proto::NowPlayingInfo {
-                title: Some("Song".into()),
-                playback_rate: Some(1.0),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        out.extend(mrp(&state, None, 0));
-        return Some(out);
+        return Some(initial_state());
     }
     if env.is::<proto::SendButtonEventMessage>() {
         let b: proto::SendButtonEventMessage = env.payload().unwrap();
@@ -283,7 +264,13 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
     if env.is::<proto::SendCommandMessage>() {
         let c: proto::SendCommandMessage = env.payload().unwrap();
         let cmd = c.command?;
-        log.lock().unwrap().commands.push(cmd);
+        let mut l = log.lock().unwrap();
+        l.commands.push(cmd);
+        if let Some(o) = c.options {
+            l.seeks.extend(o.playback_position);
+            l.language_options.extend(o.language_option);
+        }
+        drop(l);
         if cmd == Command::NextTrack as i32 {
             // Device-level error code on the envelope.
             return Some(mrp(&proto::SendCommandResultMessage::default(), id, 6));
@@ -297,16 +284,21 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
     }
     if env.is::<proto::PlaybackQueueRequestMessage>() {
         let r: proto::PlaybackQueueRequestMessage = env.payload().unwrap();
-        assert_eq!(r.return_content_item_assets_in_user_completion, Some(true));
+        // Only artwork requests get an image, like on a real device.
         #[allow(clippy::cast_possible_truncation)]
-        let item = proto::ContentItem {
-            artwork_data: Some(bytes::Bytes::from_static(b"\x89PNG")),
-            artwork_data_width: r.artwork_width.map(|w| w as i32),
-            metadata: Some(proto::ContentItemMetadata {
-                artwork_mime_type: Some("image/png".into()),
+        let item = if r.return_content_item_assets_in_user_completion == Some(true) {
+            proto::ContentItem {
+                identifier: Some("video-1".into()),
+                artwork_data: Some(bytes::Bytes::from_static(b"\x89PNG")),
+                artwork_data_width: r.artwork_width.map(|w| w as i32),
+                metadata: Some(proto::ContentItemMetadata {
+                    artwork_mime_type: Some("image/png".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
+            }
+        } else {
+            video_item()
         };
         let state = proto::SetStateMessage {
             playback_queue: Some(proto::PlaybackQueue {
@@ -319,6 +311,83 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
         return Some(mrp(&state, id, 0));
     }
     handle_voice(env, id, log).or_else(|| handle_volume(env, id, log))
+}
+
+/// Now playing client and state, sent after `CLIENT_UPDATES_CONFIG`.
+fn initial_state() -> Vec<u8> {
+    let client = proto::NowPlayingClient {
+        bundle_identifier: Some("com.apple.TVMusic".into()),
+        display_name: Some("Music".into()),
+        ..Default::default()
+    };
+    let mut out = mrp(
+        &proto::SetNowPlayingClientMessage {
+            client: Some(client.clone()),
+        },
+        None,
+        0,
+    );
+    let state = proto::SetStateMessage {
+        player_path: Some(proto::PlayerPath {
+            client: Some(client),
+            ..Default::default()
+        }),
+        playback_state: Some(PlaybackState::Playing as i32),
+        now_playing_info: Some(proto::NowPlayingInfo {
+            title: Some("Song".into()),
+            playback_rate: Some(1.0),
+            elapsed_time: Some(100.0),
+            timestamp: Some(mrp::cocoa_time(std::time::SystemTime::now())),
+            ..Default::default()
+        }),
+        playback_queue: Some(proto::PlaybackQueue {
+            location: Some(0),
+            content_items: vec![video_item()],
+            ..Default::default()
+        }),
+        // `PreviousChapter` is not supported, so `AppleTv` seeks instead.
+        supported_commands: Some(proto::SupportedCommands {
+            supported_commands: vec![proto::CommandInfo {
+                command: Some(Command::NextChapter as i32),
+                enabled: Some(true),
+                ..Default::default()
+            }],
+        }),
+        ..Default::default()
+    };
+    out.extend(mrp(&state, None, 0));
+    out
+}
+
+/// Item with chapters at 0, 60, 120 and 180 s, and Swedish subtitles on.
+fn video_item() -> proto::ContentItem {
+    let chapter = |start: f64| proto::ContentItem {
+        metadata: Some(proto::ContentItemMetadata {
+            start_time: Some(start),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let subtitles = proto::LanguageOption {
+        r#type: Some(mrp::LanguageType::Legible as i32),
+        language_tag: Some("sv".into()),
+        identifier: Some("sub-sv".into()),
+        ..Default::default()
+    };
+    proto::ContentItem {
+        identifier: Some("video-1".into()),
+        metadata: Some(proto::ContentItemMetadata {
+            duration: Some(240.0),
+            ..Default::default()
+        }),
+        sections: [0.0, 60.0, 120.0, 180.0].map(chapter).into(),
+        available_language_options: vec![proto::LanguageOptionGroup {
+            language_options: vec![subtitles.clone()],
+            ..Default::default()
+        }],
+        current_language_options: vec![subtitles],
+        ..Default::default()
+    }
 }
 
 fn recording(down: bool) -> Vec<u8> {
@@ -457,13 +526,13 @@ async fn session() {
         Error::Mrp(ratv_mrp::Error::Device { code, .. }) => assert_eq!(code, 6),
         other => panic!("unexpected {other}"),
     }
-    assert!(
-        messages
-            .recv()
-            .await
-            .unwrap()
-            .is::<proto::SendCommandResultMessage>()
-    );
+    // Other messages, such as the reply to the details request, can come first.
+    while !messages
+        .recv()
+        .await
+        .unwrap()
+        .is::<proto::SendCommandResultMessage>()
+    {}
     let art = client.artwork(300.0, -1.0).await.unwrap().unwrap();
     assert_eq!(&art.data[..], b"\x89PNG");
     assert_eq!(art.mime_type.as_deref(), Some("image/png"));
@@ -546,11 +615,19 @@ async fn siri() {
         .unwrap();
 
     let mut siri = client.start_siri().await.unwrap();
+    assert!(matches!(client.start_siri().await, Err(Error::SiriActive)));
     siri.send(&b"one"[..]).await.unwrap();
     siri.send(&b"three"[..]).await.unwrap();
     siri.finish().await.unwrap();
     // Dropping releases Siri too. The device is registered once.
     drop(client.start_siri().await.unwrap());
+    // A start can finish or be canceled here. Both release Siri and allow a new start.
+    if let Ok(result) = tokio::time::timeout(Duration::ZERO, client.start_siri()).await {
+        drop(result.unwrap());
+    }
+    drop(client.start_siri().await.unwrap());
+    // Lets the device read the last release before the connection closes.
+    tokio::time::sleep(Duration::from_millis(50)).await;
     client.close().await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -558,7 +635,54 @@ async fn siri() {
     assert_eq!(log.voice_devices, 1);
     assert_eq!(log.voice, [(0.0, 3), (320.0, 5)]);
     let siri = [(0x0c, 0x04, true), (0x0c, 0x04, false)];
-    assert_eq!(log.buttons, [siri, siri].concat());
+    assert_eq!(log.buttons, [siri; 4].concat());
+}
+
+#[cfg(feature = "companion")]
+#[tokio::test]
+async fn apple_tv_chapters_and_subtitles() {
+    use ratv::{AppleTv, ConnectOptions, Endpoints};
+
+    let device = start_device().await;
+    let endpoints = Endpoints {
+        companion: None,
+        airplay: Some(format!("127.0.0.1:{}", device.port).parse().unwrap()),
+    };
+    let opts = ConnectOptions {
+        mrp: options(),
+        ..ConnectOptions::default()
+    };
+    let tv = AppleTv::connect(&endpoints, &credentials(), &opts)
+        .await
+        .unwrap();
+    let mut np = tv.now_playing().unwrap();
+    let ready = np.wait_for(|n| n.chapters.len() == 4 && n.subtitle_language.is_some());
+    tokio::time::timeout(Duration::from_secs(2), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(np);
+
+    // At about 100 s: the app supports `NextChapter`, but not `PreviousChapter`.
+    tv.next_chapter().await.unwrap();
+    tv.previous_chapter().await.unwrap();
+    // Turns off the current track, not only the type.
+    tv.disable_subtitles().await.unwrap();
+    tv.close().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let log = device.log.lock().unwrap();
+    assert_eq!(
+        log.commands,
+        [
+            Command::NextChapter as i32,
+            Command::SeekToPlaybackPosition as i32,
+            Command::DisableLanguageOption as i32
+        ]
+    );
+    assert_eq!(log.seeks, [60.0]);
+    let archive = &log.language_options[0];
+    assert!(archive.windows(6).any(|w| w == b"sub-sv"));
 }
 
 /// Waits until the fake device got TEARDOWN.

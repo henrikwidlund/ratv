@@ -388,10 +388,7 @@ async fn session_commands() {
     client.turn_off().await.unwrap();
     assert!((client.volume().await.unwrap() - 0.25).abs() < f64::EPSILON);
     client.set_volume(1.5).await.unwrap();
-    client
-        .media(ratv::companion::MediaControl::Play)
-        .await
-        .unwrap();
+    client.media(companion::MediaControl::Play).await.unwrap();
     assert_eq!(client.power_state().await.unwrap(), AttentionState::Awake);
     let accounts = client.accounts().await.unwrap();
     assert_eq!(accounts[1].name, "Ben");

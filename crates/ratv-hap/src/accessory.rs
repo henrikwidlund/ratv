@@ -69,7 +69,7 @@ impl PairSetupServer {
 
     /// Controller stored after M5.
     #[must_use]
-    pub fn controller(&self) -> Option<&PairedController> {
+    pub const fn controller(&self) -> Option<&PairedController> {
         self.controller.as_ref()
     }
 
@@ -207,7 +207,7 @@ impl PairVerifyServer {
 
     /// Shared secret after a successful M3.
     #[must_use]
-    pub fn shared_secret(&self) -> Option<&SharedSecret> {
+    pub const fn shared_secret(&self) -> Option<&SharedSecret> {
         self.shared.as_ref()
     }
 

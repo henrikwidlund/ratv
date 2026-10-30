@@ -57,7 +57,7 @@ pub fn device_info(client: &ClientInfo<'_>) -> DeviceInfoMessage {
 
 /// Tells the device the connection is ready.
 #[must_use]
-pub fn connected() -> SetConnectionStateMessage {
+pub const fn connected() -> SetConnectionStateMessage {
     SetConnectionStateMessage {
         state: Some(proto::set_connection_state_message::ConnectionState::Connected as i32),
     }
@@ -65,7 +65,7 @@ pub fn connected() -> SetConnectionStateMessage {
 
 /// Subscribes to now playing, artwork, volume, keyboard and output device updates.
 #[must_use]
-pub fn client_updates_config() -> ClientUpdatesConfigMessage {
+pub const fn client_updates_config() -> ClientUpdatesConfigMessage {
     ClientUpdatesConfigMessage {
         now_playing_updates: Some(true),
         artwork_updates: Some(true),
@@ -79,11 +79,11 @@ pub fn client_updates_config() -> ClientUpdatesConfigMessage {
 
 /// Playback command without options.
 #[must_use]
-pub fn command(command: Command) -> SendCommandMessage {
+pub const fn command(command: Command) -> SendCommandMessage {
     command_with(command, None)
 }
 
-fn command_with(command: Command, options: Option<CommandOptions>) -> SendCommandMessage {
+const fn command_with(command: Command, options: Option<CommandOptions>) -> SendCommandMessage {
     SendCommandMessage {
         command: Some(command as i32),
         options,

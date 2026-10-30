@@ -102,7 +102,7 @@ impl<'a> Message<'a> {
 
     /// Whole message value.
     #[must_use]
-    pub fn value(&self) -> &Value<'a> {
+    pub const fn value(&self) -> &Value<'a> {
         &self.0
     }
 
@@ -128,10 +128,7 @@ impl<'a> Message<'a> {
 
     /// Returns `Err` if the message carries a device error.
     pub fn into_result(self) -> Result<Self, Error> {
-        match self.error() {
-            Some(e) => Err(e),
-            None => Ok(self),
-        }
+        self.error().map_or(Ok(self), Err)
     }
 
     /// Copies borrowed data so the message outlives the payload.
@@ -317,7 +314,7 @@ pub enum MediaControl {
 }
 
 impl MediaControl {
-    fn code(self) -> i64 {
+    const fn code(self) -> i64 {
         match self {
             Self::Play => 1,
             Self::Pause => 2,
@@ -378,7 +375,7 @@ impl MediaControlFlags {
 
     /// Returns true if all bits in `flag` are set.
     #[must_use]
-    pub fn contains(self, flag: u32) -> bool {
+    pub const fn contains(self, flag: u32) -> bool {
         self.0 & flag == flag
     }
 }
@@ -519,7 +516,7 @@ pub enum AttentionState {
 }
 
 impl AttentionState {
-    fn from_code(code: i64) -> Self {
+    const fn from_code(code: i64) -> Self {
         match code {
             1 => Self::Asleep,
             2 => Self::Screensaver,
@@ -531,7 +528,7 @@ impl AttentionState {
 
     /// Returns true unless the device is asleep or the state is unknown.
     #[must_use]
-    pub fn is_on(self) -> bool {
+    pub const fn is_on(self) -> bool {
         matches!(self, Self::Screensaver | Self::Awake | Self::Idle)
     }
 }
@@ -860,7 +857,7 @@ mod tests {
                 name: "Netflix".into()
             }
         );
-        assert!(apps_response(&roundtrip(&TouchStop)).unwrap().is_empty());
+        assert_eq!(apps_response(&roundtrip(&TouchStop)).unwrap(), []);
     }
 
     #[test]

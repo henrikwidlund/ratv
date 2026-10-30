@@ -64,7 +64,7 @@ impl VolumeState {
 
     /// Current volume.
     #[must_use]
-    pub fn volume(&self) -> &Volume {
+    pub const fn volume(&self) -> &Volume {
         &self.volume
     }
 

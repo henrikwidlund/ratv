@@ -4,7 +4,7 @@ use getrandom::SysRng;
 use rand_core::{Rng, UnwrapErr};
 
 /// Operating system random number generator. Panics if the OS source fails.
-pub(crate) fn os() -> UnwrapErr<SysRng> {
+pub(crate) const fn os() -> UnwrapErr<SysRng> {
     UnwrapErr(SysRng)
 }
 

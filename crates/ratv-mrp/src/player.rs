@@ -254,7 +254,7 @@ struct Player {
 }
 
 impl Player {
-    fn new(id: String) -> Self {
+    const fn new(id: String) -> Self {
         Self {
             id,
             state: None,
@@ -578,13 +578,15 @@ impl NowPlayingState {
                 .or_else(|| player.item()?.identifier.clone());
         }
         np.duration = info.and_then(|i| i.duration).or_else(|| meta?.duration);
-        (np.elapsed, np.elapsed_timestamp) = match info.and_then(|i| i.elapsed_time) {
-            Some(e) => (Some(e), info.and_then(|i| i.timestamp)),
-            None => (
-                meta.and_then(|m| m.elapsed_time),
-                meta.and_then(|m| m.elapsed_time_timestamp),
-            ),
-        };
+        (np.elapsed, np.elapsed_timestamp) = info.and_then(|i| i.elapsed_time).map_or_else(
+            || {
+                (
+                    meta.and_then(|m| m.elapsed_time),
+                    meta.and_then(|m| m.elapsed_time_timestamp),
+                )
+            },
+            |e| (Some(e), info.and_then(|i| i.timestamp)),
+        );
         np.rate = player.rate();
         np.shuffle = mode(&player.commands, Command::ChangeShuffleMode, |c| {
             c.shuffle_mode
@@ -1092,8 +1094,8 @@ mod tests {
         msg.playback_queue.as_mut().unwrap().content_items = vec![item("b", "Next")];
         assert!(s.apply(&env(&msg)).unwrap());
         let np = s.now_playing();
-        assert!(np.up_next.is_empty());
-        assert!(np.audio_languages.is_empty());
+        assert_eq!(np.up_next, []);
+        assert_eq!(np.audio_languages, []);
         assert_eq!(s.item_id(), Some("b"));
     }
 
