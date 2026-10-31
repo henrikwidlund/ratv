@@ -638,6 +638,29 @@ async fn siri() {
     assert_eq!(log.buttons, [siri; 4].concat());
 }
 
+#[cfg(feature = "opus")]
+#[tokio::test]
+async fn siri_pcm() {
+    let device = start_device().await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+
+    let mut siri = client.start_siri().await.unwrap();
+    // 100 + 600 samples: two frames now, the rest padded by `finish`.
+    siri.push_pcm(&[100; 100]).await.unwrap();
+    siri.push_pcm(&[-100; 600]).await.unwrap();
+    siri.finish().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    client.close().await.unwrap();
+
+    let log = device.log.lock().unwrap();
+    let times: Vec<f64> = log.voice.iter().map(|&(t, _)| t).collect();
+    assert_eq!(times, [0.0, 320.0, 640.0]);
+    assert!(log.voice.iter().all(|&(_, size)| size > 0));
+}
+
 #[cfg(feature = "companion")]
 #[tokio::test]
 async fn apple_tv_chapters_and_subtitles() {

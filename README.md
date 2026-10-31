@@ -72,13 +72,16 @@ Siri voice input. Audio is Opus, 16 kHz, mono, 20 ms per packet:
 
 ```rust
 async fn ask_siri(tv: &ratv::AppleTv, packets: Vec<Vec<u8>>) -> Result<(), ratv::Error> {
-    let mut siri = tv.start_siri().await?; // returns when the TV records
+    let mut siri = tv.start_siri().await?; // presses Siri
     for packet in packets {
         siri.send(packet).await?;          // send each packet after 20 ms
     }
     siri.finish().await                    // the TV then answers
 }
 ```
+
+Audio is kept until the TV records, then sent. With feature `opus`, send
+16-bit, 16 kHz, mono PCM in chunks of any size with `push_pcm` instead.
 
 ## Features
 
@@ -87,6 +90,7 @@ async fn ask_siri(tv: &ratv::AppleTv, packets: Vec<Vec<u8>>) -> Result<(), ratv:
 | `companion` | yes     | Companion protocol |
 | `mrp`       | yes     | MRP over AirPlay 2 |
 | `discovery` | yes     | mDNS scan          |
+| `opus`      | no      | Siri input as PCM  |
 
 `AppleTv` needs `companion` and `mrp`. Small build for ARM boards:
 

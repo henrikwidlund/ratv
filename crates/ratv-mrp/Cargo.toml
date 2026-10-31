@@ -11,6 +11,7 @@ ratv-codec.workspace = true
 prost = { workspace = true, features = ["derive"] }
 bytes.workspace = true
 thiserror.workspace = true
+rusty-opus = { version = "1.0.2", optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
@@ -22,3 +23,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[features]
+# Opus encoder for voice input from PCM.
+opus = ["dep:rusty-opus"]

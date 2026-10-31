@@ -9,6 +9,7 @@
 //! - [`messages`] builds the messages a remote control sends.
 //! - [`NowPlayingState`] tracks what is playing.
 //! - [`artwork`] reads the image of the current item.
+//! - `VoiceEncoder` (feature `opus`) encodes PCM for voice input.
 
 mod artwork;
 mod envelope;
@@ -16,6 +17,8 @@ mod error;
 pub mod hid;
 pub mod messages;
 mod player;
+#[cfg(feature = "opus")]
+mod voice;
 mod volume;
 
 /// Protobuf types generated from the MRP `.proto` files.
@@ -39,6 +42,8 @@ pub use player::{
     Chapter, DEFAULT_PLAYER, LanguageType, MediaSubType, MediaType, NowPlaying, NowPlayingState,
     PlaybackState, QueueItem, cocoa_time, four_cc,
 };
+#[cfg(feature = "opus")]
+pub use voice::VoiceEncoder;
 pub use volume::{OutputDevice, Volume, VolumeState, output_device_uid};
 
 /// A message that is sent as a payload field of `ProtocolMessage`.

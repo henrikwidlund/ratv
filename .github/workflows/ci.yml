@@ -37,7 +37,7 @@ jobs:
       - name: Clippy per feature
         shell: bash
         run: |
-          for f in "" companion mrp discovery companion,mrp; do
+          for f in "" companion mrp discovery companion,mrp mrp,opus; do
             echo "::group::features '$f'"
             cargo clippy --locked -p ratv --no-default-features --features "$f" --all-targets
             echo "::endgroup::"

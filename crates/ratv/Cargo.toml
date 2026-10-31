@@ -13,6 +13,8 @@ default = ["companion", "discovery", "mrp"]
 companion = ["dep:ratv-companion"]
 discovery = ["dep:ratv-discovery"]
 mrp = ["dep:ratv-airplay", "dep:ratv-mrp"]
+# Siri voice input from PCM.
+opus = ["mrp", "ratv-mrp/opus"]
 
 [dependencies]
 ratv-codec.workspace = true

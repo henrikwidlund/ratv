@@ -22,6 +22,9 @@ pub enum Error {
         /// Field number in the message.
         actual: Option<u32>,
     },
+    /// Opus encoding failed.
+    #[error("Opus encoding failed: {0}")]
+    Encode(&'static str),
     /// The device returned an error code.
     #[error("device error {code}: {description}")]
     Device {

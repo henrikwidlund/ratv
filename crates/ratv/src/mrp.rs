@@ -54,11 +54,22 @@ const MESSAGE_CAPACITY: usize = 64;
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
 /// Siri listening to voice input, from [`Client::start_siri`].
 ///
+/// Audio is kept until the device starts recording, then sent.
 /// Siri is released when this is dropped, but call [`finish`](Self::finish)
-/// to know that the release was sent.
+/// to send the rest of the audio and to know that the release was sent.
 #[must_use = "Siri stays active until `finish` is called or this is dropped"]
 pub struct Siri<'a> {
     client: &'a Client,
+    /// Recording count when Siri was pressed.
+    start: u32,
+    recording: watch::Receiver<u32>,
+    /// True after the device started recording.
+    started: bool,
+    /// Packets kept until the device records.
+    pending: Vec<Bytes>,
+    #[cfg(feature = "opus")]
+    /// Boxed because it is large.
+    encoder: Option<Box<ratv_mrp::VoiceEncoder>>,
     /// Sample number of the next packet.
     sample: u32,
     /// True while the button is held.
@@ -69,17 +80,63 @@ impl Siri<'_> {
     /// Sends one Opus packet of 20 ms, 16 kHz, mono.
     /// Send one packet every 20 ms.
     pub async fn send(&mut self, packet: impl Into<Bytes>) -> Result<(), Error> {
-        let msg = messages::voice_input(packet.into(), self.sample);
-        self.client.send(&msg).await?;
-        self.sample = self.sample.wrapping_add(messages::VOICE_FRAMES);
-        Ok(())
+        self.pending.push(packet.into());
+        self.send_pending().await
     }
 
-    /// Releases Siri. The device then answers.
+    /// Sends signed 16-bit, 16 kHz, mono PCM in chunks of any size.
+    /// Do not mix with [`send`](Self::send).
+    #[cfg(feature = "opus")]
+    pub async fn push_pcm(&mut self, pcm: &[i16]) -> Result<(), Error> {
+        let pending = &mut self.pending;
+        self.encoder
+            .get_or_insert_with(Box::default)
+            .push(pcm, |p| pending.push(Bytes::copy_from_slice(p)))?;
+        self.send_pending().await
+    }
+
+    /// Sends the rest of the audio and releases Siri. The device then answers.
+    ///
+    /// Waits for the device to record if it has not started yet.
     pub async fn finish(mut self) -> Result<(), Error> {
+        #[cfg(feature = "opus")]
+        if let Some(encoder) = &mut self.encoder {
+            let pending = &mut self.pending;
+            encoder.flush(|p| pending.push(Bytes::copy_from_slice(p)))?;
+        }
+        if !self.pending.is_empty() && !self.is_recording() {
+            let start = self.start;
+            let wait = self.recording.wait_for(|&n| n != start);
+            match tokio::time::timeout(self.client.timeout, wait).await {
+                Ok(Ok(_)) => self.started = true,
+                Ok(Err(_)) => return Err(Error::Disconnected),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        self.send_pending().await?;
         let result = self.client.button(Button::Siri, false).await;
         self.held = false;
         result
+    }
+
+    /// True once the device has started recording.
+    fn is_recording(&mut self) -> bool {
+        self.started = self.started || *self.recording.borrow() != self.start;
+        self.started
+    }
+
+    /// Sends the kept packets if the device records.
+    async fn send_pending(&mut self) -> Result<(), Error> {
+        if !self.is_recording() {
+            return Ok(());
+        }
+        for packet in &self.pending {
+            let msg = messages::voice_input(packet.clone(), self.sample);
+            self.client.send(&msg).await?;
+            self.sample = self.sample.wrapping_add(messages::VOICE_FRAMES);
+        }
+        self.pending.clear();
+        Ok(())
     }
 }
 
@@ -272,6 +329,8 @@ pub struct Client {
     messages: broadcast::Sender<Envelope>,
     now_playing: watch::Receiver<NowPlaying>,
     volume: watch::Receiver<Volume>,
+    /// Number of times the device started recording voice input.
+    recording: watch::Receiver<u32>,
     device: proto::DeviceInfoMessage,
     /// Output device UID for volume messages.
     output_uid: Option<String>,
@@ -316,11 +375,13 @@ impl Client {
         conns.stream.send(&out);
         let (np_tx, now_playing) = watch::channel(NowPlaying::default());
         let (volume_tx, volume) = watch::channel(Volume::default());
+        let (recording_tx, recording) = watch::channel(0);
         let mut state = State {
             now_playing: NowPlayingState::new(),
             now_playing_tx: np_tx,
             volume: VolumeState::new(),
             volume_tx,
+            recording_tx,
             item_id: None,
         };
         let device =
@@ -369,6 +430,7 @@ impl Client {
             messages,
             now_playing,
             volume,
+            recording,
             device,
             output_uid,
             next_id: AtomicU32::new(6),
@@ -445,36 +507,34 @@ impl Client {
             .map_err(|_| Error::Disconnected)
     }
 
-    /// Holds Siri and waits until the device listens. Then send the audio with
-    /// [`Siri::send`] and release Siri with [`Siri::finish`].
+    /// Holds Siri. Send the audio with [`Siri::send`] or `Siri::push_pcm`
+    /// (feature `opus`), then release Siri with [`Siri::finish`].
     ///
+    /// Returns right after the press. Audio is kept until the device records,
+    /// because audio sent before is lost.
     /// Registers a voice input device on first use.
     /// Fails with [`Error::SiriActive`] while another [`Siri`] exists.
     pub async fn start_siri(&self) -> Result<Siri<'_>, Error> {
         if self.siri_active.swap(true, Ordering::AcqRel) {
             return Err(Error::SiriActive);
         }
+        let recording = self.recording.clone();
+        let start = *recording.borrow();
         // Releases the button and the flag if a step fails or the future is dropped.
         let mut siri = Siri {
             client: self,
+            start,
+            recording,
+            started: false,
+            pending: Vec::new(),
+            #[cfg(feature = "opus")]
+            encoder: None,
             sample: 0,
             held: false,
         };
         self.voice_device().await?;
-        let mut messages = self.messages();
         self.button(Button::Siri, true).await?;
         siri.held = true;
-        // Audio sent before the device asks for it is lost.
-        let recording = async {
-            loop {
-                match messages.recv().await {
-                    Ok(env) if is_recording(&env) => return Ok(()),
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return Err(Error::Disconnected),
-                }
-            }
-        };
-        tokio::time::timeout(self.timeout, recording).await??;
         Ok(siri)
     }
 
@@ -738,6 +798,7 @@ struct State {
     now_playing_tx: watch::Sender<NowPlaying>,
     volume: VolumeState,
     volume_tx: watch::Sender<Volume>,
+    recording_tx: watch::Sender<u32>,
     /// Item that details were requested for.
     item_id: Option<String>,
 }
@@ -754,6 +815,9 @@ impl State {
             Ok(true) => publish(&self.volume_tx, self.volume.volume().clone()),
             Ok(false) => {}
             Err(err) => tracing::debug!(%err, kind = env.kind(), "invalid volume message"),
+        }
+        if is_recording(env) {
+            self.recording_tx.send_modify(|n| *n = n.wrapping_add(1));
         }
     }
 

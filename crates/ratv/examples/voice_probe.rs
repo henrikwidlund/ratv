@@ -15,6 +15,8 @@
 
 #[path = "common/caf.rs"]
 mod caf;
+#[path = "common/wav.rs"]
+mod wav;
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -110,25 +112,6 @@ fn voice_input(
     }
 }
 
-/// PCM data of a WAV file, in 20 ms blocks.
-fn wav_blocks(file: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
-    if file.get(..4) != Some(b"RIFF") || file.get(8..12) != Some(b"WAVE") {
-        return Err("not a WAV file");
-    }
-    let mut pos = 12;
-    while let Some(header) = file.get(pos..pos + 8) {
-        let len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
-        let body = pos + 8;
-        if &header[..4] == b"data" {
-            let data = file.get(body..body + len).ok_or("short data chunk")?;
-            return Ok(data.chunks(FRAMES as usize * 2).collect());
-        }
-        // Chunks are padded to an even length.
-        pos = body + len + (len & 1);
-    }
-    Err("no data chunk")
-}
-
 /// Prints voice related messages, and the kind of all others.
 fn print(env: &Envelope) {
     if env.is::<SetRecordingStateMessage>() {
@@ -221,7 +204,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (format, packets) = if is_caf {
         (Format::Opus, caf::packets(&file)?)
     } else {
-        (Format::Pcm, wav_blocks(&file)?)
+        (
+            Format::Pcm,
+            wav::pcm(&file)?.chunks(FRAMES as usize * 2).collect(),
+        )
     };
     let bytes: usize = packets.iter().map(|p| p.len()).sum();
     println!("{} blocks of 20 ms, {bytes} bytes", packets.len());

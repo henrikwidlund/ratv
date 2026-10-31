@@ -430,8 +430,7 @@ impl AppleTv {
         self.need_mrp()?.disable_language(option).await
     }
 
-    /// Holds Siri and waits until the device listens. Needs MRP.
-    /// Send Opus audio with [`mrp::Siri::send`], then call [`mrp::Siri::finish`].
+    /// Holds Siri. Needs MRP. See [`mrp::Client::start_siri`].
     pub async fn start_siri(&self) -> Result<mrp::Siri<'_>, Error> {
         self.need_mrp()?.start_siri().await
     }
