@@ -467,7 +467,7 @@ async fn session_commands() {
 async fn request_timeout() {
     struct Silent;
     impl ratv_companion::message::Outgoing for Silent {
-        const ID: &'static str = "silent";
+        const ID: &str = "silent";
         fn content(&self, e: &mut Encoder<'_>) {
             empty(e);
         }

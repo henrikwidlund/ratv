@@ -466,13 +466,7 @@ impl NowPlayingState {
                 self.active_client = Some(id);
             }
         } else if env.is::<SetNowPlayingPlayerMessage>() {
-            let msg: SetNowPlayingPlayerMessage = env.payload()?;
-            if let Some(path) = &msg.player_path
-                && let Some(c) = path.client.as_ref().and_then(|c| self.client_mut(c))
-            {
-                let id = c.player_mut(path.player.as_ref()).id.clone();
-                c.active_player = Some(id);
-            }
+            self.set_active_player(&env.payload()?);
         } else if env.is::<UpdatePlayerMessage>() {
             let msg: UpdatePlayerMessage = env.payload()?;
             if let Some(path) = &msg.player_path
@@ -486,40 +480,57 @@ impl NowPlayingState {
                 self.client_mut(c);
             }
         } else if env.is::<RemoveClientMessage>() {
-            let msg: RemoveClientMessage = env.payload()?;
-            if let Some(id) = msg.client.and_then(|c| c.bundle_identifier) {
-                self.clients.retain(|c| c.bundle_id != id);
-                if self.active_client.as_deref() == Some(&id) {
-                    self.active_client = None;
-                }
-            }
+            self.remove_client(env.payload()?);
         } else if env.is::<RemovePlayerMessage>() {
-            let msg: RemovePlayerMessage = env.payload()?;
-            let Some(path) = &msg.player_path else {
-                return Ok(true);
-            };
-            let id = path.player.as_ref().and_then(|p| p.identifier.as_deref());
-            if let (Some(c), Some(id)) = (path.client.as_ref().and_then(|c| self.client_mut(c)), id)
-            {
-                c.players.retain(|p| p.id != id);
-                if c.active_player.as_deref() == Some(id) {
-                    c.active_player = None;
-                }
-            }
+            self.remove_player(&env.payload()?);
         } else if env.is::<SetDefaultSupportedCommandsMessage>() {
-            let msg: SetDefaultSupportedCommandsMessage = env.payload()?;
-            if let Some(path) = &msg.player_path
-                && let Some(c) = path.client.as_ref().and_then(|c| self.client_mut(c))
-            {
-                c.default_commands = msg
-                    .supported_commands
-                    .map(|s| s.supported_commands)
-                    .unwrap_or_default();
-            }
+            self.set_default_commands(env.payload()?);
         } else {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    fn set_active_player(&mut self, msg: &SetNowPlayingPlayerMessage) {
+        if let Some(path) = &msg.player_path
+            && let Some(c) = path.client.as_ref().and_then(|c| self.client_mut(c))
+        {
+            let id = c.player_mut(path.player.as_ref()).id.clone();
+            c.active_player = Some(id);
+        }
+    }
+
+    fn remove_client(&mut self, msg: RemoveClientMessage) {
+        if let Some(id) = msg.client.and_then(|c| c.bundle_identifier) {
+            self.clients.retain(|c| c.bundle_id != id);
+            if self.active_client.as_deref() == Some(&id) {
+                self.active_client = None;
+            }
+        }
+    }
+
+    fn remove_player(&mut self, msg: &RemovePlayerMessage) {
+        let Some(path) = &msg.player_path else {
+            return;
+        };
+        let id = path.player.as_ref().and_then(|p| p.identifier.as_deref());
+        if let (Some(c), Some(id)) = (path.client.as_ref().and_then(|c| self.client_mut(c)), id) {
+            c.players.retain(|p| p.id != id);
+            if c.active_player.as_deref() == Some(id) {
+                c.active_player = None;
+            }
+        }
+    }
+
+    fn set_default_commands(&mut self, msg: SetDefaultSupportedCommandsMessage) {
+        if let Some(path) = &msg.player_path
+            && let Some(c) = path.client.as_ref().and_then(|c| self.client_mut(c))
+        {
+            c.default_commands = msg
+                .supported_commands
+                .map(|s| s.supported_commands)
+                .unwrap_or_default();
+        }
     }
 
     /// Bundle id of the active app.

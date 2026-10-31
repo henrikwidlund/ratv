@@ -180,7 +180,7 @@ pub struct SessionStart {
 }
 
 impl Outgoing for SessionStart {
-    const ID: &'static str = "_sessionStart";
+    const ID: &str = "_sessionStart";
 
     fn content(&self, e: &mut Encoder<'_>) {
         e.dict(2, |e| {
@@ -212,7 +212,7 @@ pub struct SessionStop {
 }
 
 impl Outgoing for SessionStop {
-    const ID: &'static str = "_sessionStop";
+    const ID: &str = "_sessionStop";
 
     fn content(&self, e: &mut Encoder<'_>) {
         e.dict(2, |e| {
@@ -227,7 +227,7 @@ impl Outgoing for SessionStop {
 pub struct TvRemoteSessionStart;
 
 impl Outgoing for TvRemoteSessionStart {
-    const ID: &'static str = "TVRCSessionStart";
+    const ID: &str = "TVRCSessionStart";
 
     fn content(&self, e: &mut Encoder<'_>) {
         e.dict(1, |e| {
@@ -282,7 +282,7 @@ pub struct Hid {
 }
 
 impl Outgoing for Hid {
-    const ID: &'static str = "_hidC";
+    const ID: &str = "_hidC";
 
     fn content(&self, e: &mut Encoder<'_>) {
         e.dict(2, |e| {
@@ -333,7 +333,7 @@ impl MediaControl {
 }
 
 impl Outgoing for MediaControl {
-    const ID: &'static str = "_mcc";
+    const ID: &str = "_mcc";
 
     fn content(&self, e: &mut Encoder<'_>) {
         let arg = match *self {
@@ -408,7 +408,7 @@ impl Outgoing for LaunchApp<'_> {
 pub struct FetchApps;
 
 impl Outgoing for FetchApps {
-    const ID: &'static str = "FetchLaunchableApplicationsEvent";
+    const ID: &str = "FetchLaunchableApplicationsEvent";
 
     fn content(&self, e: &mut Encoder<'_>) {
         empty(e);
@@ -440,7 +440,7 @@ pub fn apps_response(msg: &Message<'_>) -> Result<Vec<App>, Error> {
 pub struct FetchAccounts;
 
 impl Outgoing for FetchAccounts {
-    const ID: &'static str = "FetchUserAccountsEvent";
+    const ID: &str = "FetchUserAccountsEvent";
 
     fn content(&self, e: &mut Encoder<'_>) {
         empty(e);
@@ -499,7 +499,7 @@ fn string_pairs<'m>(
 pub struct FetchAttentionState;
 
 impl Outgoing for FetchAttentionState {
-    const ID: &'static str = "FetchAttentionState";
+    const ID: &str = "FetchAttentionState";
 
     fn content(&self, e: &mut Encoder<'_>) {
         empty(e);
@@ -604,7 +604,7 @@ impl Default for TouchStart {
 }
 
 impl Outgoing for TouchStart {
-    const ID: &'static str = "_touchStart";
+    const ID: &str = "_touchStart";
 
     fn content(&self, e: &mut Encoder<'_>) {
         e.dict(3, |e| {
@@ -620,7 +620,7 @@ impl Outgoing for TouchStart {
 pub struct TouchStop;
 
 impl Outgoing for TouchStop {
-    const ID: &'static str = "_touchStop";
+    const ID: &str = "_touchStop";
 
     fn content(&self, e: &mut Encoder<'_>) {
         empty(e);
@@ -654,7 +654,7 @@ pub struct Touch {
 }
 
 impl Outgoing for Touch {
-    const ID: &'static str = "_hidT";
+    const ID: &str = "_hidT";
     const TYPE: MessageType = MessageType::Event;
 
     fn content(&self, e: &mut Encoder<'_>) {
@@ -673,7 +673,7 @@ impl Outgoing for Touch {
 pub struct TextInputStart;
 
 impl Outgoing for TextInputStart {
-    const ID: &'static str = "_tiStart";
+    const ID: &str = "_tiStart";
 
     fn content(&self, e: &mut Encoder<'_>) {
         empty(e);
@@ -685,7 +685,7 @@ impl Outgoing for TextInputStart {
 pub struct TextInputStop;
 
 impl Outgoing for TextInputStop {
-    const ID: &'static str = "_tiStop";
+    const ID: &str = "_tiStop";
 
     fn content(&self, e: &mut Encoder<'_>) {
         empty(e);
