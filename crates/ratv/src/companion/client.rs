@@ -17,9 +17,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tracing::{Instrument, Span};
 
 use super::io::{flush, pairing_step};
-use crate::{Error, rng, touch};
+use crate::{Error, log, rng, touch};
 
 const EVENT_CAPACITY: usize = 32;
 const COMMAND_CAPACITY: usize = 16;
@@ -71,6 +72,7 @@ pub struct Client {
     /// Start of the touch session, for touch timestamps.
     touch_base: Instant,
     task: JoinHandle<()>,
+    span: Span,
 }
 
 impl Client {
@@ -80,16 +82,37 @@ impl Client {
         credentials: &Credentials,
         options: &ClientOptions,
     ) -> Result<Self, Error> {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        Self::connect_stream(stream, credentials, options).await
+        let span = log::session("companion", Some(addr));
+        async {
+            tracing::debug!("connecting");
+            let stream = TcpStream::connect(addr).await?;
+            stream.set_nodelay(true)?;
+            Self::start(stream, credentials, options, Span::current()).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Same as [`Client::connect`] on an existing stream.
     pub async fn connect_stream<S>(
+        stream: S,
+        credentials: &Credentials,
+        options: &ClientOptions,
+    ) -> Result<Self, Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let span = log::session("companion", None);
+        Self::start(stream, credentials, options, span.clone())
+            .instrument(span)
+            .await
+    }
+
+    async fn start<S>(
         mut stream: S,
         credentials: &Credentials,
         options: &ClientOptions,
+        span: Span,
     ) -> Result<Self, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -111,10 +134,11 @@ impl Client {
         .await??;
         let secret = state.handle_m4(&m4)?;
         conn.enable_encryption(&secret);
+        tracing::debug!("pair-verify done");
 
         let (commands, rx) = mpsc::channel(COMMAND_CAPACITY);
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
-        let task = tokio::spawn(run(stream, conn, rx, events.clone()));
+        let task = tokio::spawn(run(stream, conn, rx, events.clone()).instrument(span.clone()));
         let mut client = Self {
             commands,
             events,
@@ -123,6 +147,7 @@ impl Client {
             session_id: 0,
             touch_base: Instant::now(),
             task,
+            span,
         };
 
         let rp_id = rng::mac_string(rp_id(&credentials.client_id));
@@ -167,6 +192,7 @@ impl Client {
             tracing::debug!(%err, "_tiStart failed");
         }
         interest?;
+        tracing::debug!("connected");
         Ok(client)
     }
 
@@ -180,7 +206,8 @@ impl Client {
         let xid = self.next_xid();
         let mut payload = Vec::with_capacity(64);
         message::encode(msg, xid, &mut payload);
-        tracing::trace!(id = M::ID, xid, "request");
+        tracing::trace!(parent: &self.span, id = M::ID, xid, "request");
+        let start = Instant::now();
         let (reply, rx) = oneshot::channel();
         self.commands
             .send(Command::Request {
@@ -190,19 +217,26 @@ impl Client {
             })
             .await
             .map_err(|_| Error::Disconnected)?;
-        let bytes = tokio::time::timeout(self.timeout, rx)
-            .await?
-            .map_err(|_| Error::Disconnected)?;
+        let Ok(bytes) = tokio::time::timeout(self.timeout, rx).await else {
+            tracing::debug!(parent: &self.span, id = M::ID, xid, "request timed out");
+            return Err(Error::Timeout);
+        };
+        let bytes = bytes.map_err(|_| Error::Disconnected)?;
+        let elapsed = start.elapsed();
         if let Some(err) = Message::decode(&bytes)?.error() {
+            tracing::debug!(parent: &self.span, id = M::ID, xid, ?elapsed, %err, "request failed");
             return Err(err.into());
         }
+        tracing::trace!(parent: &self.span, id = M::ID, xid, ?elapsed, "response");
         Ok(bytes)
     }
 
     /// Sends an event (no response).
     pub async fn send_event<M: Outgoing + Sync>(&self, msg: &M) -> Result<(), Error> {
         let mut payload = Vec::with_capacity(64);
-        message::encode(msg, self.next_xid(), &mut payload);
+        let xid = self.next_xid();
+        message::encode(msg, xid, &mut payload);
+        tracing::trace!(parent: &self.span, id = M::ID, xid, "event");
         self.commands
             .send(Command::Event { payload })
             .await
@@ -342,12 +376,14 @@ impl Client {
         let (stop, start) =
             tokio::join!(self.request(&TextInputStop), self.request(&TextInputStart));
         if let Err(err) = stop {
-            tracing::debug!(%err, "_tiStop failed");
+            tracing::debug!(parent: &self.span, %err, "_tiStop failed");
         }
         let reply = start?;
         let msg = Message::decode(&reply)?;
         text_input::session(&msg).map_err(|err| {
-            tracing::debug!(%err, data = ?msg.field("_tiD"), "unknown text input data");
+            tracing::debug!(parent: &self.span, %err, "unknown text input data");
+            #[cfg(feature = "sensitive-logs")]
+            tracing::trace!(parent: &self.span, data = ?msg.field("_tiD"), "unknown text input data");
             err.into()
         })
     }
@@ -416,7 +452,7 @@ impl Client {
         {
             Ok(_) => Ok(()),
             Err(Error::Companion(err @ ratv_companion::Error::Device { .. })) => {
-                tracing::debug!(%err, "session already stopped by device");
+                tracing::debug!(parent: &self.span, %err, "session already stopped by device");
                 Ok(())
             }
             Err(err) => Err(err),
@@ -471,8 +507,9 @@ async fn run<S>(
         }
     }
     .await;
-    if let Err(err) = result {
-        tracing::debug!(%err, "companion connection ended");
+    match result {
+        Ok(()) => tracing::debug!("connection closed"),
+        Err(err) => tracing::debug!(%err, "connection ended"),
     }
     let _ = stream.shutdown().await;
 }
@@ -491,10 +528,13 @@ fn dispatch(
         Ok(msg) => msg,
         Err(err) => {
             tracing::debug!(%err, len = payload.len(), "invalid OPACK payload");
+            #[cfg(feature = "sensitive-logs")]
             tracing::trace!(?payload, "invalid OPACK payload");
             return;
         }
     };
+    tracing::trace!(id = ?msg.id(), kind = ?msg.kind(), xid = ?msg.xid(), len = payload.len(), "received");
+    #[cfg(feature = "sensitive-logs")]
     tracing::trace!(?msg, "received");
     match msg.kind() {
         Some(MessageType::Event) => {
@@ -507,6 +547,8 @@ fn dispatch(
             if let Some(i) = pending.iter().position(|(x, _)| *x == xid) {
                 let (_, reply) = pending.swap_remove(i);
                 let _ = reply.send(payload);
+            } else {
+                tracing::trace!(xid, "response without request");
             }
         }
         Some(MessageType::Request) => tracing::trace!(id = ?msg.id(), "ignoring device request"),

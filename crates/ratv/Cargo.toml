@@ -15,6 +15,9 @@ discovery = ["dep:ratv-discovery"]
 mrp = ["dep:ratv-airplay", "dep:ratv-mrp"]
 # Siri voice input from PCM.
 opus = ["mrp", "ratv-mrp/opus"]
+# Logs full messages at trace level. They can contain personal data,
+# for example text input and account names.
+sensitive-logs = []
 
 [dependencies]
 ratv-codec.workspace = true

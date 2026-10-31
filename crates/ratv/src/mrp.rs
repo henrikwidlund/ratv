@@ -38,6 +38,7 @@ use ratv_mrp::{
 use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tracing::{Instrument, Span};
 
 use ratv_airplay::Channel;
 use ratv_airplay::http::Message;
@@ -47,7 +48,7 @@ use ratv_hap::pair_setup::{self, ClientIdentity, NeedPin};
 use tokio::net::TcpStream;
 
 use crate::airplay::{self, Connections, Identity, READ_CHUNK};
-use crate::{Credentials, Error, rng};
+use crate::{Credentials, Error, log, rng};
 
 const COMMAND_CAPACITY: usize = 16;
 const MESSAGE_CAPACITY: usize = 64;
@@ -105,23 +106,31 @@ impl Siri<'_> {
             encoder.flush(|p| pending.push(Bytes::copy_from_slice(p)))?;
         }
         if !self.pending.is_empty() && !self.is_recording() {
-            let start = self.start;
+            let (start, client) = (self.start, self.client);
             let wait = self.recording.wait_for(|&n| n != start);
-            match tokio::time::timeout(self.client.timeout, wait).await {
-                Ok(Ok(_)) => self.started = true,
+            match tokio::time::timeout(client.timeout, wait).await {
+                // `send_pending` sees the change.
+                Ok(Ok(_)) => {}
                 Ok(Err(_)) => return Err(Error::Disconnected),
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    tracing::debug!(parent: &client.span, "Siri did not start recording");
+                    return Err(e.into());
+                }
             }
         }
         self.send_pending().await?;
         let result = self.client.button(Button::Siri, false).await;
         self.held = false;
+        tracing::debug!(parent: &self.client.span, packets = self.sample / messages::VOICE_FRAMES, "Siri released");
         result
     }
 
     /// True once the device has started recording.
     fn is_recording(&mut self) -> bool {
-        self.started = self.started || *self.recording.borrow() != self.start;
+        if !self.started && *self.recording.borrow() != self.start {
+            self.started = true;
+            tracing::debug!(parent: &self.client.span, kept = self.pending.len(), "Siri recording");
+        }
         self.started
     }
 
@@ -143,6 +152,7 @@ impl Siri<'_> {
 impl Drop for Siri<'_> {
     fn drop(&mut self) {
         if self.held {
+            tracing::debug!(parent: &self.client.span, "Siri released on drop");
             self.client.send_now(&Button::Siri.event(false));
         }
         self.client.siri_active.store(false, Ordering::Release);
@@ -220,6 +230,7 @@ impl Default for PairOptions {
 
 /// AirPlay pairing that waits for the PIN shown on the device.
 pub struct PinPrompt {
+    span: Span,
     link: PairLink,
     state: NeedPin,
     options: PairOptions,
@@ -236,6 +247,17 @@ impl core::fmt::Debug for PinPrompt {
 /// Asks the AirPlay service at `addr` to show a PIN and starts pair-setup.
 /// Complete it with [`PinPrompt::finish`].
 pub async fn pair(addr: SocketAddr, options: &PairOptions) -> Result<PinPrompt, Error> {
+    let span = log::session("airplay pairing", Some(addr));
+    pair_inner(addr, options, span.clone())
+        .instrument(span)
+        .await
+}
+
+async fn pair_inner(
+    addr: SocketAddr,
+    options: &PairOptions,
+    span: Span,
+) -> Result<PinPrompt, Error> {
     let stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
     let local = stream.local_addr()?.ip().to_string();
@@ -250,7 +272,9 @@ pub async fn pair(addr: SocketAddr, options: &PairOptions) -> Result<PinPrompt, 
     link.receive().await?;
     let (m1, state) = pair_setup::start(false);
     let m2 = link.step(&m1, name).await?;
+    tracing::debug!("waiting for PIN");
     Ok(PinPrompt {
+        span,
         link,
         state: state.handle_m2(&m2.body())?,
         options: options.clone(),
@@ -260,7 +284,13 @@ pub async fn pair(addr: SocketAddr, options: &PairOptions) -> Result<PinPrompt, 
 impl PinPrompt {
     /// Completes pairing with the PIN shown on the device.
     pub async fn finish(self, pin: &str) -> Result<Credentials, Error> {
+        let span = self.span.clone();
+        self.finish_inner(pin).instrument(span).await
+    }
+
+    async fn finish_inner(self, pin: &str) -> Result<Credentials, Error> {
         let Self {
+            span: _,
             mut link,
             state,
             options,
@@ -276,13 +306,16 @@ impl PinPrompt {
         let (m3, state) = state.submit_pin(pin, &mut rng)?;
         let m4 = link.step(&m3, name).await?;
         let verified = state.handle_m4(&m4.body())?;
+        tracing::debug!("PIN accepted");
         let identity = ClientIdentity {
             id: client_id.as_bytes(),
             metadata: Some(&metadata),
         };
         let (m5, state) = verified.exchange(identity, &mut rng);
         let m6 = link.step(&m5, name).await?;
-        Ok(state.handle_m6(&m6.body())?)
+        let credentials = state.handle_m6(&m6.body())?;
+        tracing::debug!("paired");
+        Ok(credentials)
     }
 }
 
@@ -341,6 +374,7 @@ pub struct Client {
     voice_device: tokio::sync::OnceCell<i32>,
     /// True while a [`Siri`] exists.
     siri_active: AtomicBool,
+    span: Span,
 }
 
 impl Client {
@@ -350,6 +384,19 @@ impl Client {
         credentials: &Credentials,
         options: &ClientOptions,
     ) -> Result<Self, Error> {
+        let span = log::session("mrp", Some(addr));
+        Self::start(addr, credentials, options, span.clone())
+            .instrument(span)
+            .await
+    }
+
+    async fn start(
+        addr: SocketAddr,
+        credentials: &Credentials,
+        options: &ClientOptions,
+        span: Span,
+    ) -> Result<Self, Error> {
+        tracing::debug!("connecting");
         let device_id = options
             .device_id
             .clone()
@@ -397,6 +444,11 @@ impl Client {
             }
         };
 
+        tracing::debug!(
+            model = device.model_id.as_deref(),
+            build = device.system_build_version.as_deref(),
+            "device info received"
+        );
         state.volume.set_device(&device);
         let output_uid = state.volume.output_device_uid().map(str::to_owned);
 
@@ -424,7 +476,8 @@ impl Client {
         let (requests, rx) = mpsc::channel(COMMAND_CAPACITY);
         let (messages, _) = broadcast::channel(MESSAGE_CAPACITY);
         state.publish();
-        let task = tokio::spawn(run(conns, rx, messages.clone(), state));
+        let task = tokio::spawn(run(conns, rx, messages.clone(), state).instrument(span.clone()));
+        tracing::debug!("connected");
         Ok(Self {
             requests,
             messages,
@@ -438,6 +491,7 @@ impl Client {
             siri_active: AtomicBool::new(false),
             timeout: options.timeout,
             task,
+            span,
         })
     }
 
@@ -474,9 +528,12 @@ impl Client {
     /// Sends a message and waits for the response with the same identifier.
     /// Device errors are returned as `Err`.
     pub async fn request<P: Payload>(&self, msg: &P) -> Result<Envelope, Error> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = n.to_string();
         let mut payload = BytesMut::new();
         encode(msg, Some(&id), &mut payload);
+        tracing::trace!(parent: &self.span, kind = P::TYPE, id = n, "request");
+        let start = std::time::Instant::now();
         let (tx, rx) = oneshot::channel();
         self.requests
             .send(Request::Send {
@@ -485,12 +542,17 @@ impl Client {
             })
             .await
             .map_err(|_| Error::Disconnected)?;
-        let env = tokio::time::timeout(self.timeout, rx)
-            .await?
-            .map_err(|_| Error::Disconnected)?;
+        let Ok(env) = tokio::time::timeout(self.timeout, rx).await else {
+            tracing::debug!(parent: &self.span, kind = P::TYPE, id = n, "request timed out");
+            return Err(Error::Timeout);
+        };
+        let env = env.map_err(|_| Error::Disconnected)?;
+        let elapsed = start.elapsed();
         if let Some(err) = env.error() {
+            tracing::debug!(parent: &self.span, kind = P::TYPE, id = n, ?elapsed, %err, "request failed");
             return Err(err.into());
         }
+        tracing::trace!(parent: &self.span, kind = P::TYPE, id = n, ?elapsed, "response");
         Ok(env)
     }
 
@@ -498,6 +560,7 @@ impl Client {
     pub async fn send<P: Payload>(&self, msg: &P) -> Result<(), Error> {
         let mut payload = BytesMut::new();
         encode(msg, None, &mut payload);
+        tracing::trace!(parent: &self.span, kind = P::TYPE, "send");
         self.requests
             .send(Request::Send {
                 payload,
@@ -535,6 +598,7 @@ impl Client {
         self.voice_device().await?;
         self.button(Button::Siri, true).await?;
         siri.held = true;
+        tracing::debug!(parent: &self.span, "Siri pressed");
         Ok(siri)
     }
 
@@ -544,7 +608,11 @@ impl Client {
                 let env = self.request(&messages::register_voice_input()).await?;
                 let reply: proto::RegisterVoiceInputDeviceResponseMessage = env.payload()?;
                 match reply.error_code.unwrap_or(0) {
-                    0 => Ok(reply.device_id.unwrap_or(0)),
+                    0 => {
+                        let id = reply.device_id.unwrap_or(0);
+                        tracing::debug!(parent: &self.span, id, "voice input device registered");
+                        Ok(id)
+                    }
                     code => Err(ratv_mrp::Error::Device {
                         code,
                         description: "voice input registration failed".into(),
@@ -855,8 +923,9 @@ async fn run(
     messages: broadcast::Sender<Envelope>,
     state: State,
 ) {
-    if let Err(err) = run_inner(conns, requests, &messages, state).await {
-        tracing::debug!(%err, "MRP connection ended");
+    match run_inner(conns, requests, &messages, state).await {
+        Ok(()) => tracing::debug!("connection closed"),
+        Err(err) => tracing::debug!(%err, "connection ended"),
     }
 }
 
@@ -912,6 +981,7 @@ async fn run_inner(
                 None => return Ok(()),
             },
             _ = feedback.tick() => {
+                tracing::trace!("feedback");
                 session.feedback(&mut channel);
                 airplay::flush(&mut control, &mut channel).await?;
             }
@@ -952,6 +1022,8 @@ fn dispatch(
     state: &mut State,
 ) {
     tracing::trace!(kind = env.kind(), id = ?env.identifier(), "received");
+    #[cfg(feature = "sensitive-logs")]
+    tracing::trace!(?env, "received");
     state.apply(&env);
     if let Some(id) = env.identifier()
         && let Some(i) = pending.iter().position(|(p, _)| p == id)

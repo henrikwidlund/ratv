@@ -6,9 +6,10 @@ use ratv_hap::Credentials;
 use ratv_hap::pair_setup::{self, ClientIdentity, NeedPin};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tracing::{Instrument, Span};
 
 use super::io::pairing_step;
-use crate::{Error, rng};
+use crate::{Error, log, rng};
 
 /// Options for Companion pairing.
 #[derive(Debug, Clone)]
@@ -33,6 +34,7 @@ impl Default for PairOptions {
 
 /// The device shows a PIN. Call [`PinPrompt::finish`] with it.
 pub struct PinPrompt<S> {
+    span: Span,
     stream: S,
     conn: Connection,
     state: NeedPin,
@@ -50,13 +52,26 @@ impl<S> core::fmt::Debug for PinPrompt<S> {
 
 /// Connects to `addr` and starts pairing. The device shows a PIN when this returns.
 pub async fn pair(addr: SocketAddr, options: &PairOptions) -> Result<PinPrompt<TcpStream>, Error> {
-    let stream = TcpStream::connect(addr).await?;
-    stream.set_nodelay(true)?;
-    pair_stream(stream, options).await
+    let span = log::session("companion pairing", Some(addr));
+    async {
+        let stream = TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        start(stream, options, Span::current()).await
+    }
+    .instrument(span)
+    .await
 }
 
 /// Starts pairing on an existing stream.
-pub async fn pair_stream<S>(mut stream: S, options: &PairOptions) -> Result<PinPrompt<S>, Error>
+pub async fn pair_stream<S>(stream: S, options: &PairOptions) -> Result<PinPrompt<S>, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let span = log::session("companion pairing", None);
+    start(stream, options, span.clone()).instrument(span).await
+}
+
+async fn start<S>(mut stream: S, options: &PairOptions, span: Span) -> Result<PinPrompt<S>, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -65,7 +80,9 @@ where
     let (m1, state) = pair_setup::start(false);
     let m2 = pairing_step(&mut stream, &mut conn, Flow::Setup, true, &m1, &mut buf).await?;
     let state = state.handle_m2(&m2)?;
+    tracing::debug!("waiting for PIN");
     Ok(PinPrompt {
+        span,
         stream,
         conn,
         state,
@@ -76,7 +93,12 @@ where
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PinPrompt<S> {
     /// Completes pairing with the PIN shown on the device.
-    pub async fn finish(mut self, pin: &str) -> Result<Credentials, Error> {
+    pub async fn finish(self, pin: &str) -> Result<Credentials, Error> {
+        let span = self.span.clone();
+        self.finish_inner(pin).instrument(span).await
+    }
+
+    async fn finish_inner(mut self, pin: &str) -> Result<Credentials, Error> {
         let mut rng = rng::os();
         let mut buf = Vec::with_capacity(1024);
         let (m3, state) = self.state.submit_pin(pin, &mut rng)?;
@@ -90,6 +112,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PinPrompt<S> {
         )
         .await?;
         let verified = state.handle_m4(&m4)?;
+        tracing::debug!("PIN accepted");
 
         let metadata = ClientInfo {
             account_id: &self.client_id,
@@ -113,6 +136,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PinPrompt<S> {
             &mut buf,
         )
         .await?;
-        Ok(state.handle_m6(&m6)?)
+        let credentials = state.handle_m6(&m6)?;
+        tracing::debug!("paired");
+        Ok(credentials)
     }
 }

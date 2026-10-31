@@ -186,6 +186,12 @@ impl AppleTv {
         if tv.companion.is_none() && tv.mrp.is_none() {
             return Err(first_error.unwrap_or(Error::NotConnected("no endpoints")));
         }
+        let (companion, mrp) = (tv.companion.is_some(), tv.mrp.is_some());
+        if let Some(err) = first_error {
+            tracing::warn!(%err, companion, mrp, "one protocol failed to connect");
+        } else {
+            tracing::debug!(companion, mrp, "connected");
+        }
         Ok(tv)
     }
 
@@ -569,7 +575,7 @@ impl AppleTv {
     }
 }
 
-/// Returns the client, or logs the error and stores the first one.
+/// Returns the client, or logs the error and keeps the first one.
 fn keep<T>(
     name: &str,
     result: Option<Result<T, Error>>,
@@ -578,7 +584,7 @@ fn keep<T>(
     match result? {
         Ok(client) => Some(client),
         Err(err) => {
-            tracing::warn!(%err, "{name} connection failed");
+            tracing::debug!(%err, protocol = name, "connection failed");
             first_error.get_or_insert(err);
             None
         }

@@ -60,6 +60,7 @@ pub(crate) async fn connect(
     let m4 = ok(tokio::time::timeout(timeout, exchange(&mut control, &mut channel)).await??)?;
     let secret = state.handle_m4(&m4.body())?;
     channel.enable_encryption(keys::control(&secret, Side::Client));
+    tracing::debug!("pair-verify done");
 
     // Borrows end with the block, so TEARDOWN can be sent if a step fails.
     let streams = async {
@@ -80,6 +81,7 @@ pub(crate) async fn connect(
         );
         let resp = tokio::time::timeout(timeout, exchange(&mut control, &mut channel)).await??;
         let event_port = rtsp::event_port(&resp)?;
+        tracing::debug!(event_port, "event SETUP done");
 
         let mut events = TcpStream::connect(SocketAddr::new(addr.ip(), event_port)).await?;
         events.set_nodelay(true)?;
@@ -111,6 +113,7 @@ pub(crate) async fn connect(
         .await??;
         rtsp::check(&record)?;
         let (data_port, _) = rtsp::data_stream_port(&resp)?;
+        tracing::debug!(data_port, "RECORD and data stream SETUP done");
 
         let data = TcpStream::connect(SocketAddr::new(addr.ip(), data_port)).await?;
         data.set_nodelay(true)?;
@@ -124,6 +127,7 @@ pub(crate) async fn connect(
     let (events, event_channel, data, stream) = match streams {
         Ok(s) => s,
         Err(err) => {
+            tracing::debug!(%err, "setup failed");
             teardown(&mut control, &mut channel, &mut session).await;
             return Err(err);
         }
@@ -150,6 +154,7 @@ pub(crate) async fn teardown(
     channel: &mut Channel,
     session: &mut Session,
 ) {
+    tracing::debug!("TEARDOWN");
     session.teardown(channel);
     let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, flush(control, channel)).await;
 }

@@ -38,6 +38,8 @@ pub mod companion;
 #[cfg(feature = "discovery")]
 pub mod discovery;
 mod error;
+#[cfg(any(feature = "companion", feature = "mrp"))]
+mod log;
 #[cfg(feature = "mrp")]
 pub mod mrp;
 #[cfg(any(feature = "companion", feature = "mrp"))]

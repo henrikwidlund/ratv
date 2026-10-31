@@ -85,17 +85,34 @@ Audio is kept until the TV records, then sent. With feature `opus`, send
 
 ## Features
 
-| Feature     | Default | Content            |
-|-------------|---------|--------------------|
-| `companion` | yes     | Companion protocol |
-| `mrp`       | yes     | MRP over AirPlay 2 |
-| `discovery` | yes     | mDNS scan          |
-| `opus`      | no      | Siri input as PCM  |
+| Feature          | Default | Content                                                      |
+|------------------|---------|--------------------------------------------------------------|
+| `companion`      | yes     | Companion protocol                                           |
+| `mrp`            | yes     | MRP over AirPlay 2                                           |
+| `discovery`      | yes     | mDNS scan                                                    |
+| `opus`           | no      | Siri input as PCM                                            |
+| `sensitive-logs` | no      | Full messages in trace logs. They can contain personal data. |
 
 `AppleTv` needs `companion` and `mrp`. Small build for ARM boards:
 
 ```sh
 cargo build -p ratv --no-default-features --features companion --profile embedded --target aarch64-unknown-linux-gnu
+```
+
+## Logging
+
+The library logs with [`tracing`](https://docs.rs/tracing). Each connection
+and pairing has a `session` span with `protocol`, `id` and `addr`.
+
+- `warn`: the library continues with less function.
+- `debug`: connect, disconnect, handshake steps, failed or timed out requests, Siri steps.
+- `trace`: each message sent and received, with kind, id and size.
+
+Errors are returned, not logged. Credentials, keys, PINs, text, account data
+and audio are not logged. Feature `sensitive-logs` adds full messages at `trace`.
+
+```sh
+RUST_LOG=ratv=debug cargo run --example remote -- "$CREDENTIALS" play
 ```
 
 ## Crates
