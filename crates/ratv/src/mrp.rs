@@ -153,9 +153,15 @@ impl Siri {
             }
             return Ok(());
         }
-        for packet in &self.pending {
+        let mut sent = 0;
+        while let Some(packet) = self.pending.get(sent) {
             let msg = messages::voice_input(packet.clone(), self.sample);
-            self.client.send(&msg).await?;
+            if let Err(err) = self.client.send(&msg).await {
+                // Sent packets are not sent again.
+                self.pending.drain(..sent);
+                return Err(err);
+            }
+            sent += 1;
             self.sample = self.sample.wrapping_add(messages::VOICE_FRAMES);
         }
         self.pending.clear();
@@ -406,7 +412,7 @@ impl Client {
         let device_id = options
             .device_id
             .clone()
-            .unwrap_or_else(|| rng::mac_string(rng::bytes()));
+            .unwrap_or_else(|| rng::stable_device_id(credentials.client_id()));
         let identity = Identity {
             name: &options.name,
             model: &options.model,
@@ -417,7 +423,10 @@ impl Client {
         let mut conns = airplay::connect(addr, credentials, &identity, options.timeout).await?;
 
         // DEVICE_INFO must be answered before anything else is sent.
-        let unique = options.unique_identifier.clone().unwrap_or_else(rng::uuid);
+        let unique = options
+            .unique_identifier
+            .clone()
+            .unwrap_or_else(|| rng::stable_uuid(credentials.client_id()));
         let mut out = BytesMut::new();
         let info = messages::device_info(&messages::ClientInfo {
             unique_identifier: &unique,
@@ -429,14 +438,7 @@ impl Client {
         let (np_tx, now_playing) = watch::channel(NowPlaying::default());
         let (volume_tx, volume) = watch::channel(Volume::default());
         let (recording_tx, recording) = watch::channel(0);
-        let mut state = State {
-            now_playing: NowPlayingState::new(),
-            now_playing_tx: np_tx,
-            volume: VolumeState::new(),
-            volume_tx,
-            recording_tx,
-            item_id: None,
-        };
+        let mut state = State::new(np_tx, volume_tx, recording_tx);
         let device =
             tokio::time::timeout(options.timeout, wait_device_info(&mut conns, &mut state))
                 .await
@@ -556,13 +558,14 @@ impl Client {
         id: Option<u32>,
         reply: Option<oneshot::Sender<Envelope>>,
     ) -> Result<(), Error> {
-        if !self.inner.link.is_open() {
-            return Err(Error::Disconnected);
-        }
         let mut buf = [0; 10];
         let id_text = id.map(|n| id_str(n, &mut buf));
         {
             let mut out = self.inner.shared.outbox();
+            // Checked while locked: the task clears `pending` after the link closes.
+            if !self.inner.link.is_open() {
+                return Err(Error::Disconnected);
+            }
             if out.buf.len() > MAX_OUTBOX {
                 return Err(Error::QueueFull);
             }
@@ -586,7 +589,9 @@ impl Client {
         self.queue(msg, Some(n), Some(tx))?;
         let Ok(env) = tokio::time::timeout(self.inner.timeout, rx).await else {
             tracing::debug!(parent: &self.inner.span, kind = P::TYPE, id = n, "request timed out");
-            return Err(Error::Timeout);
+            let name = proto::protocol_message::Type::try_from(P::TYPE)
+                .map_or("MRP request", |t| t.as_str_name());
+            return Err(Error::NoAnswer(name));
         };
         let env = env.map_err(|_| Error::Disconnected)?;
         let elapsed = start.elapsed();
@@ -673,10 +678,17 @@ impl Client {
         self.button(button, false).await
     }
 
-    /// Holds a button for `duration`.
+    /// Holds a button for `duration`. The button is released also if the
+    /// returned future is dropped.
     pub async fn hold(&self, button: Button, duration: Duration) -> Result<(), Error> {
+        let mut held = Held {
+            client: self,
+            button,
+            armed: true,
+        };
         self.button(button, true).await?;
         tokio::time::sleep(duration).await;
+        held.armed = false;
         self.button(button, false).await
     }
 
@@ -725,7 +737,8 @@ impl Client {
     }
 
     /// Requests the image of the current item in about this size.
-    /// A size of -1 keeps the aspect ratio. `None` if the item has no image.
+    /// A size of -1 keeps the aspect ratio. This is not the same as
+    /// [`NowPlaying::artwork_url_sized`], which uses 0. `None` if the item has no image.
     ///
     /// Right after connect the device may not answer with an image yet.
     /// Wait until [`NowPlaying::artwork_id`] is set, and fetch again when it changes.
@@ -738,6 +751,7 @@ impl Client {
 
     /// Sets the volume of the device, 0.0 to 1.0.
     pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
+        let volume = crate::volume_level(volume)?;
         self.send(&messages::set_volume(volume, self.output_uid()?))
             .await
     }
@@ -798,6 +812,7 @@ impl Client {
 
     /// Sets the volume, 0.0 to 1.0, of one output device. UIDs are in [`Volume::outputs`].
     pub async fn set_output_volume(&self, uid: &str, volume: f32) -> Result<(), Error> {
+        let volume = crate::volume_level(volume)?;
         self.send(&messages::set_volume(volume, uid)).await
     }
 
@@ -826,11 +841,15 @@ impl Client {
 
     /// Ends the session and closes the connections of all clones.
     pub async fn close(&self) -> Result<(), Error> {
-        if !self.inner.link.is_open() {
-            return Ok(());
-        }
         let (tx, rx) = oneshot::channel();
-        self.inner.shared.outbox().close = Some(tx);
+        {
+            let mut out = self.inner.shared.outbox();
+            // Checked while locked: the task drops `close` after the link closes.
+            if !self.inner.link.is_open() {
+                return Ok(());
+            }
+            out.close = Some(tx);
+        }
         self.inner.shared.wake.notify_one();
         let _ = rx.await;
         self.inner.link.closed().await;
@@ -838,15 +857,29 @@ impl Client {
     }
 }
 
+/// Releases a button when dropped while armed.
+struct Held<'a> {
+    client: &'a Client,
+    button: Button,
+    armed: bool,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.client.queue(&self.button.event(false), None, None);
+        }
+    }
+}
+
 async fn wait_device_info(
     conns: &mut Connections,
     state: &mut State,
 ) -> Result<proto::DeviceInfoMessage, Error> {
-    use tokio::io::AsyncWriteExt;
     let mut device = None;
     loop {
         if conns.stream.has_transmit() {
-            conns.data.write_all(&conns.stream.take_transmit()).await?;
+            tcp::write_all(&mut conns.data, &conns.stream.take_transmit()).await?;
         }
         // Messages after DEVICE_INFO in the same read are applied too, so none are lost.
         while let Some(data) = conns.stream.poll()? {
@@ -858,6 +891,7 @@ async fn wait_device_info(
                 state.apply(&env);
             }
         }
+        state.publish();
         if let Some(device) = device {
             return Ok(device);
         }
@@ -889,19 +923,38 @@ struct State {
     recording_tx: watch::Sender<u32>,
     /// Item that details were requested for.
     item_id: Option<String>,
+    /// Now playing changed since the last `publish`.
+    now_playing_changed: bool,
+    /// Volume changed since the last `publish`.
+    volume_changed: bool,
 }
 
 impl State {
-    /// Updates the state and publishes changes.
+    fn new(
+        now_playing_tx: watch::Sender<NowPlaying>,
+        volume_tx: watch::Sender<Volume>,
+        recording_tx: watch::Sender<u32>,
+    ) -> Self {
+        Self {
+            now_playing: NowPlayingState::new(),
+            now_playing_tx,
+            volume: VolumeState::new(),
+            volume_tx,
+            recording_tx,
+            item_id: None,
+            now_playing_changed: false,
+            volume_changed: false,
+        }
+    }
+
+    /// Updates the state. Call [`publish`](Self::publish) after a batch of messages.
     fn apply(&mut self, env: &Envelope) {
         match self.now_playing.apply(env) {
-            Ok(true) => publish(&self.now_playing_tx, self.now_playing.now_playing()),
-            Ok(false) => {}
+            Ok(changed) => self.now_playing_changed |= changed,
             Err(err) => tracing::debug!(%err, kind = env.kind(), "invalid now playing message"),
         }
         match self.volume.apply(env) {
-            Ok(true) => publish(&self.volume_tx, self.volume.volume().clone()),
-            Ok(false) => {}
+            Ok(changed) => self.volume_changed |= changed,
             Err(err) => tracing::debug!(%err, kind = env.kind(), "invalid volume message"),
         }
         if is_recording(env) {
@@ -919,10 +972,14 @@ impl State {
         id.is_some()
     }
 
-    /// Publishes the current state.
-    fn publish(&self) {
-        publish(&self.now_playing_tx, self.now_playing.now_playing());
-        publish(&self.volume_tx, self.volume.volume().clone());
+    /// Publishes what changed since the last call.
+    fn publish(&mut self) {
+        if std::mem::take(&mut self.now_playing_changed) {
+            publish(&self.now_playing_tx, self.now_playing.now_playing());
+        }
+        if std::mem::take(&mut self.volume_changed) {
+            publish(&self.volume_tx, self.volume.volume().clone());
+        }
     }
 }
 
@@ -955,8 +1012,10 @@ async fn run(
         }
     };
     link.close(reason);
-    // Waiting requests fail right away.
-    shared.outbox().pending.clear();
+    // Waiting requests fail and `close` returns right away.
+    let mut out = shared.outbox();
+    out.pending.clear();
+    out.close = None;
 }
 
 async fn run_inner(
@@ -965,8 +1024,6 @@ async fn run_inner(
     messages: &broadcast::Sender<Envelope>,
     mut state: State,
 ) -> Result<(), Error> {
-    use tokio::io::AsyncWriteExt;
-
     let Connections {
         mut control,
         mut channel,
@@ -977,6 +1034,7 @@ async fn run_inner(
         mut stream,
     } = conns;
     let mut details = BytesMut::new();
+    let mut received = Vec::new();
     let start = tokio::time::Instant::now() + FEEDBACK_INTERVAL;
     let mut feedback = tokio::time::interval_at(start, FEEDBACK_INTERVAL);
     let mut last_control = tokio::time::Instant::now();
@@ -993,7 +1051,7 @@ async fn run_inner(
             stream.send(&details);
         }
         if stream.has_transmit() {
-            data.write_all(&stream.take_transmit()).await?;
+            tcp::write_all(&mut data, &stream.take_transmit()).await?;
         }
         tokio::select! {
             () = shared.wake.notified() => {
@@ -1005,7 +1063,7 @@ async fn run_inner(
                 stream.send(&chunk);
                 if let Some(done) = close {
                     if stream.has_transmit() {
-                        data.write_all(&stream.take_transmit()).await?;
+                        tcp::write_all(&mut data, &stream.take_transmit()).await?;
                     }
                     airplay::teardown(&mut control, &mut channel, &mut session).await;
                     let _ = done.send(());
@@ -1015,7 +1073,7 @@ async fn run_inner(
             _ = feedback.tick() => {
                 if last_control.elapsed() > FEEDBACK_TIMEOUT {
                     tracing::debug!("no answer to feedback");
-                    return Err(Error::Timeout);
+                    return Err(Error::NoAnswer("feedback"));
                 }
                 tracing::trace!("feedback");
                 session.feedback(&mut channel);
@@ -1044,24 +1102,28 @@ async fn run_inner(
                 }
                 while let Some(bytes) = stream.poll()? {
                     for env in frames(bytes) {
-                        dispatch(env?, shared, messages, &mut state);
+                        let env = env?;
+                        state.apply(&env);
+                        received.push(env);
                     }
+                }
+                // Once per read, so a burst of updates builds the state once.
+                // Before the replies, so a caller sees the new state.
+                state.publish();
+                // `drain` keeps the capacity for the next read.
+                #[allow(clippy::iter_with_drain)]
+                for env in received.drain(..) {
+                    dispatch(env, shared, messages);
                 }
             }
         }
     }
 }
 
-fn dispatch(
-    env: Envelope,
-    shared: &Shared,
-    messages: &broadcast::Sender<Envelope>,
-    state: &mut State,
-) {
+fn dispatch(env: Envelope, shared: &Shared, messages: &broadcast::Sender<Envelope>) {
     tracing::trace!(kind = env.kind(), id = ?env.identifier(), "received");
     #[cfg(feature = "sensitive-logs")]
     tracing::trace!(?env, "received");
-    state.apply(&env);
     if let Some(id) = env.identifier().and_then(|id| id.parse::<u32>().ok()) {
         let reply = {
             let mut out = shared.outbox();

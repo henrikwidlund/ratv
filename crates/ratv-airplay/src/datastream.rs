@@ -14,8 +14,6 @@
 //! where `data` holds length-prefixed MRP messages. Every `sync` is answered
 //! with an empty `rply` with the same sequence number.
 
-use std::borrow::Cow;
-
 use bytes::{Bytes, BytesMut};
 use ratv_codec::bplist::{self, Value};
 
@@ -66,17 +64,10 @@ impl DataStream {
     /// Queues MRP messages. `messages` holds one or more length-prefixed
     /// `ProtocolMessage`s.
     pub fn send(&mut self, messages: &[u8]) {
-        let payload = Value::Dict(vec![(
-            Cow::Borrowed("params"),
-            Value::Dict(vec![(
-                Cow::Borrowed("data"),
-                Value::Data(Cow::Borrowed(messages)),
-            )]),
-        )]);
         let mut buf = std::mem::take(&mut self.scratch);
         buf.clear();
         buf.resize(HEADER_LEN, 0);
-        payload.encode_into(&mut buf);
+        write_payload(messages, &mut buf);
         let size = u32::try_from(buf.len()).expect("message size fits in u32");
         write_header(&mut buf[..HEADER_LEN], size, SYNC, *COMMAND, self.seqno);
         self.seqno = self.seqno.wrapping_add(1);
@@ -127,6 +118,60 @@ impl DataStream {
     }
 }
 
+/// Start of the payload plist up to the data object: header, the outer dict,
+/// `"params"`, the inner dict and `"data"`. Dicts hold one key and value
+/// as 1-byte object numbers.
+const PAYLOAD_START: &[u8] = b"bplist00\xD1\x01\x02\x56params\xD1\x03\x04\x54data";
+/// Offsets of objects 0 to 4 in the plist. Object 4 is the data.
+const PAYLOAD_OFFSETS: [u8; 5] = [8, 11, 18, 21, 26];
+
+/// Writes the binary plist `{"params": {"data": data}}` without building a value tree.
+fn write_payload(data: &[u8], out: &mut Vec<u8>) {
+    let start = out.len();
+    out.reserve(PAYLOAD_START.len() + 9 + data.len() + PAYLOAD_OFFSETS.len() + 32);
+    out.extend_from_slice(PAYLOAD_START);
+    let len = data.len();
+    if len < 15 {
+        // Short data has its length in the marker.
+        out.push(0x40 | len as u8);
+    } else {
+        // Long data: marker 0x4F, then the length as an integer object.
+        out.push(0x4F);
+        if let Ok(n) = u8::try_from(len) {
+            out.extend_from_slice(&[0x10, n]);
+        } else if let Ok(n) = u16::try_from(len) {
+            out.push(0x11);
+            out.extend_from_slice(&n.to_be_bytes());
+        } else if let Ok(n) = u32::try_from(len) {
+            out.push(0x12);
+            out.extend_from_slice(&n.to_be_bytes());
+        } else {
+            out.push(0x13);
+            out.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+    }
+    out.extend_from_slice(data);
+    let table = (out.len() - start) as u64;
+    // The device needs offset entries large enough for the table position,
+    // although all objects start in the first bytes.
+    let offset_size: u8 = match table {
+        0..=0xFF => 1,
+        0x100..=0xFFFF => 2,
+        0x1_0000..=0xFFFF_FFFF => 4,
+        _ => 8,
+    };
+    for offset in PAYLOAD_OFFSETS {
+        let be = u64::from(offset).to_be_bytes();
+        out.extend_from_slice(&be[8 - usize::from(offset_size)..]);
+    }
+    // Trailer: 6 unused bytes, offset size, reference size 1, object
+    // count, top object 0, offset table position.
+    out.extend_from_slice(&[0, 0, 0, 0, 0, 0, offset_size, 1]);
+    out.extend_from_slice(&(PAYLOAD_OFFSETS.len() as u64).to_be_bytes());
+    out.extend_from_slice(&0u64.to_be_bytes());
+    out.extend_from_slice(&table.to_be_bytes());
+}
+
 fn write_header(out: &mut [u8], size: u32, kind: &[u8; 12], command: [u8; 4], seqno: u64) {
     out[..4].copy_from_slice(&size.to_be_bytes());
     out[4..16].copy_from_slice(kind);
@@ -165,6 +210,32 @@ mod tests {
     fn deliver(from: &mut DataStream, to: &mut DataStream) {
         let bytes = from.take_transmit();
         to.receive_buffer(bytes.len()).extend_from_slice(&bytes);
+    }
+
+    #[test]
+    fn payload_matches_plist_encoder() {
+        for len in [0, 14, 15, 200, 254, 255, 256, 1000, 65_535, 65_536, 100_000] {
+            let data: Vec<u8> = (0..=255u8).cycle().take(len).collect();
+            let value = Value::Dict(vec![(
+                "params".into(),
+                Value::Dict(vec![("data".into(), Value::Data(data.as_slice().into()))]),
+            )]);
+            let mut new = Vec::new();
+            write_payload(&data, &mut new);
+            assert_eq!(new, value.encode(), "len {len}");
+        }
+    }
+
+    #[test]
+    fn payload_is_valid_plist() {
+        for len in [0, 1, 14, 15, 255, 256, 65_535, 65_536] {
+            let data: Vec<u8> = (0..=255u8).cycle().take(len).collect();
+            let mut out = Vec::new();
+            write_payload(&data, &mut out);
+            let v = bplist::decode(&out).unwrap();
+            let got = v.get("params").and_then(|p| p.get("data"));
+            assert_eq!(got.and_then(Value::as_bytes), Some(&data[..]), "len {len}");
+        }
     }
 
     #[test]

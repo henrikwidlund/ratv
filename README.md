@@ -78,9 +78,10 @@ async fn control() -> Result<(), Box<dyn std::error::Error>> {
         np.changed().await?;
         println!("{:?}", np.borrow().title);
     }
-    // Returns when a connection closes. Connect again to continue.
+    // Returns when one connection closes. Close all, then connect again.
     let reason = tv.closed().await;
     println!("closed: {reason:?}");
+    tv.close().await?;
     Ok(())
 }
 ```

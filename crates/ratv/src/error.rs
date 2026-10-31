@@ -32,6 +32,12 @@ pub enum Error {
     /// The protocol needed for this call is not connected.
     #[error("{0} is not connected")]
     NotConnected(&'static str),
+    /// No address to connect to was given.
+    #[error("no endpoints")]
+    NoEndpoints,
+    /// A value is outside its range, for example a volume of NaN.
+    #[error("invalid {0}")]
+    InvalidArgument(&'static str),
     /// No text field has focus on the device.
     #[error("no text field has focus")]
     NoTextField,
@@ -44,9 +50,12 @@ pub enum Error {
     /// The item has no next or previous chapter.
     #[error("no such chapter")]
     NoChapter,
-    /// Device did not answer in time.
-    #[error("request timed out")]
+    /// Connecting, a handshake step or a write did not finish in time.
+    #[error("timed out")]
     Timeout,
+    /// The device did not answer this request in time.
+    #[error("no answer to {0}")]
+    NoAnswer(&'static str),
     /// Connection is closed.
     #[error("connection closed")]
     Disconnected,

@@ -132,10 +132,8 @@ fn print(env: &Envelope) {
 
 async fn connect(credentials: &str, ip: IpAddr) -> Result<AppleTv, Box<dyn std::error::Error>> {
     let credentials = credentials::load(credentials)?;
-    let options = ScanOptions {
-        targets: vec![SocketAddr::new(ip, MDNS_PORT)],
-        ..ScanOptions::default()
-    };
+    let mut options = ScanOptions::default();
+    options.targets = vec![SocketAddr::new(ip, MDNS_PORT)];
     let devices = scan(&options).await?;
     let device = devices.first().ok_or("device not found")?;
     let tv = AppleTv::connect(

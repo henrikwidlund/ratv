@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use socket2::{SockRef, TcpKeepalive};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::Error;
@@ -17,6 +18,20 @@ const KEEPALIVE_RETRIES: u32 = 3;
 /// Time that sent data can stay without acknowledgement before the connection fails.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const USER_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Time a write can wait for the device to read.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Writes and flushes all of `buf`. Fails with [`Error::Timeout`] if the
+/// device does not read it in time.
+pub(crate) async fn write_all<W: AsyncWrite + Unpin>(w: &mut W, buf: &[u8]) -> Result<(), Error> {
+    tokio::time::timeout(WRITE_TIMEOUT, async {
+        w.write_all(buf).await?;
+        w.flush().await
+    })
+    .await??;
+    Ok(())
+}
 
 /// Connects with a timeout, turns off Nagle's algorithm and turns on keepalive.
 ///

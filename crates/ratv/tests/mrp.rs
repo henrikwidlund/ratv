@@ -507,10 +507,9 @@ fn handle_volume(env: &Envelope, id: Option<&str>, log: &Arc<Mutex<Log>>) -> Opt
 }
 
 fn options() -> ClientOptions {
-    ClientOptions {
-        timeout: Duration::from_secs(2),
-        ..ClientOptions::default()
-    }
+    let mut options = ClientOptions::default();
+    options.timeout = Duration::from_secs(2);
+    options
 }
 
 #[tokio::test]
@@ -692,7 +691,7 @@ async fn closed_without_feedback_answer() {
     tokio::time::pause();
     let reason = client.closed().await;
     assert!(
-        matches!(reason.as_deref(), Some(Error::Timeout)),
+        matches!(reason.as_deref(), Some(Error::NoAnswer("feedback"))),
         "{reason:?}"
     );
     assert!(device.log.lock().unwrap().feedback >= 4);
@@ -733,10 +732,8 @@ async fn siri_in_task() {
 async fn siri_not_recording() {
     let device = start_device().await;
     let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
-    let opts = ClientOptions {
-        timeout: Duration::from_millis(200),
-        ..options()
-    };
+    let mut opts = options();
+    opts.timeout = Duration::from_millis(200);
     let client = Client::connect(addr, &credentials(), &opts).await.unwrap();
     device.log.lock().unwrap().no_recording = true;
 
@@ -849,7 +846,8 @@ async fn failed_setup_sends_teardown() {
     let device = start_faulty_device(Fault::DataPort).await;
     let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
     let result = Client::connect(addr, &credentials(), &options()).await;
-    assert!(matches!(result, Err(Error::Io(_))));
+    // Windows retries a refused connect for about 2 s, so the timeout can come first.
+    assert!(matches!(result, Err(Error::Io(_) | Error::Timeout)));
     wait_teardown(&device.log).await;
 }
 
@@ -857,10 +855,8 @@ async fn failed_setup_sends_teardown() {
 async fn missing_device_info_sends_teardown() {
     let device = start_faulty_device(Fault::DeviceInfo).await;
     let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
-    let options = ClientOptions {
-        timeout: Duration::from_millis(200),
-        ..options()
-    };
+    let mut options = options();
+    options.timeout = Duration::from_millis(200);
     let result = Client::connect(addr, &credentials(), &options).await;
     assert!(matches!(result, Err(Error::Timeout)));
     wait_teardown(&device.log).await;
@@ -885,9 +881,10 @@ async fn connection_refused() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
+    // Windows retries a refused connect for about 2 s, so the timeout can come first.
     assert!(matches!(
         Client::connect(addr, &credentials(), &options()).await,
-        Err(Error::Io(_))
+        Err(Error::Io(_) | Error::Timeout)
     ));
 }
 
@@ -993,11 +990,9 @@ async fn pairing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let device = tokio::spawn(pair_device(listener));
-    let options = PairOptions {
-        name: "Test Remote".into(),
-        client_id: Some("client-9".into()),
-        ..PairOptions::default()
-    };
+    let mut options = PairOptions::default();
+    options.name = "Test Remote".into();
+    options.client_id = Some("client-9".into());
     let creds = mrp::pair(addr, &options)
         .await
         .unwrap()
@@ -1041,5 +1036,26 @@ async fn pairing_with_wrong_pin_fails() {
             ))
         ),
         "{err}"
+    );
+}
+
+#[tokio::test]
+async fn hold_released_when_cancelled() {
+    let device = start_device().await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    let hold = client.hold(Button::Home, Duration::from_secs(10));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), hold)
+            .await
+            .is_err()
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Down, then up from the dropped future.
+    assert_eq!(
+        device.log.lock().unwrap().buttons,
+        [(0x0c, 0x40, true), (0x0c, 0x40, false)]
     );
 }

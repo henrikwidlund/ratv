@@ -25,6 +25,9 @@ use crate::link::{Link, LinkTx};
 use crate::{Error, log, rng, tcp, touch};
 
 const EVENT_CAPACITY: usize = 32;
+/// Requests in a row that time out while nothing is received. Then the
+/// connection is treated as dead.
+const MAX_SILENT_TIMEOUTS: u32 = 2;
 /// Encoded messages that are not sent yet.
 const MAX_OUTBOX: usize = 1 << 20;
 
@@ -45,6 +48,8 @@ struct Inner {
     events: broadcast::Sender<Event>,
     xid: AtomicU32,
     timeout: Duration,
+    /// Requests in a row that timed out while nothing was received.
+    silent_timeouts: AtomicU32,
     session_id: AtomicU64,
     /// Start of the touch session, for touch timestamps.
     touch_base: Instant,
@@ -63,6 +68,8 @@ impl Drop for Inner {
 struct Shared {
     outbox: Mutex<Outbox>,
     wake: Notify,
+    /// Number of reads with data, to see if the device sends anything.
+    reads: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -70,10 +77,15 @@ struct Outbox {
     /// OPACK payloads to send, each after its length as `u32` little endian.
     buf: Vec<u8>,
     /// Requests that wait for a response, by xid.
-    pending: Vec<(u32, oneshot::Sender<Bytes>)>,
+    pending: Vec<(u32, oneshot::Sender<Reply>)>,
     /// Set by `close`.
     close: bool,
+    /// Set when requests time out and nothing is received.
+    stalled: bool,
 }
+
+/// Response payload, or the error the device sent.
+type Reply = Result<Bytes, ratv_companion::Error>;
 
 impl Shared {
     /// Locks the outbox. A panic while locked cannot leave it invalid.
@@ -157,6 +169,7 @@ impl Client {
                 events,
                 xid: AtomicU32::new(rng::u32() >> 16),
                 timeout: options.timeout,
+                silent_timeouts: AtomicU32::new(0),
                 session_id: AtomicU64::new(0),
                 touch_base: Instant::now(),
                 task,
@@ -164,7 +177,10 @@ impl Client {
             }),
         };
 
-        let rp_id = rng::mac_string(rp_id(credentials.client_id()));
+        let rp_id = options
+            .device_id
+            .clone()
+            .unwrap_or_else(|| rng::stable_device_id(credentials.client_id()));
         let ours = rng::u32();
         let info = SystemInfo {
             name: &options.name,
@@ -224,19 +240,42 @@ impl Client {
         tracing::trace!(parent: &self.inner.span, id = M::ID, xid, "request");
         let start = Instant::now();
         let (reply, rx) = oneshot::channel();
+        let reads = self.inner.shared.reads.load(Ordering::Relaxed);
         self.queue(msg, xid, Some(reply))?;
-        let Ok(bytes) = tokio::time::timeout(self.inner.timeout, rx).await else {
+        let Ok(reply) = tokio::time::timeout(self.inner.timeout, rx).await else {
             tracing::debug!(parent: &self.inner.span, id = M::ID, xid, "request timed out");
-            return Err(Error::Timeout);
+            self.timed_out(reads);
+            return Err(Error::NoAnswer(M::ID));
         };
-        let bytes = bytes.map_err(|_| Error::Disconnected)?;
+        self.inner.silent_timeouts.store(0, Ordering::Relaxed);
+        let reply = reply.map_err(|_| Error::Disconnected)?;
         let elapsed = start.elapsed();
-        if let Some(err) = Message::decode(&bytes)?.error() {
-            tracing::debug!(parent: &self.inner.span, id = M::ID, xid, ?elapsed, %err, "request failed");
-            return Err(err.into());
+        match reply {
+            Ok(bytes) => {
+                tracing::trace!(parent: &self.inner.span, id = M::ID, xid, ?elapsed, "response");
+                Ok(bytes)
+            }
+            Err(err) => {
+                tracing::debug!(parent: &self.inner.span, id = M::ID, xid, ?elapsed, %err, "request failed");
+                Err(err.into())
+            }
         }
-        tracing::trace!(parent: &self.inner.span, id = M::ID, xid, ?elapsed, "response");
-        Ok(bytes)
+    }
+
+    /// Ends the connection after requests in a row time out while the
+    /// device sends nothing. TCP keepalive does not run while sent data
+    /// waits for acknowledgement, so this finds a device that is gone.
+    fn timed_out(&self, reads_before: u64) {
+        if self.inner.shared.reads.load(Ordering::Relaxed) != reads_before {
+            self.inner.silent_timeouts.store(0, Ordering::Relaxed);
+            return;
+        }
+        let n = self.inner.silent_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= MAX_SILENT_TIMEOUTS {
+            tracing::debug!(parent: &self.inner.span, "device sends nothing");
+            self.inner.shared.outbox().stalled = true;
+            self.inner.shared.wake.notify_one();
+        }
     }
 
     /// Sends an event (no response).
@@ -253,13 +292,14 @@ impl Client {
         &self,
         msg: &M,
         xid: u32,
-        reply: Option<oneshot::Sender<Bytes>>,
+        reply: Option<oneshot::Sender<Reply>>,
     ) -> Result<(), Error> {
-        if !self.inner.link.is_open() {
-            return Err(Error::Disconnected);
-        }
         {
             let mut out = self.inner.shared.outbox();
+            // Checked while locked: the task clears `pending` after the link closes.
+            if !self.inner.link.is_open() {
+                return Err(Error::Disconnected);
+            }
             if out.buf.len() > MAX_OUTBOX {
                 return Err(Error::QueueFull);
             }
@@ -317,14 +357,27 @@ impl Client {
             }
             return Ok(());
         }
+        let mut held = Held {
+            client: self,
+            command,
+            armed: true,
+        };
         self.button(command, ButtonState::Down).await?;
+        held.armed = false;
         self.button(command, ButtonState::Up).await
     }
 
-    /// Holds a button for `duration`.
+    /// Holds a button for `duration`. The button is released also if the
+    /// returned future is dropped.
     pub async fn hold(&self, command: HidCommand, duration: Duration) -> Result<(), Error> {
+        let mut held = Held {
+            client: self,
+            command,
+            armed: true,
+        };
         self.button(command, ButtonState::Down).await?;
         tokio::time::sleep(duration).await;
+        held.armed = false;
         self.button(command, ButtonState::Up).await
     }
 
@@ -344,8 +397,8 @@ impl Client {
 
     /// Sets the volume from 0.0 to 1.0.
     pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
-        self.media(MediaControl::SetVolume(f64::from(volume.clamp(0.0, 1.0))))
-            .await
+        let volume = crate::volume_level(volume)?;
+        self.media(MediaControl::SetVolume(f64::from(volume))).await
     }
 
     /// Launches an app by bundle id.
@@ -435,28 +488,37 @@ impl Client {
 
     /// Sends a touch event. `x` and `y` range from 0.0 to 1.0.
     pub async fn touch(&self, x: f64, y: f64, phase: TouchPhase) -> Result<(), Error> {
+        self.send_event(&self.touch_event(x, y, phase)).await
+    }
+
+    fn touch_event(&self, x: f64, y: f64, phase: TouchPhase) -> Touch {
         let area = TouchStart::default();
         // Rounded and clamped, so the cast is exact.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let scale = |v: f64, size: f64| (v.clamp(0.0, 1.0) * size).round() as u16;
-        self.send_event(&Touch {
+        Touch {
             timestamp_ns: u64::try_from(self.inner.touch_base.elapsed().as_nanos())
                 .unwrap_or(u64::MAX),
             finger: 1,
             x: scale(x, area.width),
             y: scale(y, area.height),
             phase,
-        })
-        .await
+        }
     }
 
     /// Swipes from `from` to `to` in about `duration`. Coordinates range from 0.0 to 1.0.
+    /// The finger is lifted also if the returned future is dropped.
     pub async fn swipe(
         &self,
         from: (f64, f64),
         to: (f64, f64),
         duration: Duration,
     ) -> Result<(), Error> {
+        let mut down = Touching {
+            client: self,
+            at: to,
+            armed: true,
+        };
         touch::swipe(from, to, duration, |x, y, phase| {
             let phase = match phase {
                 touch::Phase::Begin => TouchPhase::Press,
@@ -465,13 +527,22 @@ impl Client {
             };
             self.touch(x, y, phase)
         })
-        .await
+        .await?;
+        down.armed = false;
+        Ok(())
     }
 
     /// Taps at `x`, `y` without a click. Coordinates range from 0.0 to 1.0.
+    /// The finger is lifted also if the returned future is dropped.
     pub async fn tap(&self, x: f64, y: f64) -> Result<(), Error> {
+        let mut down = Touching {
+            client: self,
+            at: (x, y),
+            armed: true,
+        };
         self.touch(x, y, TouchPhase::Press).await?;
         tokio::time::sleep(touch::STEP).await;
+        down.armed = false;
         self.touch(x, y, TouchPhase::Release).await
     }
 
@@ -513,6 +584,42 @@ impl Client {
     }
 }
 
+/// Releases a button when dropped while armed.
+struct Held<'a> {
+    client: &'a Client,
+    command: HidCommand,
+    armed: bool,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let up = Hid {
+                command: self.command,
+                state: ButtonState::Up,
+            };
+            let _ = self.client.queue(&up, self.client.next_xid(), None);
+        }
+    }
+}
+
+/// Lifts the finger at `at` when dropped while armed.
+struct Touching<'a> {
+    client: &'a Client,
+    at: (f64, f64),
+    armed: bool,
+}
+
+impl Drop for Touching<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let (x, y) = self.at;
+            let up = self.client.touch_event(x, y, TouchPhase::Release);
+            let _ = self.client.queue(&up, self.client.next_xid(), None);
+        }
+    }
+}
+
 async fn run<S>(
     mut stream: S,
     mut conn: Connection,
@@ -528,11 +635,14 @@ async fn run<S>(
         loop {
             tokio::select! {
                 () = shared.wake.notified() => {
-                    let close = {
+                    let (close, stalled) = {
                         let mut out = shared.outbox();
                         std::mem::swap(&mut out.buf, &mut batch);
-                        out.close
+                        (out.close, out.stalled)
                     };
+                    if stalled {
+                        return Err(Error::NoAnswer("requests"));
+                    }
                     let mut rest = batch.as_slice();
                     while let Some((len, tail)) = rest.split_first_chunk::<4>() {
                         let (payload, tail) = tail.split_at(u32::from_le_bytes(*len) as usize);
@@ -549,6 +659,7 @@ async fn run<S>(
                     if n? == 0 {
                         return Err(Error::Disconnected);
                     }
+                    shared.reads.fetch_add(1, Ordering::Relaxed);
                     while let Some(frame) = conn.poll_frame()? {
                         dispatch(frame.ty, frame.payload, &shared, &events);
                     }
@@ -606,38 +717,11 @@ fn dispatch(ty: FrameType, payload: Bytes, shared: &Shared, events: &broadcast::
                     .map(|i| out.pending.swap_remove(i).1)
             };
             if let Some(reply) = reply {
-                let _ = reply.send(payload);
+                let _ = reply.send(msg.error().map_or(Ok(payload), Err));
             } else {
                 tracing::trace!(xid, "response without request");
             }
         }
         Some(MessageType::Request) => tracing::trace!(id = ?msg.id(), "ignoring device request"),
-    }
-}
-
-/// Device id for `_systemInfo`, stable per pairing.
-/// Some tvOS versions close the connection if it changes between connects.
-fn rp_id(client_id: &[u8]) -> [u8; 6] {
-    // FNV-1a, stable across Rust versions.
-    let hash = client_id.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    });
-    let mut id = [0; 6];
-    id.copy_from_slice(&hash.to_le_bytes()[..6]);
-    // Locally administered, unicast.
-    id[0] = (id[0] | 0x02) & !0x01;
-    id
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rp_id_is_stable_per_client() {
-        let a = rp_id(b"E5B59DDB-9930-4ACC-BC01-BDB185F96216");
-        assert_eq!(a, rp_id(b"E5B59DDB-9930-4ACC-BC01-BDB185F96216"));
-        assert_ne!(a, rp_id(b"1404D88A-8D8A-49C1-82A4-5112791D0018"));
-        assert_eq!(a[0] & 0x03, 0x02);
     }
 }

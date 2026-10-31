@@ -3,7 +3,10 @@
 use std::time::Duration;
 
 /// Options for connecting to a device.
+///
+/// Start from `ClientOptions::default()` and change the fields you need.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ClientOptions {
     /// Name we report to the device.
     pub name: String,
@@ -13,9 +16,11 @@ pub struct ClientOptions {
     pub os_version: String,
     /// iOS build we report. Used by MRP.
     pub os_build: String,
-    /// Stable id, `AA:BB:CC:DD:EE:FF`. Random if `None`. Used by MRP.
+    /// Device id, `AA:BB:CC:DD:EE:FF`. If `None`, it is made from the
+    /// credentials, so it is the same on each connect.
     pub device_id: Option<String>,
-    /// Stable unique id for `DEVICE_INFO`, usually a UUID. Random if `None`. Used by MRP.
+    /// Unique id for `DEVICE_INFO`, usually a UUID. If `None`, it is made
+    /// from the credentials, so it is the same on each connect. Used by MRP.
     pub unique_identifier: Option<String>,
     /// Time to wait for the connection and each response.
     pub timeout: Duration,
@@ -36,7 +41,10 @@ impl Default for ClientOptions {
 }
 
 /// Options for pairing.
+///
+/// Start from `PairOptions::default()` and change the fields you need.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PairOptions {
     /// Name shown with the PIN and in the device settings.
     pub name: String,

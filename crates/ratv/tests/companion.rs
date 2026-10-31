@@ -175,7 +175,9 @@ async fn device_session(mut s: DuplexStream, controller: PairedController, log: 
             &pair_reply(&reply),
         )
         .await;
-        if reply.windows(2).any(|w| w == [0x07, 0x01]) {
+        // Tag 7 is the HAP error item: verification failed.
+        let tlv = ratv_codec::tlv8::Tlv8::decode(&reply).unwrap();
+        if tlv.get(0x07).is_some() {
             return;
         }
     }
@@ -328,10 +330,9 @@ async fn pair() -> (Credentials, PairedController) {
 }
 
 fn options() -> ClientOptions {
-    ClientOptions {
-        timeout: Duration::from_secs(2),
-        ..ClientOptions::default()
-    }
+    let mut options = ClientOptions::default();
+    options.timeout = Duration::from_secs(2);
+    options
 }
 
 #[tokio::test]
@@ -461,6 +462,7 @@ async fn session_commands() {
 }
 
 /// The fake device never answers `silent`, so the request times out.
+/// After two such timeouts with nothing received, the connection closes.
 #[tokio::test]
 async fn request_timeout() {
     struct Silent;
@@ -473,14 +475,22 @@ async fn request_timeout() {
     let (creds, controller) = pair().await;
     let (client_io, device_io) = tokio::io::duplex(8192);
     tokio::spawn(device_session(device_io, controller, Arc::default()));
-    let opts = ClientOptions {
-        timeout: Duration::from_millis(100),
-        ..ClientOptions::default()
-    };
+    let mut opts = ClientOptions::default();
+    opts.timeout = Duration::from_millis(100);
     let client = companion::Client::connect_stream(client_io, &creds, &opts)
         .await
         .unwrap();
-    assert!(matches!(client.request(&Silent).await, Err(Error::Timeout)));
+    let err = client.request(&Silent).await.unwrap_err();
+    assert!(matches!(err, Error::NoAnswer("silent")), "{err}");
+    assert!(client.is_connected());
+    let _ = client.request(&Silent).await;
+    let reason = tokio::time::timeout(Duration::from_secs(1), client.closed())
+        .await
+        .unwrap();
+    assert!(
+        matches!(reason.as_deref(), Some(Error::NoAnswer("requests"))),
+        "{reason:?}"
+    );
 }
 
 #[tokio::test]
@@ -543,4 +553,49 @@ async fn verify_with_unknown_credentials_fails() {
         matches!(err, Error::Hap(ratv_hap::Error::Device(_))),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn hold_released_when_cancelled() {
+    let (creds, controller) = pair().await;
+    let log = Arc::new(Mutex::new(Log::default()));
+    let (client_io, device_io) = tokio::io::duplex(8192);
+    tokio::spawn(device_session(device_io, controller, log.clone()));
+    let client = companion::Client::connect_stream(client_io, &creds, &options())
+        .await
+        .unwrap();
+    let hold = client.hold(HidCommand::Select, Duration::from_secs(10));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), hold)
+            .await
+            .is_err()
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let hid = log.lock().unwrap().hid.clone();
+    // Down, then up from the dropped future.
+    assert_eq!(hid.len(), 2, "{hid:?}");
+    assert_eq!((hid[0].0, hid[0].1, hid[1].1), (hid[1].0, 1, 2));
+}
+
+#[tokio::test]
+async fn swipe_lifted_when_cancelled() {
+    let (creds, controller) = pair().await;
+    let log = Arc::new(Mutex::new(Log::default()));
+    let (client_io, device_io) = tokio::io::duplex(8192);
+    tokio::spawn(device_session(device_io, controller, log.clone()));
+    let client = companion::Client::connect_stream(client_io, &creds, &options())
+        .await
+        .unwrap();
+    let swipe = client.swipe((0.5, 0.5), (0.5, 0.1), Duration::from_secs(10));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), swipe)
+            .await
+            .is_err()
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let touches = log.lock().unwrap().touches.clone();
+    let phases: Vec<_> = touches.iter().map(|t| t.2).collect();
+    // Press (1), moves (3), then release (4) from the dropped future.
+    assert_eq!(phases.first(), Some(&1), "{touches:?}");
+    assert_eq!(phases.last(), Some(&4), "{touches:?}");
 }

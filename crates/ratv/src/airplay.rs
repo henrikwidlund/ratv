@@ -9,7 +9,7 @@ use ratv_airplay::http::Message;
 use ratv_airplay::keys::{self, Side};
 use ratv_airplay::rtsp::{self, ClientInfo, DataStreamSetup, Session};
 use ratv_hap::{Credentials, pair_verify};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 use crate::{Error, rng, tcp};
@@ -159,7 +159,7 @@ pub(crate) async fn teardown(
 /// Writes all queued bytes of a channel.
 pub(crate) async fn flush(stream: &mut TcpStream, channel: &mut Channel) -> Result<(), Error> {
     if channel.has_transmit() {
-        stream.write_all(&channel.take_transmit()).await?;
+        tcp::write_all(stream, &channel.take_transmit()).await?;
     }
     Ok(())
 }

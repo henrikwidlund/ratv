@@ -7,9 +7,14 @@
 //! so references always resolve to the same index on both sides.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 /// Maximum container nesting accepted by the decoder.
 pub const MAX_DEPTH: usize = 32;
+
+/// Object table size from which the decoder looks up values in a hash set.
+/// Below it, a linear search is faster.
+const SET_FROM: usize = 32;
 
 const TERMINATOR: u8 = 0x03;
 const ENDLESS: usize = 0xF;
@@ -477,6 +482,7 @@ pub fn decode_prefix(input: &[u8]) -> Result<(Value<'_>, &[u8]), Error> {
         input,
         pos: 0,
         objects: Vec::new(),
+        seen: None,
     };
     let value = d.value(0)?;
     Ok((value, &input[d.pos..]))
@@ -487,6 +493,8 @@ struct Decoder<'a> {
     pos: usize,
     // Encoded byte ranges of values in the object table.
     objects: Vec<&'a [u8]>,
+    // Same values as `objects`, once the table is large.
+    seen: Option<HashSet<&'a [u8]>>,
 }
 
 impl<'a> Decoder<'a> {
@@ -578,10 +586,25 @@ impl<'a> Decoder<'a> {
             _ => return Err(Error::InvalidTag(tag)),
         };
         let span = &self.input[start..self.pos];
-        if span.len() > 1 && !self.objects.contains(&span) {
-            self.objects.push(span);
+        if span.len() > 1 {
+            self.remember(span);
         }
         Ok(value)
+    }
+
+    /// Adds `span` to the object table if it is not there yet.
+    fn remember(&mut self, span: &'a [u8]) {
+        let new = match &mut self.seen {
+            Some(seen) => seen.insert(span),
+            None => !self.objects.contains(&span),
+        };
+        if !new {
+            return;
+        }
+        self.objects.push(span);
+        if self.seen.is_none() && self.objects.len() >= SET_FROM {
+            self.seen = Some(self.objects.iter().copied().collect());
+        }
     }
 
     fn str(&mut self, n: usize) -> Result<Value<'a>, Error> {
@@ -600,6 +623,7 @@ impl<'a> Decoder<'a> {
             input: span,
             pos: 0,
             objects: Vec::new(),
+            seen: None,
         };
         sub.value(MAX_DEPTH)
     }

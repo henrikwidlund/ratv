@@ -60,6 +60,15 @@ pub use error::Error;
 #[cfg(any(feature = "companion", feature = "mrp"))]
 pub use options::{ClientOptions, PairOptions};
 
+/// Checks a volume and limits it to 0.0 to 1.0.
+#[cfg(any(feature = "companion", feature = "mrp"))]
+const fn volume_level(volume: f32) -> Result<f32, Error> {
+    if volume.is_nan() {
+        return Err(Error::InvalidArgument("volume"));
+    }
+    Ok(volume.clamp(0.0, 1.0))
+}
+
 #[cfg(all(doctest, feature = "companion", feature = "mrp", feature = "discovery"))]
 #[doc = include_str!("../../../README.md")]
 struct ReadmeDoctests;

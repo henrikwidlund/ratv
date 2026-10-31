@@ -1,5 +1,5 @@
 use ratv_companion::{Connection, Frame, FrameType};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use crate::Error;
 
@@ -11,9 +11,7 @@ pub(crate) async fn flush<S: AsyncWrite + Unpin>(
     conn: &mut Connection,
 ) -> Result<(), Error> {
     if conn.has_transmit() {
-        let bytes = conn.take_transmit();
-        stream.write_all(&bytes).await?;
-        stream.flush().await?;
+        crate::tcp::write_all(stream, &conn.take_transmit()).await?;
     }
     Ok(())
 }

@@ -334,7 +334,8 @@ impl Player {
         self.location = location;
     }
 
-    fn update_items(&mut self, items: Vec<ContentItem>) {
+    /// `scratch` is a buffer for the merge, kept between calls.
+    fn update_items(&mut self, items: Vec<ContentItem>, scratch: &mut Vec<u8>) {
         for new in items {
             let Some(old) = self
                 .items
@@ -346,7 +347,11 @@ impl Player {
             if let Some(meta) = new.metadata {
                 match &mut old.metadata {
                     // Protobuf merge keeps fields that are not set in the update.
-                    Some(m) => m.merge(meta.encode_to_vec().as_slice()).unwrap_or_default(),
+                    Some(m) => {
+                        scratch.clear();
+                        meta.encode(scratch).unwrap_or_default();
+                        m.merge(scratch.as_slice()).unwrap_or_default();
+                    }
                     None => old.metadata = Some(meta),
                 }
             }
@@ -424,6 +429,8 @@ impl Client {
 pub struct NowPlayingState {
     clients: Vec<Client>,
     active_client: Option<String>,
+    /// Buffer for merging item updates.
+    scratch: Vec<u8>,
 }
 
 impl NowPlayingState {
@@ -447,9 +454,11 @@ impl NowPlayingState {
             }
         } else if env.is::<UpdateContentItemMessage>() {
             let msg: UpdateContentItemMessage = env.payload()?;
+            let mut scratch = std::mem::take(&mut self.scratch);
             if let Some(p) = self.player_mut(msg.player_path.as_ref()) {
-                p.update_items(msg.content_items);
+                p.update_items(msg.content_items, &mut scratch);
             }
+            self.scratch = scratch;
         } else if env.is::<SetNowPlayingClientMessage>() {
             let msg: SetNowPlayingClientMessage = env.payload()?;
             if let Some(c) = msg.client.as_ref().and_then(|c| self.client_mut(c)) {

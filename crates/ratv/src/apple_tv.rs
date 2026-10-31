@@ -66,7 +66,7 @@ pub async fn pair(endpoints: &Endpoints, options: &PairOptions) -> Result<PinPro
     let prompt = match (endpoints.companion, endpoints.airplay) {
         (Some(addr), _) => Prompt::Companion(companion::pair(addr, options).await?),
         (None, Some(addr)) => Prompt::Mrp(mrp::pair(addr, options).await?),
-        (None, None) => return Err(Error::NotConnected("no endpoints")),
+        (None, None) => return Err(Error::NoEndpoints),
     };
     Ok(PinPrompt(prompt))
 }
@@ -172,9 +172,16 @@ impl Key {
     }
 }
 
+/// Client chosen for a call: Companion with `A`, or MRP with `B`.
+enum Route<'a, A, B> {
+    Companion(&'a companion::Client, A),
+    Mrp(&'a mrp::Client, B),
+}
+
 /// A connected Apple TV.
 ///
-/// Clones share the connections.
+/// Clones share the connections. If one protocol closes, calls that the
+/// other protocol supports use the other one.
 #[derive(Debug, Clone)]
 pub struct AppleTv {
     companion: Option<companion::Client>,
@@ -210,7 +217,7 @@ impl AppleTv {
             mrp: keep("MRP", mrp, &mut first_error),
         };
         if tv.companion.is_none() && tv.mrp.is_none() {
-            return Err(first_error.unwrap_or(Error::NotConnected("no endpoints")));
+            return Err(first_error.unwrap_or(Error::NoEndpoints));
         }
         let (companion, mrp) = (tv.companion.is_some(), tv.mrp.is_some());
         if let Some(err) = first_error {
@@ -243,10 +250,39 @@ impl AppleTv {
         self.mrp.as_ref().ok_or(Error::NotConnected("MRP"))
     }
 
-    /// MRP client and button for keys that Companion does not handle.
-    fn mrp_button(&self, key: Key) -> Result<(&mrp::Client, Button), Error> {
-        let button = key.button().ok_or(Error::NotConnected("Companion"))?;
-        Ok((self.need_mrp()?, button))
+    /// Picks the client for a call that Companion does with `a` and MRP with `b`.
+    ///
+    /// An open connection wins over a closed one. If both are open or both
+    /// are closed, MRP is used when `prefer_mrp` is true. A closed client
+    /// returns [`Error::Disconnected`].
+    fn route<A, B>(&self, prefer_mrp: bool, a: Option<A>, b: Option<B>) -> Option<Route<'_, A, B>> {
+        let c = self.companion.as_ref().zip(a);
+        let m = self.mrp.as_ref().zip(b);
+        let use_mrp = match (&c, &m) {
+            (None, None) => return None,
+            (Some(_), None) => false,
+            (None, Some(_)) => true,
+            (Some((c, _)), Some((m, _))) => {
+                let (c_open, m_open) = (c.is_connected(), m.is_connected());
+                if c_open == m_open { prefer_mrp } else { m_open }
+            }
+        };
+        if use_mrp {
+            m.map(|(m, b)| Route::Mrp(m, b))
+        } else {
+            c.map(|(c, a)| Route::Companion(c, a))
+        }
+    }
+
+    /// Route for a key: Companion first.
+    fn key_route(&self, key: Key) -> Result<Route<'_, HidCommand, Button>, Error> {
+        self.route(false, key.hid(), key.button()).ok_or_else(|| {
+            if key.button().is_none() {
+                Error::NotConnected("Companion")
+            } else {
+                Error::NotConnected("MRP")
+            }
+        })
     }
 
     /// What the device plays. Needs MRP.
@@ -268,34 +304,40 @@ impl AppleTv {
 
     /// Presses and releases a key.
     pub async fn press(&self, key: Key) -> Result<(), Error> {
-        if let (Some(c), Some(hid)) = (&self.companion, key.hid()) {
-            return c.press(hid).await;
+        match self.key_route(key)? {
+            Route::Companion(c, hid) => c.press(hid).await,
+            Route::Mrp(m, button) => m.press(button).await,
         }
-        let (m, button) = self.mrp_button(key)?;
-        m.press(button).await
     }
 
-    /// Holds a key for `duration`.
+    /// Holds a key for `duration`. The key is released also if the
+    /// returned future is dropped.
     pub async fn hold(&self, key: Key, duration: Duration) -> Result<(), Error> {
-        if let (Some(c), Some(hid)) = (&self.companion, key.hid()) {
-            return c.hold(hid, duration).await;
+        match self.key_route(key)? {
+            Route::Companion(c, hid) => c.hold(hid, duration).await,
+            Route::Mrp(m, button) => m.hold(button, duration).await,
         }
-        let (m, button) = self.mrp_button(key)?;
-        m.hold(button, duration).await
     }
 
     /// Sends a key down or up event.
     pub async fn key(&self, key: Key, down: bool) -> Result<(), Error> {
-        if let (Some(c), Some(hid)) = (&self.companion, key.hid()) {
-            let state = if down {
-                ButtonState::Down
-            } else {
-                ButtonState::Up
-            };
-            return c.button(hid, state).await;
+        match self.key_route(key)? {
+            Route::Companion(c, hid) => {
+                let state = if down {
+                    ButtonState::Down
+                } else {
+                    ButtonState::Up
+                };
+                c.button(hid, state).await
+            }
+            Route::Mrp(m, button) => m.button(button, down).await,
         }
-        let (m, button) = self.mrp_button(key)?;
-        m.button(button, down).await
+    }
+
+    /// Route for a playback call: MRP first.
+    fn media_route<A>(&self, fallback: Option<A>) -> Result<Route<'_, A, ()>, Error> {
+        self.route(true, fallback, Some(()))
+            .ok_or(Error::NotConnected("MRP"))
     }
 
     async fn playback(
@@ -303,10 +345,9 @@ impl AppleTv {
         command: Command,
         fallback: Option<MediaControl>,
     ) -> Result<(), Error> {
-        match (&self.mrp, &self.companion, fallback) {
-            (Some(m), _, _) => m.command(command).await,
-            (None, Some(c), Some(f)) => c.media(f).await,
-            (None, _, _) => Err(Error::NotConnected("MRP")),
+        match self.media_route(fallback)? {
+            Route::Companion(c, f) => c.media(f).await,
+            Route::Mrp(m, ()) => m.command(command).await,
         }
     }
 
@@ -323,9 +364,9 @@ impl AppleTv {
 
     /// Toggles play and pause.
     pub async fn play_pause(&self) -> Result<(), Error> {
-        match &self.mrp {
-            Some(m) => m.command(Command::TogglePlayPause).await,
-            None => self.need_companion()?.press(HidCommand::PlayPause).await,
+        match self.media_route(Some(HidCommand::PlayPause))? {
+            Route::Companion(c, hid) => c.press(hid).await,
+            Route::Mrp(m, ()) => m.command(Command::TogglePlayPause).await,
         }
     }
 
@@ -353,13 +394,9 @@ impl AppleTv {
 
     /// Skips `seconds` forward, or backward if negative.
     pub async fn skip(&self, seconds: f64) -> Result<(), Error> {
-        match &self.mrp {
-            Some(m) => m.skip(seconds).await,
-            None => {
-                self.need_companion()?
-                    .media(MediaControl::SkipBy(seconds))
-                    .await
-            }
+        match self.media_route(Some(MediaControl::SkipBy(seconds)))? {
+            Route::Companion(c, f) => c.media(f).await,
+            Route::Mrp(m, ()) => m.skip(seconds).await,
         }
     }
 
@@ -479,9 +516,9 @@ impl AppleTv {
 
     /// Sets the volume, 0.0 to 1.0.
     pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
-        match &self.mrp {
-            Some(m) => m.set_volume(volume).await,
-            None => self.need_companion()?.set_volume(volume).await,
+        match self.media_route(Some(()))? {
+            Route::Companion(c, ()) => c.set_volume(volume).await,
+            Route::Mrp(m, ()) => m.set_volume(volume).await,
         }
     }
 
@@ -547,6 +584,7 @@ impl AppleTv {
     }
 
     /// Swipes from `from` to `to` in about `duration`. Coordinates range from 0.0 to 1.0.
+    /// Needs Companion.
     pub async fn swipe(
         &self,
         from: (f64, f64),
@@ -611,7 +649,9 @@ impl AppleTv {
 
     /// Waits until one of the connected protocols closes. Returns the error
     /// that closed it, or `None` after [`close`](Self::close).
-    /// Connect again to get all protocols back.
+    ///
+    /// The other protocol stays connected. To get all protocols back, call
+    /// [`close`](Self::close) or drop all clones, then connect again.
     pub async fn closed(&self) -> Option<Arc<Error>> {
         let companion = async {
             match &self.companion {
@@ -686,7 +726,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, Error::NotConnected("no endpoints")));
+        assert!(matches!(err, Error::NoEndpoints));
     }
 
     #[tokio::test]
@@ -694,7 +734,7 @@ mod tests {
         let err = pair(&Endpoints::default(), &PairOptions::default())
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::NotConnected("no endpoints")));
+        assert!(matches!(err, Error::NoEndpoints));
     }
 
     fn test_credentials() -> Credentials {

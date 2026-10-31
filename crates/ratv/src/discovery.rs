@@ -26,7 +26,10 @@ use crate::Error;
 const RESEND_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Options for [`scan`].
+///
+/// Start from `ScanOptions::default()` and change the fields you need.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ScanOptions {
     /// Total scan time.
     pub timeout: Duration,
