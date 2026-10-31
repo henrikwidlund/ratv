@@ -951,7 +951,8 @@ async fn wrong_credentials_fail() {
         good.accessory_id().to_vec(),
         good.client_id().to_vec(),
     );
-    assert!(Client::connect(addr, &creds, &options()).await.is_err());
+    let err = Client::connect(addr, &creds, &options()).await.unwrap_err();
+    assert!(err.is_auth(), "{err}");
 }
 
 #[tokio::test]

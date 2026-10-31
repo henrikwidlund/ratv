@@ -75,3 +75,47 @@ impl From<tokio::time::error::Elapsed> for Error {
         Self::Timeout
     }
 }
+
+impl Error {
+    /// True if the device rejected the credentials, or the PIN while pairing.
+    /// After a failed connect, pair again to fix it.
+    #[must_use]
+    pub const fn is_auth(&self) -> bool {
+        match self {
+            Self::Hap(e) => hap_auth(e),
+            #[cfg(feature = "companion")]
+            Self::Companion(ratv_companion::Error::Hap(e)) => hap_auth(e),
+            #[cfg(feature = "mrp")]
+            Self::Airplay(ratv_airplay::Error::Hap(e)) => hap_auth(e),
+            _ => false,
+        }
+    }
+}
+
+const fn hap_auth(e: &ratv_hap::Error) -> bool {
+    matches!(
+        e,
+        ratv_hap::Error::UnknownAccessory
+            | ratv_hap::Error::BadSignature
+            | ratv_hap::Error::BadProof
+            | ratv_hap::Error::Device(ratv_hap::DeviceError::Authentication)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_auth() {
+        assert!(Error::Hap(ratv_hap::Error::UnknownAccessory).is_auth());
+        assert!(
+            Error::Hap(ratv_hap::Error::Device(
+                ratv_hap::DeviceError::Authentication
+            ))
+            .is_auth()
+        );
+        assert!(!Error::Hap(ratv_hap::Error::Decrypt).is_auth());
+        assert!(!Error::Timeout.is_auth());
+    }
+}

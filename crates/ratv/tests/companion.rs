@@ -553,6 +553,7 @@ async fn verify_with_unknown_credentials_fails() {
         matches!(err, Error::Hap(ratv_hap::Error::Device(_))),
         "{err}"
     );
+    assert!(err.is_auth(), "{err}");
 }
 
 #[tokio::test]
