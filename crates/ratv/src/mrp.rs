@@ -755,15 +755,27 @@ impl Client {
         Ok(ratv_mrp::artwork(&env)?)
     }
 
-    /// Sets the volume of the device, 0.0 to 1.0.
+    /// Sets the volume of the device, 0.0 to 1.0. Fails with
+    /// [`Error::VolumeNotAvailable`] if [`Volume::available`] is false.
     pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
         let volume = crate::volume_level(volume)?;
+        self.check_volume()?;
         self.send(&messages::set_volume(volume, self.output_uid()?))
             .await
     }
 
-    /// Mutes or unmutes the device.
+    /// Fails if the device cannot change the volume, see [`Volume::available`].
+    fn check_volume(&self) -> Result<(), Error> {
+        if self.inner.volume.borrow().available == Some(false) {
+            return Err(Error::VolumeNotAvailable);
+        }
+        Ok(())
+    }
+
+    /// Mutes or unmutes the device. Fails with [`Error::VolumeNotAvailable`]
+    /// if [`Volume::available`] is false.
     pub async fn set_muted(&self, muted: bool) -> Result<(), Error> {
+        self.check_volume()?;
         self.send(&messages::set_volume_muted(muted, self.output_uid()?))
             .await
     }

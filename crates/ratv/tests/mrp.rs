@@ -42,6 +42,8 @@ struct Log {
     teardown: bool,
     /// Siri does not start recording.
     no_recording: bool,
+    /// The device cannot change the volume.
+    no_volume_control: bool,
 }
 
 fn credentials() -> Credentials {
@@ -262,7 +264,7 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
         let devices = proto::UpdateOutputDeviceMessage {
             output_devices: vec![proto::AvOutputDeviceDescriptor {
                 unique_identifier: Some("UID-1".into()),
-                is_volume_control_available: Some(true),
+                is_volume_control_available: Some(!log.lock().unwrap().no_volume_control),
                 volume_capabilities: Some(3),
                 ..Default::default()
             }],
@@ -735,6 +737,28 @@ async fn siri_in_task() {
     let siri = [(0x0c, 0x04, true), (0x0c, 0x04, false)];
     assert_eq!(log.buttons, siri);
     assert!(log.teardown);
+}
+
+#[tokio::test]
+async fn volume_not_available() {
+    let device = start_device().await;
+    device.log.lock().unwrap().no_volume_control = true;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    let mut volume = client.volume();
+    let ready = volume.wait_for(|v| v.available == Some(false));
+    tokio::time::timeout(Duration::from_secs(2), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(volume);
+    let err = client.set_volume(0.5).await.unwrap_err();
+    assert!(matches!(err, Error::VolumeNotAvailable), "{err}");
+    let err = client.set_muted(true).await.unwrap_err();
+    assert!(matches!(err, Error::VolumeNotAvailable), "{err}");
+    client.close().await.unwrap();
 }
 
 #[tokio::test]

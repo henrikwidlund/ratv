@@ -104,6 +104,7 @@ pub enum Key {
     Select,
     Menu,
     Home,
+    /// Behavior depends on the app: some go to the Home Screen, some do nothing.
     TopMenu,
     PlayPause,
     VolumeUp,
@@ -765,8 +766,10 @@ impl AppleTv {
         self.need_mrp()?.play_queue_item(index).await
     }
 
-    /// Sets the volume, 0.0 to 1.0.
+    /// Sets the volume, 0.0 to 1.0. Fails with [`Error::VolumeNotAvailable`] if MRP
+    /// reports that the device cannot change it.
     pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
+        self.check_volume().await?;
         match self
             .route(true, Some(()), Some(()))
             .ok_or(Error::NotConnected("MRP"))?
@@ -797,9 +800,27 @@ impl AppleTv {
         self.need_mrp()?.dislike(disliked).await
     }
 
-    /// Mutes or unmutes the device. Needs MRP.
+    /// Mutes or unmutes the device. Needs MRP. Fails with [`Error::VolumeNotAvailable`]
+    /// if the device cannot change the volume.
     pub async fn set_muted(&self, muted: bool) -> Result<(), Error> {
+        self.check_volume().await?;
         self.need_mrp()?.set_muted(muted).await
+    }
+
+    /// Fails if MRP reports that the device cannot change the volume. Right after
+    /// connect, waits for the volume state like [`wait_for_state`](Self::wait_for_state).
+    async fn check_volume(&self) -> Result<(), Error> {
+        let Some(m) = self.mrp.as_ref().filter(|m| m.is_connected()) else {
+            return Ok(());
+        };
+        let mut volume = m.volume();
+        if let Some(left) = STATE_WAIT.checked_sub(self.connected_at.elapsed()) {
+            let _ = tokio::time::timeout(left, volume.wait_for(|v| v.available.is_some())).await;
+        }
+        if volume.borrow().available == Some(false) {
+            return Err(Error::VolumeNotAvailable);
+        }
+        Ok(())
     }
 
     /// Wakes the device. Needs Companion.
