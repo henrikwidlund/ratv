@@ -31,6 +31,7 @@ pub type LanguageType = proto::language_option::Type;
 
 /// A chapter of the current item.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct Chapter {
     /// Title.
     pub title: Option<String>,
@@ -42,6 +43,7 @@ pub struct Chapter {
 
 /// An item in the playback queue.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct QueueItem {
     /// Item id.
     pub id: Option<String>,
@@ -64,6 +66,7 @@ pub fn cocoa_time(t: SystemTime) -> f64 {
 
 /// Snapshot of what the active player is playing.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct NowPlaying {
     /// Bundle id of the app that plays.
     pub app: Option<String>,

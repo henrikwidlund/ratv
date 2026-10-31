@@ -10,6 +10,7 @@ use crate::{Envelope, Error};
 
 /// Volume of the connected device.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Volume {
     /// Level from 0.0 to 1.0. `None` when volume control is not available.
     pub level: Option<f32>,
@@ -25,6 +26,7 @@ pub struct Volume {
 
 /// AirPlay output device in a group.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct OutputDevice {
     /// UID used in volume and output messages.
     pub uid: String,

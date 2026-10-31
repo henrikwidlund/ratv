@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -14,68 +15,77 @@ use ratv_companion::text_input::{self, TextInputCommand, TextSession};
 use ratv_companion::{Connection, FrameType};
 use ratv_hap::{Credentials, pair_verify};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Notify, broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
 
 use super::io::{flush, pairing_step};
+use crate::ClientOptions;
+use crate::link::{Link, LinkTx};
 use crate::{Error, log, rng, tcp, touch};
 
 const EVENT_CAPACITY: usize = 32;
-const COMMAND_CAPACITY: usize = 16;
-
-/// Options for [`Client::connect`].
-#[derive(Debug, Clone)]
-pub struct ClientOptions {
-    /// Name we report to the device.
-    pub name: String,
-    /// Model we report, for example `iPhone10,6`.
-    pub model: String,
-    /// Time to wait for each response.
-    pub timeout: Duration,
-}
-
-impl Default for ClientOptions {
-    fn default() -> Self {
-        Self {
-            name: "ratv".into(),
-            model: "iPhone10,6".into(),
-            timeout: Duration::from_secs(5),
-        }
-    }
-}
-
-enum Command {
-    Request {
-        xid: u32,
-        payload: Vec<u8>,
-        reply: oneshot::Sender<Bytes>,
-    },
-    Event {
-        payload: Vec<u8>,
-    },
-    Close,
-}
+/// Encoded messages that are not sent yet.
+const MAX_OUTBOX: usize = 1 << 20;
 
 /// Connected Companion session.
 ///
-/// Requests can be sent from several tasks at the same time. A background task
-/// owns the socket; it stops when the client is dropped or the device disconnects.
-#[derive(Debug)]
+/// Requests can be sent from several tasks at the same time. Clones share the
+/// session. A background task owns the socket; it stops when the last clone is
+/// dropped or the device disconnects.
+#[derive(Debug, Clone)]
 pub struct Client {
-    commands: mpsc::Sender<Command>,
+    inner: Arc<Inner>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    shared: Arc<Shared>,
+    link: Link,
     events: broadcast::Sender<Event>,
     xid: AtomicU32,
     timeout: Duration,
-    session_id: u64,
+    session_id: AtomicU64,
     /// Start of the touch session, for touch timestamps.
     touch_base: Instant,
     task: JoinHandle<()>,
     span: Span,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Written by clients, read by the background task.
+#[derive(Debug, Default)]
+struct Shared {
+    outbox: Mutex<Outbox>,
+    wake: Notify,
+}
+
+#[derive(Debug, Default)]
+struct Outbox {
+    /// OPACK payloads to send, each after its length as `u32` little endian.
+    buf: Vec<u8>,
+    /// Requests that wait for a response, by xid.
+    pending: Vec<(u32, oneshot::Sender<Bytes>)>,
+    /// Set by `close`.
+    close: bool,
+}
+
+impl Shared {
+    /// Locks the outbox. A panic while locked cannot leave it invalid.
+    fn outbox(&self) -> MutexGuard<'_, Outbox> {
+        self.outbox.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 impl Client {
     /// Connects to `addr`, runs pair-verify and starts a session.
+    ///
+    /// The TV closes an open connection that uses the same credentials.
     pub async fn connect(
         addr: SocketAddr,
         credentials: &Credentials,
@@ -134,26 +144,32 @@ impl Client {
         conn.enable_encryption(&secret);
         tracing::debug!("pair-verify done");
 
-        let (commands, rx) = mpsc::channel(COMMAND_CAPACITY);
+        let shared = Arc::new(Shared::default());
+        let (link_tx, link) = Link::new();
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
-        let task = tokio::spawn(run(stream, conn, rx, events.clone()).instrument(span.clone()));
-        let mut client = Self {
-            commands,
-            events,
-            xid: AtomicU32::new(rng::u32() >> 16),
-            timeout: options.timeout,
-            session_id: 0,
-            touch_base: Instant::now(),
-            task,
-            span,
+        let task = tokio::spawn(
+            run(stream, conn, shared.clone(), link_tx, events.clone()).instrument(span.clone()),
+        );
+        let client = Self {
+            inner: Arc::new(Inner {
+                shared,
+                link,
+                events,
+                xid: AtomicU32::new(rng::u32() >> 16),
+                timeout: options.timeout,
+                session_id: AtomicU64::new(0),
+                touch_base: Instant::now(),
+                task,
+                span,
+            }),
         };
 
-        let rp_id = rng::mac_string(rp_id(&credentials.client_id));
+        let rp_id = rng::mac_string(rp_id(credentials.client_id()));
         let ours = rng::u32();
         let info = SystemInfo {
             name: &options.name,
             model: &options.model,
-            client_id: &credentials.client_id,
+            client_id: credentials.client_id(),
             rp_id: &rp_id,
             pub_id: &rp_id,
         };
@@ -178,7 +194,10 @@ impl Client {
         );
         info?;
         let device = message::session_start_response(&Message::decode(&session?)?)?;
-        client.session_id = message::combined_session_id(device, ours);
+        client.inner.session_id.store(
+            message::combined_session_id(device, ours),
+            Ordering::Relaxed,
+        );
         // Older tvOS versions may not support it.
         if let Err(err) = touch_start {
             tracing::debug!(%err, "_touchStart failed");
@@ -195,68 +214,93 @@ impl Client {
     }
 
     fn next_xid(&self) -> u32 {
-        self.xid.fetch_add(1, Ordering::Relaxed)
+        self.inner.xid.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Sends a request and returns the raw response payload.
     /// Decode it with [`Message::decode`]. Device errors are returned as `Err`.
     pub async fn request<M: Outgoing + Sync>(&self, msg: &M) -> Result<Bytes, Error> {
         let xid = self.next_xid();
-        let mut payload = Vec::with_capacity(64);
-        message::encode(msg, xid, &mut payload);
-        tracing::trace!(parent: &self.span, id = M::ID, xid, "request");
+        tracing::trace!(parent: &self.inner.span, id = M::ID, xid, "request");
         let start = Instant::now();
         let (reply, rx) = oneshot::channel();
-        self.commands
-            .send(Command::Request {
-                xid,
-                payload,
-                reply,
-            })
-            .await
-            .map_err(|_| Error::Disconnected)?;
-        let Ok(bytes) = tokio::time::timeout(self.timeout, rx).await else {
-            tracing::debug!(parent: &self.span, id = M::ID, xid, "request timed out");
+        self.queue(msg, xid, Some(reply))?;
+        let Ok(bytes) = tokio::time::timeout(self.inner.timeout, rx).await else {
+            tracing::debug!(parent: &self.inner.span, id = M::ID, xid, "request timed out");
             return Err(Error::Timeout);
         };
         let bytes = bytes.map_err(|_| Error::Disconnected)?;
         let elapsed = start.elapsed();
         if let Some(err) = Message::decode(&bytes)?.error() {
-            tracing::debug!(parent: &self.span, id = M::ID, xid, ?elapsed, %err, "request failed");
+            tracing::debug!(parent: &self.inner.span, id = M::ID, xid, ?elapsed, %err, "request failed");
             return Err(err.into());
         }
-        tracing::trace!(parent: &self.span, id = M::ID, xid, ?elapsed, "response");
+        tracing::trace!(parent: &self.inner.span, id = M::ID, xid, ?elapsed, "response");
         Ok(bytes)
     }
 
     /// Sends an event (no response).
+    // Async, so waiting for queue space can be added without an API change.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn send_event<M: Outgoing + Sync>(&self, msg: &M) -> Result<(), Error> {
-        let mut payload = Vec::with_capacity(64);
         let xid = self.next_xid();
-        message::encode(msg, xid, &mut payload);
-        tracing::trace!(parent: &self.span, id = M::ID, xid, "event");
-        self.commands
-            .send(Command::Event { payload })
-            .await
-            .map_err(|_| Error::Disconnected)
+        tracing::trace!(parent: &self.inner.span, id = M::ID, xid, "event");
+        self.queue(msg, xid, None)
+    }
+
+    /// Encodes `msg` into the outbox and wakes the background task.
+    fn queue<M: Outgoing>(
+        &self,
+        msg: &M,
+        xid: u32,
+        reply: Option<oneshot::Sender<Bytes>>,
+    ) -> Result<(), Error> {
+        if !self.inner.link.is_open() {
+            return Err(Error::Disconnected);
+        }
+        {
+            let mut out = self.inner.shared.outbox();
+            if out.buf.len() > MAX_OUTBOX {
+                return Err(Error::QueueFull);
+            }
+            let start = out.buf.len();
+            out.buf.extend_from_slice(&[0; 4]);
+            message::encode(msg, xid, &mut out.buf);
+            let len = u32::try_from(out.buf.len() - start - 4).unwrap_or(u32::MAX);
+            out.buf[start..start + 4].copy_from_slice(&len.to_le_bytes());
+            if let Some(reply) = reply {
+                out.pending.retain(|(_, tx)| !tx.is_closed());
+                out.pending.push((xid, reply));
+            }
+        }
+        self.inner.shared.wake.notify_one();
+        Ok(())
     }
 
     /// Receives device events (media controls, power state, keyboard focus).
+    ///
+    /// A receiver that reads too slowly misses old events and gets `RecvError::Lagged`.
     #[must_use]
     pub fn events(&self) -> broadcast::Receiver<Event> {
-        self.events.subscribe()
+        self.inner.events.subscribe()
     }
 
     /// Combined session id.
     #[must_use]
-    pub const fn session_id(&self) -> u64 {
-        self.session_id
+    pub fn session_id(&self) -> u64 {
+        self.inner.session_id.load(Ordering::Relaxed)
     }
 
-    /// Returns true while the connection is open.
+    /// True until the connection closes.
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        !self.task.is_finished()
+        self.inner.link.is_open()
+    }
+
+    /// Waits until the connection closes. Returns the error that closed it,
+    /// or `None` after [`close`](Self::close).
+    pub async fn closed(&self) -> Option<Arc<Error>> {
+        self.inner.link.closed().await
     }
 
     /// Sets the state of a button.
@@ -290,14 +334,17 @@ impl Client {
     }
 
     /// Returns the volume from 0.0 to 1.0.
-    pub async fn volume(&self) -> Result<f64, Error> {
+    pub async fn volume(&self) -> Result<f32, Error> {
         let reply = self.request(&MediaControl::GetVolume).await?;
-        Ok(message::volume_response(&Message::decode(&reply)?)?)
+        let volume = message::volume_response(&Message::decode(&reply)?)?;
+        // Volume is 0.0 to 1.0, so f32 is exact enough.
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(volume as f32)
     }
 
     /// Sets the volume from 0.0 to 1.0.
-    pub async fn set_volume(&self, volume: f64) -> Result<(), Error> {
-        self.media(MediaControl::SetVolume(volume.clamp(0.0, 1.0)))
+    pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
+        self.media(MediaControl::SetVolume(f64::from(volume.clamp(0.0, 1.0))))
             .await
     }
 
@@ -374,14 +421,14 @@ impl Client {
         let (stop, start) =
             tokio::join!(self.request(&TextInputStop), self.request(&TextInputStart));
         if let Err(err) = stop {
-            tracing::debug!(parent: &self.span, %err, "_tiStop failed");
+            tracing::debug!(parent: &self.inner.span, %err, "_tiStop failed");
         }
         let reply = start?;
         let msg = Message::decode(&reply)?;
         text_input::session(&msg).map_err(|err| {
-            tracing::debug!(parent: &self.span, %err, "unknown text input data");
+            tracing::debug!(parent: &self.inner.span, %err, "unknown text input data");
             #[cfg(feature = "sensitive-logs")]
-            tracing::trace!(parent: &self.span, data = ?msg.field("_tiD"), "unknown text input data");
+            tracing::trace!(parent: &self.inner.span, data = ?msg.field("_tiD"), "unknown text input data");
             err.into()
         })
     }
@@ -393,7 +440,8 @@ impl Client {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let scale = |v: f64, size: f64| (v.clamp(0.0, 1.0) * size).round() as u16;
         self.send_event(&Touch {
-            timestamp_ns: u64::try_from(self.touch_base.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            timestamp_ns: u64::try_from(self.inner.touch_base.elapsed().as_nanos())
+                .unwrap_or(u64::MAX),
             finger: 1,
             x: scale(x, area.width),
             y: scale(y, area.height),
@@ -437,87 +485,95 @@ impl Client {
         self.press(HidCommand::Sleep).await
     }
 
-    /// Stops the session and closes the connection.
+    /// Stops the session and closes the connection of all clones.
     ///
     /// A device error for the stop request is ignored: the device ends the
     /// session itself when the app changes or it goes to sleep.
-    pub async fn close(mut self) -> Result<(), Error> {
+    pub async fn close(&self) -> Result<(), Error> {
+        if !self.inner.link.is_open() {
+            return Ok(());
+        }
         let result = match self
             .request(&SessionStop {
-                session_id: self.session_id,
+                session_id: self.session_id(),
             })
             .await
         {
             Ok(_) => Ok(()),
             Err(Error::Companion(err @ ratv_companion::Error::Device { .. })) => {
-                tracing::debug!(parent: &self.span, %err, "session already stopped by device");
+                tracing::debug!(parent: &self.inner.span, %err, "session already stopped by device");
                 Ok(())
             }
             Err(err) => Err(err),
         };
-        if self.commands.send(Command::Close).await.is_ok() {
-            let _ = (&mut self.task).await;
-        }
+        self.inner.shared.outbox().close = true;
+        self.inner.shared.wake.notify_one();
+        self.inner.link.closed().await;
         result
-    }
-}
-
-impl Drop for Client {
-    fn drop(&mut self) {
-        self.task.abort();
     }
 }
 
 async fn run<S>(
     mut stream: S,
     mut conn: Connection,
-    mut commands: mpsc::Receiver<Command>,
+    shared: Arc<Shared>,
+    link: LinkTx,
     events: broadcast::Sender<Event>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut pending: Vec<(u32, oneshot::Sender<Bytes>)> = Vec::new();
+    // Swapped with the outbox buffer, so both keep their capacity.
+    let mut batch = Vec::new();
     let result: Result<(), Error> = async {
         loop {
             tokio::select! {
-                cmd = commands.recv() => {
-                    let payload = match cmd {
-                        None | Some(Command::Close) => return Ok(()),
-                        Some(Command::Request { xid, payload, reply }) => {
-                            pending.retain(|(_, tx)| !tx.is_closed());
-                            pending.push((xid, reply));
-                            payload
-                        }
-                        Some(Command::Event { payload }) => payload,
+                () = shared.wake.notified() => {
+                    let close = {
+                        let mut out = shared.outbox();
+                        std::mem::swap(&mut out.buf, &mut batch);
+                        out.close
                     };
-                    conn.send(FrameType::E_OPACK, &payload);
+                    let mut rest = batch.as_slice();
+                    while let Some((len, tail)) = rest.split_first_chunk::<4>() {
+                        let (payload, tail) = tail.split_at(u32::from_le_bytes(*len) as usize);
+                        conn.send(FrameType::E_OPACK, payload);
+                        rest = tail;
+                    }
+                    batch.clear();
                     flush(&mut stream, &mut conn).await?;
+                    if close {
+                        return Ok(());
+                    }
                 }
                 n = stream.read_buf(conn.receive_buffer(4096)) => {
                     if n? == 0 {
                         return Err(Error::Disconnected);
                     }
                     while let Some(frame) = conn.poll_frame()? {
-                        dispatch(frame.ty, frame.payload, &mut pending, &events);
+                        dispatch(frame.ty, frame.payload, &shared, &events);
                     }
                 }
             }
         }
     }
     .await;
-    match result {
-        Ok(()) => tracing::debug!("connection closed"),
-        Err(err) => tracing::debug!(%err, "connection ended"),
-    }
+    let reason = match result {
+        Ok(()) => {
+            tracing::debug!("connection closed");
+            None
+        }
+        Err(err) => {
+            tracing::debug!(%err, "connection ended");
+            Some(Arc::new(err))
+        }
+    };
+    link.close(reason);
+    // Waiting requests fail right away.
+    shared.outbox().pending.clear();
     let _ = stream.shutdown().await;
 }
 
-fn dispatch(
-    ty: FrameType,
-    payload: Bytes,
-    pending: &mut Vec<(u32, oneshot::Sender<Bytes>)>,
-    events: &broadcast::Sender<Event>,
-) {
+fn dispatch(ty: FrameType, payload: Bytes, shared: &Shared, events: &broadcast::Sender<Event>) {
     if ty != FrameType::E_OPACK {
         tracing::trace!(ty = ty.0, "ignoring frame");
         return;
@@ -542,8 +598,14 @@ fn dispatch(
         }
         Some(MessageType::Response) | None => {
             let Some(xid) = msg.xid() else { return };
-            if let Some(i) = pending.iter().position(|(x, _)| *x == xid) {
-                let (_, reply) = pending.swap_remove(i);
+            let reply = {
+                let mut out = shared.outbox();
+                out.pending
+                    .iter()
+                    .position(|(x, _)| *x == xid)
+                    .map(|i| out.pending.swap_remove(i).1)
+            };
+            if let Some(reply) = reply {
                 let _ = reply.send(payload);
             } else {
                 tracing::trace!(xid, "response without request");
@@ -577,12 +639,5 @@ mod tests {
         assert_eq!(a, rp_id(b"E5B59DDB-9930-4ACC-BC01-BDB185F96216"));
         assert_ne!(a, rp_id(b"1404D88A-8D8A-49C1-82A4-5112791D0018"));
         assert_eq!(a[0] & 0x03, 0x02);
-    }
-
-    #[test]
-    fn default_options() {
-        let o = ClientOptions::default();
-        assert_eq!(o.timeout, Duration::from_secs(5));
-        assert_eq!(o.model, "iPhone10,6");
     }
 }

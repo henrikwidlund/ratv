@@ -17,16 +17,17 @@ ed25519-dalek.workspace = true
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 hkdf = "0.13"
 sha2 = "0.11"
-num-bigint = "0.5"
 subtle = "2.6"
 rand_core.workspace = true
 zeroize = "1"
 thiserror.workspace = true
 secrecy = "0.10.3"
 base16ct = { version = "1.0.0", features = ["alloc"] }
+crypto-bigint = { version = "0.7.10", default-features = false, features = ["zeroize"] }
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "cipher"

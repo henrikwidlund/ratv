@@ -24,6 +24,7 @@ pub use credentials::{Credentials, ParseCredentialsError};
 pub use error::{DeviceError, Error};
 pub use secrecy::{ExposeSecret, SecretString};
 pub use secret::SharedSecret;
+pub use zeroize::Zeroizing;
 
 /// Random number generator accepted by this crate.
 pub use rand_core::CryptoRng;

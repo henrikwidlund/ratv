@@ -37,7 +37,7 @@ use std::time::{Duration, SystemTime};
 
 use ratv::discovery::{MDNS_PORT, ScanOptions, scan};
 use ratv::mrp::{self, RepeatMode, ShuffleMode, cocoa_time};
-use ratv::{AppleTv, ConnectOptions, Endpoints, Key};
+use ratv::{AppleTv, ClientOptions, Endpoints, Key};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         endpoints.airplay
     );
 
-    let tv = AppleTv::connect(&endpoints, &credentials, &ConnectOptions::default()).await?;
+    let tv = AppleTv::connect(&endpoints, &credentials, &ClientOptions::default()).await?;
     println!(
         "connected: companion {}, mrp {}",
         tv.companion().is_some(),

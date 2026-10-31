@@ -10,9 +10,9 @@ categories = ["network-programming", "api-bindings"]
 
 [features]
 default = ["companion", "discovery", "mrp"]
-companion = ["dep:ratv-companion"]
+companion = ["dep:ratv-companion", "dep:socket2"]
 discovery = ["dep:ratv-discovery"]
-mrp = ["dep:ratv-airplay", "dep:ratv-mrp"]
+mrp = ["dep:ratv-airplay", "dep:ratv-mrp", "dep:socket2"]
 # Siri voice input from PCM.
 opus = ["mrp", "ratv-mrp/opus"]
 # Logs full messages at trace level. They can contain personal data,
@@ -32,6 +32,7 @@ tokio = { version = "1", default-features = false, features = ["net", "io-util",
 getrandom = { version = "0.4", features = ["sys_rng"] }
 rand_core.workspace = true
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+socket2 = { version = "0.6.5", features = ["all"], optional = true }
 
 [dev-dependencies]
 ratv-hap = { workspace = true, features = ["accessory"] }

@@ -39,12 +39,10 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-use ratv::ExposeSecret;
-use ratv::companion::{self, PairOptions};
+use ratv::{Endpoints, ExposeSecret, PairOptions};
 
-async fn pair() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "192.168.1.20:49153".parse()?; // _companion-link._tcp
-    let prompt = companion::pair(addr, &PairOptions::default()).await?;
+async fn pair(endpoints: &Endpoints) -> Result<(), Box<dyn std::error::Error>> {
+    let prompt = ratv::pair(endpoints, &PairOptions::default()).await?;
     let credentials = prompt.finish("1234").await?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -64,13 +62,14 @@ Find the device and connect:
 
 ```rust
 use ratv::discovery::{ScanOptions, scan};
-use ratv::{AppleTv, ConnectOptions, Credentials, Endpoints, Key};
+use ratv::{AppleTv, ClientOptions, Credentials, Endpoints, ExposeSecret, Key, SecretString};
 
 async fn control() -> Result<(), Box<dyn std::error::Error>> {
     let devices = scan(&ScanOptions::default()).await?;
-    let credentials: Credentials = std::fs::read_to_string("tv.credentials")?.parse()?;
+    let text = SecretString::from(std::fs::read_to_string("tv.credentials")?);
+    let credentials: Credentials = text.expose_secret().parse()?;
     let endpoints = Endpoints::from(&devices[0]);
-    let tv = AppleTv::connect(&endpoints, &credentials, &ConnectOptions::default()).await?;
+    let tv = AppleTv::connect(&endpoints, &credentials, &ClientOptions::default()).await?;
 
     tv.press(Key::Select).await?;
     tv.pause().await?;
@@ -79,6 +78,9 @@ async fn control() -> Result<(), Box<dyn std::error::Error>> {
         np.changed().await?;
         println!("{:?}", np.borrow().title);
     }
+    // Returns when a connection closes. Connect again to continue.
+    let reason = tv.closed().await;
+    println!("closed: {reason:?}");
     Ok(())
 }
 ```
@@ -97,6 +99,10 @@ async fn ask_siri(tv: &ratv::AppleTv, packets: Vec<Vec<u8>>) -> Result<(), ratv:
 
 Audio is kept until the TV records, then sent. With feature `opus`, send
 16-bit, 16 kHz, mono PCM in chunks of any size with `push_pcm` instead.
+`AppleTv` and the clients are cheap to clone, and `Siri` can move to another task.
+
+The TV closes an open Companion connection when a new one connects with the
+same credentials. Share one client with `clone()` instead of connecting again.
 
 ## Features
 

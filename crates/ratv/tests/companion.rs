@@ -337,8 +337,8 @@ fn options() -> ClientOptions {
 #[tokio::test]
 async fn pairing_creates_credentials() {
     let (creds, controller) = pair().await;
-    assert_eq!(creds.accessory_id, DEVICE_ID);
-    assert_eq!(creds.client_id, controller.id);
+    assert_eq!(creds.accessory_id(), DEVICE_ID);
+    assert_eq!(creds.client_id(), controller.id);
     let meta = ratv_codec::opack::decode(controller.metadata.as_deref().unwrap()).unwrap();
     assert_eq!(meta.get("name").and_then(Value::as_str), Some("ratv"));
     // Credentials are the same after conversion to text and back.
@@ -393,7 +393,7 @@ async fn session_commands() {
         .unwrap();
     client.turn_on().await.unwrap();
     client.turn_off().await.unwrap();
-    assert!((client.volume().await.unwrap() - 0.25).abs() < f64::EPSILON);
+    assert!((client.volume().await.unwrap() - 0.25).abs() < f32::EPSILON);
     client.set_volume(1.5).await.unwrap();
     client.media(companion::MediaControl::Play).await.unwrap();
     assert_eq!(client.power_state().await.unwrap(), AttentionState::Awake);
@@ -495,15 +495,45 @@ async fn disconnect_fails_pending_requests() {
     let _ = device.await;
     let err = client.press(HidCommand::Up).await.unwrap_err();
     assert!(matches!(err, Error::Disconnected), "{err}");
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    let reason = tokio::time::timeout(Duration::from_secs(1), client.closed())
+        .await
+        .unwrap();
+    assert!(reason.is_some());
     assert!(!client.is_connected());
 }
 
 #[tokio::test]
+async fn clones_share_session() {
+    let (creds, controller) = pair().await;
+    let (client_io, device_io) = tokio::io::duplex(8192);
+    tokio::spawn(device_session(device_io, controller, Arc::default()));
+    let client = companion::Client::connect_stream(client_io, &creds, &options())
+        .await
+        .unwrap();
+    let clone = client.clone();
+    tokio::spawn(async move { clone.press(HidCommand::Up).await })
+        .await
+        .unwrap()
+        .unwrap();
+    client.close().await.unwrap();
+    // Closed with `close`, so there is no error.
+    assert!(client.closed().await.is_none());
+    assert!(!client.is_connected());
+    let err = client.press(HidCommand::Up).await.unwrap_err();
+    assert!(matches!(err, Error::Disconnected), "{err}");
+    client.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn verify_with_unknown_credentials_fails() {
-    let (mut creds, controller) = pair().await;
+    let (creds, controller) = pair().await;
     // Different client key: the device rejects the M3 signature.
-    creds.client_ltsk = [1u8; 32].into();
+    let creds = Credentials::new(
+        *creds.accessory_ltpk(),
+        [1u8; 32].into(),
+        creds.accessory_id().to_vec(),
+        creds.client_id().to_vec(),
+    );
     let (client_io, device_io) = tokio::io::duplex(8192);
     tokio::spawn(device_session(device_io, controller, Arc::default()));
     let err = companion::Client::connect_stream(client_io, &creds, &options())

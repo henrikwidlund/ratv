@@ -1,5 +1,6 @@
 /// Parsed TXT record: `key=value` pairs. Keys compare case-insensitively.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Txt {
     entries: Vec<(String, String)>,
 }

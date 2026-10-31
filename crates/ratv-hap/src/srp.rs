@@ -2,12 +2,14 @@
 //!
 //! Values that enter a hash are padded to the group size (384 bytes),
 //! except `S` in `K = H(S)`: Apple devices hash `S` without leading zero bytes.
+//! Modular arithmetic runs in constant time.
 
 use std::sync::LazyLock;
-use subtle::ConstantTimeEq;
 
-use num_bigint::BigUint;
+use crypto_bigint::modular::{FixedMontyForm, FixedMontyParams};
+use crypto_bigint::{NonZero, Odd, U256, U512, U1024, U1280, U3072, Uint};
 use sha2::{Digest, Sha512};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::Error;
@@ -31,25 +33,38 @@ ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D8760273\
 3EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB31\
 43DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF";
 
+/// Number modulo `N`, in Montgomery form.
+type Mod = FixedMontyForm<{ U3072::LIMBS }>;
+
 struct Group {
-    n: BigUint,
-    g: BigUint,
-    k: BigUint,
+    n: NonZero<U3072>,
+    params: FixedMontyParams<{ U3072::LIMBS }>,
+    g: Mod,
+    k: Mod,
     // H(N) xor H(g)
     hn_xor_hg: [u8; 64],
 }
 
 static GROUP: LazyLock<Group> = LazyLock::new(|| {
-    let n = BigUint::parse_bytes(N_HEX, 16).expect("valid prime");
-    let g = BigUint::from(5u32);
-    let k = BigUint::from_bytes_be(&hash(&[&pad(&n), &pad(&g)]));
-    let hn = hash(&[&n.to_bytes_be()]);
-    let hg = hash(&[&g.to_bytes_be()]);
+    let hex = core::str::from_utf8(N_HEX).expect("ASCII");
+    let n = U3072::from_be_hex(hex);
+    let params = FixedMontyParams::new(Odd::new(n).expect("N is odd"));
+    let g = U3072::from_u8(5);
+    let k = uint::<{ U3072::LIMBS }>(&hash(&[&pad(&n), &pad(&g)]));
+    let hn = hash(&[&pad(&n)]);
+    // `g` is hashed as one byte.
+    let hg = hash(&[&[5]]);
     let mut hn_xor_hg = [0u8; 64];
     for (i, b) in hn_xor_hg.iter_mut().enumerate() {
         *b = hn[i] ^ hg[i];
     }
-    Group { n, g, k, hn_xor_hg }
+    Group {
+        n: NonZero::new(n).expect("N is not zero"),
+        g: Mod::new(&g, &params),
+        k: Mod::new(&k, &params),
+        params,
+        hn_xor_hg,
+    }
 });
 
 fn hash(parts: &[&[u8]]) -> [u8; 64] {
@@ -60,22 +75,44 @@ fn hash(parts: &[&[u8]]) -> [u8; 64] {
     h.finalize().into()
 }
 
-fn pad(v: &BigUint) -> [u8; GROUP_LEN] {
-    let bytes = v.to_bytes_be();
+/// Reads big endian bytes. `bytes` must not be longer than `Uint<L>`.
+fn uint<const L: usize>(bytes: &[u8]) -> Uint<L> {
+    let size = Uint::<L>::BYTES;
+    let mut buf = Zeroizing::new([0u8; GROUP_LEN]);
+    buf[size - bytes.len()..size].copy_from_slice(bytes);
+    Uint::from_be_slice(&buf[..size])
+}
+
+fn pad(v: &U3072) -> [u8; GROUP_LEN] {
     let mut out = [0u8; GROUP_LEN];
-    out[GROUP_LEN - bytes.len()..].copy_from_slice(&bytes);
+    out.copy_from_slice(&v.to_be_bytes());
     out
 }
 
 // K = H(S), with `S` not padded.
-fn session_key(s: &BigUint) -> [u8; 64] {
-    hash(&[&Zeroizing::new(s.to_bytes_be())])
+fn session_key(s: &U3072) -> [u8; 64] {
+    let bytes = Zeroizing::new(pad(s));
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(GROUP_LEN);
+    hash(&[&bytes[start..]])
 }
 
 // x = H(salt | H(username ":" password))
-fn private_x(salt: &[u8], password: &[u8]) -> BigUint {
+fn private_x(salt: &[u8], password: &[u8]) -> Zeroizing<U512> {
     let inner = hash(&[USERNAME, b":", password]);
-    BigUint::from_bytes_be(&hash(&[salt, &inner]))
+    Zeroizing::new(U512::from_be_slice(&hash(&[salt, &inner])))
+}
+
+/// Reads a public value from the other side. Fails if it is 0 mod `N`.
+fn public_value(bytes: &[u8]) -> Result<Mod, Error> {
+    let grp = &*GROUP;
+    if bytes.len() > GROUP_LEN {
+        return Err(Error::InvalidSrpParameters);
+    }
+    let v = uint::<{ U3072::LIMBS }>(bytes).rem(&grp.n);
+    if v.is_zero_vartime() {
+        return Err(Error::InvalidSrpParameters);
+    }
+    Ok(Mod::new(&v, &grp.params))
 }
 
 fn proofs(
@@ -110,21 +147,20 @@ impl SrpClient {
         a_private: &[u8; 32],
     ) -> Result<Self, Error> {
         let grp = &*GROUP;
-        let b = BigUint::from_bytes_be(b_pub);
-        if b_pub.len() > GROUP_LEN || (&b % &grp.n) == BigUint::ZERO {
-            return Err(Error::InvalidSrpParameters);
-        }
-        let a = BigUint::from_bytes_be(a_private);
-        let a_pub = pad(&grp.g.modpow(&a, &grp.n));
-        let b_pad = pad(&b);
-        let u = BigUint::from_bytes_be(&hash(&[&a_pub, &b_pad]));
-        if u == BigUint::ZERO {
+        let b = public_value(b_pub)?;
+        let a = Zeroizing::new(U256::from_be_slice(a_private));
+        let a_pub = pad(&grp.g.pow(&*a).retrieve());
+        let b_pad = pad(&b.retrieve());
+        let u = U512::from_be_slice(&hash(&[&a_pub, &b_pad]));
+        if u.is_zero_vartime() {
             return Err(Error::InvalidSrpParameters);
         }
         let x = private_x(salt, password);
-        let kgx = (&grp.k * grp.g.modpow(&x, &grp.n)) % &grp.n;
-        let base = (&b + &grp.n - kgx) % &grp.n;
-        let s = base.modpow(&(a + u * x), &grp.n);
+        let base = b - grp.k * grp.g.pow(&*x);
+        // a + u * x is below 2^1025, so it fits without overflow.
+        let ux: U1024 = u.concatenating_mul(&*x);
+        let exp = Zeroizing::new(ux.resize::<{ U1280::LIMBS }>().wrapping_add(&a.resize()));
+        let s = Zeroizing::new(base.pow(&*exp).retrieve());
         let key = Zeroizing::new(session_key(&s));
         let (m1, m2) = proofs(&a_pub, &b_pad, salt, &key);
         Ok(Self { a_pub, m1, m2, key })
@@ -156,8 +192,8 @@ impl SrpClient {
 #[cfg(any(test, feature = "accessory"))]
 pub struct SrpServer {
     salt: Vec<u8>,
-    verifier: BigUint,
-    b: BigUint,
+    verifier: Mod,
+    b: Zeroizing<U256>,
     b_pub: [u8; GROUP_LEN],
 }
 
@@ -167,9 +203,9 @@ impl SrpServer {
     #[must_use]
     pub fn new(password: &[u8], salt: &[u8], b_private: &[u8; 32]) -> Self {
         let grp = &*GROUP;
-        let verifier = grp.g.modpow(&private_x(salt, password), &grp.n);
-        let b = BigUint::from_bytes_be(b_private);
-        let b_pub = pad(&((&grp.k * &verifier + grp.g.modpow(&b, &grp.n)) % &grp.n));
+        let verifier = grp.g.pow(&*private_x(salt, password));
+        let b = Zeroizing::new(U256::from_be_slice(b_private));
+        let b_pub = pad(&(grp.k * verifier + grp.g.pow(&*b)).retrieve());
         Self {
             salt: salt.to_vec(),
             verifier,
@@ -186,14 +222,10 @@ impl SrpServer {
 
     /// Checks the client proof. Returns the server proof `M2` and session key `K`.
     pub fn verify(&self, a_pub: &[u8], client_proof: &[u8]) -> Result<([u8; 64], [u8; 64]), Error> {
-        let grp = &*GROUP;
-        let a = BigUint::from_bytes_be(a_pub);
-        if (&a % &grp.n) == BigUint::ZERO {
-            return Err(Error::InvalidSrpParameters);
-        }
-        let a_pad = pad(&a);
-        let u = BigUint::from_bytes_be(&hash(&[&a_pad, &self.b_pub]));
-        let s = (a * self.verifier.modpow(&u, &grp.n)).modpow(&self.b, &grp.n);
+        let a = public_value(a_pub)?;
+        let a_pad = pad(&a.retrieve());
+        let u = U512::from_be_slice(&hash(&[&a_pad, &self.b_pub]));
+        let s = Zeroizing::new((a * self.verifier.pow(&u)).pow(&*self.b).retrieve());
         let key = session_key(&s);
         let (m1, m2) = proofs(&a_pad, &self.b_pub, &self.salt, &key);
         if bool::from(m1.ct_eq(client_proof)) {
@@ -231,7 +263,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_public_keys() {
-        let n = GROUP.n.to_bytes_be();
+        let n = pad(&GROUP.n);
         assert_eq!(
             SrpClient::new(b"1", &[0; 16], &n, &[1; 32]).err(),
             Some(Error::InvalidSrpParameters)
@@ -327,7 +359,7 @@ mod tests {
 
     #[test]
     fn group_constants() {
-        assert_eq!(GROUP.n.to_bytes_be().len(), GROUP_LEN);
-        assert_eq!(pad(&BigUint::from(1u8))[GROUP_LEN - 1], 1);
+        assert_eq!(pad(&GROUP.n)[0], 0xFF);
+        assert_eq!(pad(&U3072::ONE)[GROUP_LEN - 1], 1);
     }
 }

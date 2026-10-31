@@ -22,6 +22,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -36,7 +37,7 @@ use ratv_mrp::{
     NowPlayingState, Payload, VolumeState, encode, encode_type, frames, messages, proto,
 };
 use tokio::io::AsyncReadExt;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Notify, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
 
@@ -48,11 +49,17 @@ use ratv_hap::pair_setup::{self, ClientIdentity, NeedPin};
 use tokio::net::TcpStream;
 
 use crate::airplay::{self, Connections, Identity, READ_CHUNK};
+use crate::link::{Link, LinkTx};
+pub use crate::{ClientOptions, PairOptions};
 use crate::{Credentials, Error, log, rng, tcp};
 
-const COMMAND_CAPACITY: usize = 16;
+/// Encoded messages that are not sent yet.
+const MAX_OUTBOX: usize = 1 << 20;
 const MESSAGE_CAPACITY: usize = 64;
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
+/// The device answers each feedback request. Without an answer for this long,
+/// the connection is dead.
+const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Voice packets kept until the device records: 30 s.
 const MAX_PENDING: usize = 1500;
 /// Siri listening to voice input, from [`Client::start_siri`].
@@ -61,8 +68,8 @@ const MAX_PENDING: usize = 1500;
 /// Siri is released when this is dropped, but call [`finish`](Self::finish)
 /// to send the rest of the audio and to know that the release was sent.
 #[must_use = "Siri stays active until `finish` is called or this is dropped"]
-pub struct Siri<'a> {
-    client: &'a Client,
+pub struct Siri {
+    client: Client,
     /// Recording count when Siri was pressed.
     start: u32,
     recording: watch::Receiver<u32>,
@@ -79,7 +86,7 @@ pub struct Siri<'a> {
     held: bool,
 }
 
-impl Siri<'_> {
+impl Siri {
     /// Sends one Opus packet of 20 ms, 16 kHz, mono.
     /// Send one packet every 20 ms.
     pub async fn send(&mut self, packet: impl Into<Bytes>) -> Result<(), Error> {
@@ -108,14 +115,14 @@ impl Siri<'_> {
             encoder.flush(|p| pending.push(Bytes::copy_from_slice(p)))?;
         }
         if !self.pending.is_empty() && !self.is_recording() {
-            let (start, client) = (self.start, self.client);
+            let (start, client) = (self.start, self.client.clone());
             let wait = self.recording.wait_for(|&n| n != start);
-            match tokio::time::timeout(client.timeout, wait).await {
+            match tokio::time::timeout(client.inner.timeout, wait).await {
                 // `send_pending` sees the change.
                 Ok(Ok(_)) => {}
                 Ok(Err(_)) => return Err(Error::Disconnected),
                 Err(_) => {
-                    tracing::debug!(parent: &client.span, "Siri did not start recording");
+                    tracing::debug!(parent: &client.inner.span, "Siri did not start recording");
                     return Err(Error::SiriNotRecording);
                 }
             }
@@ -123,7 +130,7 @@ impl Siri<'_> {
         self.send_pending().await?;
         let result = self.client.button(Button::Siri, false).await;
         self.held = false;
-        tracing::debug!(parent: &self.client.span, packets = self.sample / messages::VOICE_FRAMES, "Siri released");
+        tracing::debug!(parent: &self.client.inner.span, packets = self.sample / messages::VOICE_FRAMES, "Siri released");
         result
     }
 
@@ -131,7 +138,7 @@ impl Siri<'_> {
     fn is_recording(&mut self) -> bool {
         if !self.started && *self.recording.borrow() != self.start {
             self.started = true;
-            tracing::debug!(parent: &self.client.span, kept = self.pending.len(), "Siri recording");
+            tracing::debug!(parent: &self.client.inner.span, kept = self.pending.len(), "Siri recording");
         }
         self.started
     }
@@ -140,7 +147,7 @@ impl Siri<'_> {
     async fn send_pending(&mut self) -> Result<(), Error> {
         if !self.is_recording() {
             if self.pending.len() > MAX_PENDING {
-                tracing::debug!(parent: &self.client.span, "Siri did not start recording");
+                tracing::debug!(parent: &self.client.inner.span, "Siri did not start recording");
                 self.pending.clear();
                 return Err(Error::SiriNotRecording);
             }
@@ -156,13 +163,16 @@ impl Siri<'_> {
     }
 }
 
-impl Drop for Siri<'_> {
+impl Drop for Siri {
     fn drop(&mut self) {
         if self.held {
-            tracing::debug!(parent: &self.client.span, "Siri released on drop");
-            self.client.send_now(&Button::Siri.event(false));
+            tracing::debug!(parent: &self.client.inner.span, "Siri released on drop");
+            let _ = self.client.queue(&Button::Siri.event(false), None, None);
         }
-        self.client.siri_active.store(false, Ordering::Release);
+        self.client
+            .inner
+            .siri_active
+            .store(false, Ordering::Release);
     }
 }
 
@@ -180,60 +190,6 @@ fn is_recording(env: &Envelope) -> bool {
 const AUTO_LANGUAGE: &str = "__AUTO__";
 /// Current item plus next items to request for [`NowPlaying::up_next`].
 const QUEUE_LENGTH: i32 = 10;
-
-/// Options for [`Client::connect`].
-#[derive(Debug, Clone)]
-pub struct ClientOptions {
-    /// Name we report to the device.
-    pub name: String,
-    /// Model we report, for example `iPhone14,3`.
-    pub model: String,
-    /// iOS version we report.
-    pub os_version: String,
-    /// iOS build we report.
-    pub os_build: String,
-    /// Stable id, `AA:BB:CC:DD:EE:FF`. Random if `None`.
-    pub device_id: Option<String>,
-    /// Stable unique id for `DEVICE_INFO`, usually a UUID. Random if `None`.
-    pub unique_identifier: Option<String>,
-    /// Time to wait for each response.
-    pub timeout: Duration,
-}
-
-impl Default for ClientOptions {
-    fn default() -> Self {
-        Self {
-            name: "ratv".into(),
-            model: "iPhone14,3".into(),
-            os_version: "17.0".into(),
-            os_build: "21A329".into(),
-            device_id: None,
-            unique_identifier: None,
-            timeout: Duration::from_secs(5),
-        }
-    }
-}
-
-/// Options for [`pair`].
-#[derive(Debug, Clone)]
-pub struct PairOptions {
-    /// Name shown with the PIN and in the device settings.
-    pub name: String,
-    /// Pairing identifier. A random UUID is used when `None`.
-    pub client_id: Option<String>,
-    /// Time to wait for each response.
-    pub timeout: Duration,
-}
-
-impl Default for PairOptions {
-    fn default() -> Self {
-        Self {
-            name: "ratv".into(),
-            client_id: None,
-            timeout: Duration::from_secs(5),
-        }
-    }
-}
 
 /// AirPlay pairing that waits for the PIN shown on the device.
 pub struct PinPrompt {
@@ -350,21 +306,20 @@ impl PairLink {
     }
 }
 
-enum Request {
-    Send {
-        payload: BytesMut,
-        reply: Option<(String, oneshot::Sender<Envelope>)>,
-    },
-    Close(oneshot::Sender<()>),
-}
-
 /// Connected MRP session.
 ///
-/// A background task owns the three AirPlay connections. Dropping the client
-/// stops it; [`Client::close`] also ends the session on the device.
-#[derive(Debug)]
+/// A background task owns the three AirPlay connections. Clones share the
+/// session. Dropping the last clone stops it; [`Client::close`] also ends the
+/// session on the device.
+#[derive(Debug, Clone)]
 pub struct Client {
-    requests: mpsc::Sender<Request>,
+    inner: Arc<Inner>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    shared: Arc<Shared>,
+    link: Link,
     messages: broadcast::Sender<Envelope>,
     now_playing: watch::Receiver<NowPlaying>,
     volume: watch::Receiver<Volume>,
@@ -381,6 +336,51 @@ pub struct Client {
     /// True while a [`Siri`] exists.
     siri_active: AtomicBool,
     span: Span,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Written by clients, read by the background task.
+#[derive(Debug, Default)]
+struct Shared {
+    outbox: Mutex<Outbox>,
+    wake: Notify,
+}
+
+#[derive(Debug, Default)]
+struct Outbox {
+    /// Encoded messages to send.
+    buf: BytesMut,
+    /// Requests that wait for a response, by identifier.
+    pending: Vec<(u32, oneshot::Sender<Envelope>)>,
+    /// Set by `close`.
+    close: Option<oneshot::Sender<()>>,
+}
+
+impl Shared {
+    /// Locks the outbox. A panic while locked cannot leave it invalid.
+    fn outbox(&self) -> MutexGuard<'_, Outbox> {
+        self.outbox.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Formats a request identifier without allocating.
+fn id_str(mut n: u32, buf: &mut [u8; 10]) -> &str {
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        // A digit, so the cast is exact.
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&buf[i..]).expect("ASCII digits")
 }
 
 impl Client {
@@ -479,13 +479,17 @@ impl Client {
         }
         conns.stream.send(&out);
 
-        let (requests, rx) = mpsc::channel(COMMAND_CAPACITY);
+        let shared = Arc::new(Shared::default());
+        let (link_tx, link) = Link::new();
         let (messages, _) = broadcast::channel(MESSAGE_CAPACITY);
         state.publish();
-        let task = tokio::spawn(run(conns, rx, messages.clone(), state).instrument(span.clone()));
+        let task = tokio::spawn(
+            run(conns, shared.clone(), link_tx, messages.clone(), state).instrument(span.clone()),
+        );
         tracing::debug!("connected");
-        Ok(Self {
-            requests,
+        let inner = Inner {
+            shared,
+            link,
             messages,
             now_playing,
             volume,
@@ -498,82 +502,108 @@ impl Client {
             timeout: options.timeout,
             task,
             span,
+        };
+        Ok(Self {
+            inner: Arc::new(inner),
         })
     }
 
     /// Device info from the connection handshake.
     #[must_use]
-    pub const fn device_info(&self) -> &proto::DeviceInfoMessage {
-        &self.device
+    pub fn device_info(&self) -> &proto::DeviceInfoMessage {
+        &self.inner.device
     }
 
     /// What the device plays. Updated by the background task.
     #[must_use]
     pub fn now_playing(&self) -> watch::Receiver<NowPlaying> {
-        self.now_playing.clone()
+        self.inner.now_playing.clone()
     }
 
     /// Volume and mute state. Updated by the background task.
     #[must_use]
     pub fn volume(&self) -> watch::Receiver<Volume> {
-        self.volume.clone()
+        self.inner.volume.clone()
     }
 
     /// All received MRP messages.
+    ///
+    /// A receiver that reads too slowly misses old messages and gets
+    /// `RecvError::Lagged`. For state, use [`now_playing`](Self::now_playing)
+    /// and [`volume`](Self::volume): they always have the latest value.
     #[must_use]
     pub fn messages(&self) -> broadcast::Receiver<Envelope> {
-        self.messages.subscribe()
+        self.inner.messages.subscribe()
     }
 
-    /// True while the background task runs.
+    /// True until the connection closes.
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        !self.task.is_finished()
+        self.inner.link.is_open()
+    }
+
+    /// Waits until the connection closes. Returns the error that closed it,
+    /// or `None` after [`close`](Self::close).
+    pub async fn closed(&self) -> Option<Arc<Error>> {
+        self.inner.link.closed().await
+    }
+
+    /// Encodes `msg` into the outbox and wakes the background task.
+    /// Registers `reply` for the response to `id`.
+    fn queue<P: Payload>(
+        &self,
+        msg: &P,
+        id: Option<u32>,
+        reply: Option<oneshot::Sender<Envelope>>,
+    ) -> Result<(), Error> {
+        if !self.inner.link.is_open() {
+            return Err(Error::Disconnected);
+        }
+        let mut buf = [0; 10];
+        let id_text = id.map(|n| id_str(n, &mut buf));
+        {
+            let mut out = self.inner.shared.outbox();
+            if out.buf.len() > MAX_OUTBOX {
+                return Err(Error::QueueFull);
+            }
+            encode(msg, id_text, &mut out.buf);
+            if let (Some(id), Some(reply)) = (id, reply) {
+                out.pending.retain(|(_, tx)| !tx.is_closed());
+                out.pending.push((id, reply));
+            }
+        }
+        self.inner.shared.wake.notify_one();
+        Ok(())
     }
 
     /// Sends a message and waits for the response with the same identifier.
     /// Device errors are returned as `Err`.
     pub async fn request<P: Payload>(&self, msg: &P) -> Result<Envelope, Error> {
-        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let id = n.to_string();
-        let mut payload = BytesMut::new();
-        encode(msg, Some(&id), &mut payload);
-        tracing::trace!(parent: &self.span, kind = P::TYPE, id = n, "request");
+        let n = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        tracing::trace!(parent: &self.inner.span, kind = P::TYPE, id = n, "request");
         let start = std::time::Instant::now();
         let (tx, rx) = oneshot::channel();
-        self.requests
-            .send(Request::Send {
-                payload,
-                reply: Some((id, tx)),
-            })
-            .await
-            .map_err(|_| Error::Disconnected)?;
-        let Ok(env) = tokio::time::timeout(self.timeout, rx).await else {
-            tracing::debug!(parent: &self.span, kind = P::TYPE, id = n, "request timed out");
+        self.queue(msg, Some(n), Some(tx))?;
+        let Ok(env) = tokio::time::timeout(self.inner.timeout, rx).await else {
+            tracing::debug!(parent: &self.inner.span, kind = P::TYPE, id = n, "request timed out");
             return Err(Error::Timeout);
         };
         let env = env.map_err(|_| Error::Disconnected)?;
         let elapsed = start.elapsed();
         if let Some(err) = env.error() {
-            tracing::debug!(parent: &self.span, kind = P::TYPE, id = n, ?elapsed, %err, "request failed");
+            tracing::debug!(parent: &self.inner.span, kind = P::TYPE, id = n, ?elapsed, %err, "request failed");
             return Err(err.into());
         }
-        tracing::trace!(parent: &self.span, kind = P::TYPE, id = n, ?elapsed, "response");
+        tracing::trace!(parent: &self.inner.span, kind = P::TYPE, id = n, ?elapsed, "response");
         Ok(env)
     }
 
     /// Sends a message without waiting for a response.
+    // Async, so waiting for queue space can be added without an API change.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn send<P: Payload>(&self, msg: &P) -> Result<(), Error> {
-        let mut payload = BytesMut::new();
-        encode(msg, None, &mut payload);
-        tracing::trace!(parent: &self.span, kind = P::TYPE, "send");
-        self.requests
-            .send(Request::Send {
-                payload,
-                reply: None,
-            })
-            .await
-            .map_err(|_| Error::Disconnected)
+        tracing::trace!(parent: &self.inner.span, kind = P::TYPE, "send");
+        self.queue(msg, None, None)
     }
 
     /// Holds Siri. Send the audio with [`Siri::send`] or `Siri::push_pcm`
@@ -585,15 +615,15 @@ impl Client {
     /// [`Siri::finish`] fails with it after the timeout.
     /// Registers a voice input device on first use.
     /// Fails with [`Error::SiriActive`] while another [`Siri`] exists.
-    pub async fn start_siri(&self) -> Result<Siri<'_>, Error> {
-        if self.siri_active.swap(true, Ordering::AcqRel) {
+    pub async fn start_siri(&self) -> Result<Siri, Error> {
+        if self.inner.siri_active.swap(true, Ordering::AcqRel) {
             return Err(Error::SiriActive);
         }
-        let recording = self.recording.clone();
+        let recording = self.inner.recording.clone();
         let start = *recording.borrow();
         // Releases the button and the flag if a step fails or the future is dropped.
         let mut siri = Siri {
-            client: self,
+            client: self.clone(),
             start,
             recording,
             started: false,
@@ -606,19 +636,19 @@ impl Client {
         self.voice_device().await?;
         self.button(Button::Siri, true).await?;
         siri.held = true;
-        tracing::debug!(parent: &self.span, "Siri pressed");
+        tracing::debug!(parent: &self.inner.span, "Siri pressed");
         Ok(siri)
     }
 
     async fn voice_device(&self) -> Result<i32, Error> {
-        self.voice_device
+        self.inner.voice_device
             .get_or_try_init(|| async {
                 let env = self.request(&messages::register_voice_input()).await?;
                 let reply: proto::RegisterVoiceInputDeviceResponseMessage = env.payload()?;
                 match reply.error_code.unwrap_or(0) {
                     0 => {
                         let id = reply.device_id.unwrap_or(0);
-                        tracing::debug!(parent: &self.span, id, "voice input device registered");
+                        tracing::debug!(parent: &self.inner.span, id, "voice input device registered");
                         Ok(id)
                     }
                     code => Err(ratv_mrp::Error::Device {
@@ -630,24 +660,6 @@ impl Client {
             })
             .await
             .copied()
-    }
-
-    /// Queues a message without waiting. If the queue is full, a task sends it.
-    fn send_now<P: Payload>(&self, msg: &P) {
-        let mut payload = BytesMut::new();
-        encode(msg, None, &mut payload);
-        let request = Request::Send {
-            payload,
-            reply: None,
-        };
-        if let Err(mpsc::error::TrySendError::Full(request)) = self.requests.try_send(request)
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
-            let requests = self.requests.clone();
-            runtime.spawn(async move {
-                let _ = requests.send(request).await;
-            });
-        }
     }
 
     /// Sends a button down or up event.
@@ -679,8 +691,10 @@ impl Client {
     }
 
     /// Skips `seconds` forward, or backward if negative.
-    pub async fn skip(&self, seconds: f32) -> Result<(), Error> {
-        self.run_command(&messages::skip(seconds)).await
+    pub async fn skip(&self, seconds: f64) -> Result<(), Error> {
+        // The protocol field is a float.
+        #[allow(clippy::cast_possible_truncation)]
+        self.run_command(&messages::skip(seconds as f32)).await
     }
 
     /// Sets the shuffle mode.
@@ -769,7 +783,7 @@ impl Client {
     /// Turns off subtitles.
     pub async fn disable_subtitles(&self) -> Result<(), Error> {
         // With only the type, the device can show another subtitle track instead.
-        let msg = match self.now_playing.borrow().subtitle_language.as_ref() {
+        let msg = match self.inner.now_playing.borrow().subtitle_language.as_ref() {
             Some(o) if o.language_tag() != AUTO_LANGUAGE => messages::disable_language(o),
             _ => messages::disable_subtitles(),
         };
@@ -804,25 +818,23 @@ impl Client {
     }
 
     fn output_uid(&self) -> Result<&str, Error> {
-        self.output_uid
+        self.inner
+            .output_uid
             .as_deref()
             .ok_or(Error::Protocol("device has no output device UID"))
     }
 
-    /// Ends the session and closes the connections.
-    pub async fn close(mut self) -> Result<(), Error> {
-        let (tx, rx) = oneshot::channel();
-        if self.requests.send(Request::Close(tx)).await.is_ok() {
-            let _ = rx.await;
-            let _ = (&mut self.task).await;
+    /// Ends the session and closes the connections of all clones.
+    pub async fn close(&self) -> Result<(), Error> {
+        if !self.inner.link.is_open() {
+            return Ok(());
         }
+        let (tx, rx) = oneshot::channel();
+        self.inner.shared.outbox().close = Some(tx);
+        self.inner.shared.wake.notify_one();
+        let _ = rx.await;
+        self.inner.link.closed().await;
         Ok(())
-    }
-}
-
-impl Drop for Client {
-    fn drop(&mut self) {
-        self.task.abort();
     }
 }
 
@@ -927,19 +939,29 @@ fn publish<T: PartialEq>(tx: &watch::Sender<T>, value: T) {
 
 async fn run(
     conns: Connections,
-    requests: mpsc::Receiver<Request>,
+    shared: Arc<Shared>,
+    link: LinkTx,
     messages: broadcast::Sender<Envelope>,
     state: State,
 ) {
-    match run_inner(conns, requests, &messages, state).await {
-        Ok(()) => tracing::debug!("connection closed"),
-        Err(err) => tracing::debug!(%err, "connection ended"),
-    }
+    let reason = match run_inner(conns, &shared, &messages, state).await {
+        Ok(()) => {
+            tracing::debug!("connection closed");
+            None
+        }
+        Err(err) => {
+            tracing::debug!(%err, "connection ended");
+            Some(Arc::new(err))
+        }
+    };
+    link.close(reason);
+    // Waiting requests fail right away.
+    shared.outbox().pending.clear();
 }
 
 async fn run_inner(
     conns: Connections,
-    mut requests: mpsc::Receiver<Request>,
+    shared: &Shared,
     messages: &broadcast::Sender<Envelope>,
     mut state: State,
 ) -> Result<(), Error> {
@@ -954,41 +976,47 @@ async fn run_inner(
         mut data,
         mut stream,
     } = conns;
-    let mut pending: Vec<(String, oneshot::Sender<Envelope>)> = Vec::new();
+    let mut details = BytesMut::new();
     let start = tokio::time::Instant::now() + FEEDBACK_INTERVAL;
     let mut feedback = tokio::time::interval_at(start, FEEDBACK_INTERVAL);
+    let mut last_control = tokio::time::Instant::now();
 
     loop {
         // Pushed items often lack languages, chapters and next items.
         if state.item_changed() {
-            let mut out = BytesMut::new();
+            details.clear();
             encode(
                 &messages::playback_queue_details(QUEUE_LENGTH),
                 Some("details"),
-                &mut out,
+                &mut details,
             );
-            stream.send(&out);
+            stream.send(&details);
         }
         if stream.has_transmit() {
             data.write_all(&stream.take_transmit()).await?;
         }
         tokio::select! {
-            req = requests.recv() => match req {
-                Some(Request::Send { payload, reply }) => {
-                    if let Some(r) = reply {
-                        pending.retain(|(_, tx)| !tx.is_closed());
-                        pending.push(r);
+            () = shared.wake.notified() => {
+                let (chunk, close) = {
+                    let mut out = shared.outbox();
+                    (out.buf.split(), out.close.take())
+                };
+                // Sent before TEARDOWN, so a release queued before `close` arrives.
+                stream.send(&chunk);
+                if let Some(done) = close {
+                    if stream.has_transmit() {
+                        data.write_all(&stream.take_transmit()).await?;
                     }
-                    stream.send(&payload);
-                }
-                Some(Request::Close(done)) => {
                     airplay::teardown(&mut control, &mut channel, &mut session).await;
                     let _ = done.send(());
                     return Ok(());
                 }
-                None => return Ok(()),
             },
             _ = feedback.tick() => {
+                if last_control.elapsed() > FEEDBACK_TIMEOUT {
+                    tracing::debug!("no answer to feedback");
+                    return Err(Error::Timeout);
+                }
                 tracing::trace!("feedback");
                 session.feedback(&mut channel);
                 airplay::flush(&mut control, &mut channel).await?;
@@ -997,6 +1025,7 @@ async fn run_inner(
                 if n? == 0 {
                     return Err(Error::Disconnected);
                 }
+                last_control = tokio::time::Instant::now();
                 while let Some(m) = channel.poll_message()? {
                     if m.status() != Some(200) {
                         tracing::debug!(status = ?m.status(), "control response");
@@ -1015,7 +1044,7 @@ async fn run_inner(
                 }
                 while let Some(bytes) = stream.poll()? {
                     for env in frames(bytes) {
-                        dispatch(env?, &mut pending, messages, &mut state);
+                        dispatch(env?, shared, messages, &mut state);
                     }
                 }
             }
@@ -1025,7 +1054,7 @@ async fn run_inner(
 
 fn dispatch(
     env: Envelope,
-    pending: &mut Vec<(String, oneshot::Sender<Envelope>)>,
+    shared: &Shared,
     messages: &broadcast::Sender<Envelope>,
     state: &mut State,
 ) {
@@ -1033,11 +1062,17 @@ fn dispatch(
     #[cfg(feature = "sensitive-logs")]
     tracing::trace!(?env, "received");
     state.apply(&env);
-    if let Some(id) = env.identifier()
-        && let Some(i) = pending.iter().position(|(p, _)| p == id)
-    {
-        let (_, reply) = pending.swap_remove(i);
-        let _ = reply.send(env.clone());
+    if let Some(id) = env.identifier().and_then(|id| id.parse::<u32>().ok()) {
+        let reply = {
+            let mut out = shared.outbox();
+            out.pending
+                .iter()
+                .position(|(p, _)| *p == id)
+                .map(|i| out.pending.swap_remove(i).1)
+        };
+        if let Some(reply) = reply {
+            let _ = reply.send(env.clone());
+        }
     }
     let _ = messages.send(env);
 }

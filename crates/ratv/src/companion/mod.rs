@@ -6,8 +6,9 @@ mod client;
 mod io;
 mod pairing;
 
-pub use client::{Client, ClientOptions};
-pub use pairing::{PairOptions, PinPrompt, pair, pair_stream};
+pub use crate::{ClientOptions, PairOptions};
+pub use client::Client;
+pub use pairing::{PinPrompt, pair, pair_stream};
 pub use ratv_companion::message::{
     Account, App, AttentionState, ButtonState, Event, HidCommand, MediaControl, MediaControlFlags,
     TouchPhase,

@@ -272,12 +272,12 @@ mod tests {
         // Build a secret through a real pair-verify with fixed keys.
         let device_seed = [0x22; 32];
         let client_seed = [0x11; 32];
-        let creds = Credentials {
-            accessory_ltpk: ed25519_public(&device_seed),
-            client_ltsk: client_seed.into(),
-            accessory_id: b"dev".to_vec(),
-            client_id: b"cli".to_vec(),
-        };
+        let creds = Credentials::new(
+            ed25519_public(&device_seed),
+            client_seed.into(),
+            b"dev".to_vec(),
+            b"cli".to_vec(),
+        );
         let mut server = PairVerifyServer::new(
             b"dev",
             &device_seed,

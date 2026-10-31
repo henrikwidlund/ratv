@@ -417,6 +417,7 @@ impl Outgoing for FetchApps {
 
 /// An installed app.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct App {
     /// Bundle id.
     pub bundle_id: String,
@@ -462,6 +463,7 @@ impl Outgoing for SwitchAccount<'_> {
 
 /// A user account on the device.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Account {
     /// Id for [`SwitchAccount`].
     pub id: String,
@@ -507,6 +509,7 @@ impl Outgoing for FetchAttentionState {
 /// Device power/attention state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum AttentionState {
     Unknown,
     Asleep,

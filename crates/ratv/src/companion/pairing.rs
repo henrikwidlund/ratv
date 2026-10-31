@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use ratv_companion::Connection;
 use ratv_companion::pairing::{ClientInfo, Flow};
@@ -10,31 +9,7 @@ use tokio::net::TcpStream;
 use tracing::{Instrument, Span};
 
 use super::io::pairing_step;
-use crate::{Error, log, rng, tcp};
-
-/// Options for Companion pairing.
-#[derive(Debug, Clone)]
-pub struct PairOptions {
-    /// Name shown in the Apple TV settings.
-    pub name: String,
-    /// Model we report, for example `iPhone10,6`.
-    pub model: String,
-    /// Pairing identifier. A random UUID is used when `None`.
-    pub client_id: Option<String>,
-    /// Time to wait for the connection and each response.
-    pub timeout: Duration,
-}
-
-impl Default for PairOptions {
-    fn default() -> Self {
-        Self {
-            name: "ratv".into(),
-            model: "iPhone10,6".into(),
-            client_id: None,
-            timeout: Duration::from_secs(5),
-        }
-    }
-}
+use crate::{Error, PairOptions, log, rng, tcp};
 
 /// The device shows a PIN. Call [`PinPrompt::finish`] with it.
 pub struct PinPrompt<S> {

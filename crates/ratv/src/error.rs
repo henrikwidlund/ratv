@@ -50,6 +50,9 @@ pub enum Error {
     /// Connection is closed.
     #[error("connection closed")]
     Disconnected,
+    /// Too much data waits to be sent. The device does not read it.
+    #[error("send queue is full")]
+    QueueFull,
     /// Device sent something unexpected.
     #[error("protocol error: {0}")]
     Protocol(&'static str),

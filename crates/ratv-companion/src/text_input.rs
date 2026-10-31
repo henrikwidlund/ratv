@@ -14,6 +14,7 @@ use crate::message::{Message, MessageType, Outgoing};
 
 /// Focused text field.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TextSession {
     /// Session UUID bytes, used as target of text operations.
     pub uuid: Vec<u8>,

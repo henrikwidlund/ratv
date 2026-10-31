@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 bytes = "1"
 ratv-codec = { path = "../crates/ratv-codec" }
+ratv-hap = { path = "../crates/ratv-hap" }
 ratv-companion = { path = "../crates/ratv-companion" }
 ratv-airplay = { path = "../crates/ratv-airplay" }
 ratv-mrp = { path = "../crates/ratv-mrp" }
@@ -71,6 +72,13 @@ bench = false
 [[bin]]
 name = "txt"
 path = "fuzz_targets/txt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "credentials"
+path = "fuzz_targets/credentials.rs"
 test = false
 doc = false
 bench = false

@@ -24,7 +24,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use ratv::discovery::{MDNS_PORT, ScanOptions, scan};
-use ratv::{AppleTv, ConnectOptions, Endpoints, Key};
+use ratv::{AppleTv, ClientOptions, Endpoints, Key};
 use ratv_codec::bplist::Value;
 use ratv_mrp::Envelope;
 use ratv_mrp::proto::{
@@ -141,7 +141,7 @@ async fn connect(credentials: &str, ip: IpAddr) -> Result<AppleTv, Box<dyn std::
     let tv = AppleTv::connect(
         &Endpoints::from(device),
         &credentials,
-        &ConnectOptions::default(),
+        &ClientOptions::default(),
     )
     .await?;
     Ok(tv)

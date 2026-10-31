@@ -8,6 +8,7 @@ use crate::{Envelope, Error};
 
 /// Image data of the current item.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Artwork {
     /// Encoded image, shares the buffer of the received message.
     pub data: Bytes,

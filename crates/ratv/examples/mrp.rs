@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(v) = value("seek=") {
                 client.seek(v?).await?;
             } else if let Some(v) = value("skip=") {
-                client.skip(v? as f32).await?;
+                client.skip(v?).await?;
             } else if let Some(v) = value("volume=") {
                 client.set_volume(v? as f32).await?;
             } else {

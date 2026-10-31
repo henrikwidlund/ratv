@@ -2,6 +2,7 @@ use core::fmt;
 use core::str::FromStr;
 
 use secrecy::SecretString;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 /// Long-term keys from a completed pair-setup.
@@ -9,17 +10,30 @@ use zeroize::Zeroizing;
 /// The text form is `ltpk:ltsk:accessory_id:client_id`, each part hex encoded.
 /// This is the same format pyatv uses, so credentials can be shared.
 /// Create it with [`to_secret_string`](Self::to_secret_string) and read it with `parse`.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Credentials {
     /// Device long-term Ed25519 public key.
-    pub accessory_ltpk: [u8; 32],
+    pub(crate) accessory_ltpk: [u8; 32],
     /// Our long-term Ed25519 secret key (seed).
-    pub client_ltsk: Zeroizing<[u8; 32]>,
+    pub(crate) client_ltsk: Zeroizing<[u8; 32]>,
     /// Device pairing identifier.
-    pub accessory_id: Vec<u8>,
+    pub(crate) accessory_id: Vec<u8>,
     /// Our pairing identifier.
-    pub client_id: Vec<u8>,
+    pub(crate) client_id: Vec<u8>,
 }
+
+impl PartialEq for Credentials {
+    fn eq(&self, other: &Self) -> bool {
+        // The secret key is always compared in full, in constant time.
+        let secret = bool::from(self.client_ltsk.ct_eq(other.client_ltsk.as_ref()));
+        secret
+            && self.accessory_ltpk == other.accessory_ltpk
+            && self.accessory_id == other.accessory_id
+            && self.client_id == other.client_id
+    }
+}
+
+impl Eq for Credentials {}
 
 impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -31,6 +45,41 @@ impl fmt::Debug for Credentials {
 }
 
 impl Credentials {
+    /// Creates credentials from their parts, for example from another library.
+    /// Usually they come from pairing or from [`to_secret_string`](Self::to_secret_string) text.
+    #[must_use]
+    pub const fn new(
+        accessory_ltpk: [u8; 32],
+        client_ltsk: Zeroizing<[u8; 32]>,
+        accessory_id: Vec<u8>,
+        client_id: Vec<u8>,
+    ) -> Self {
+        Self {
+            accessory_ltpk,
+            client_ltsk,
+            accessory_id,
+            client_id,
+        }
+    }
+
+    /// Device long-term Ed25519 public key.
+    #[must_use]
+    pub const fn accessory_ltpk(&self) -> &[u8; 32] {
+        &self.accessory_ltpk
+    }
+
+    /// Device pairing identifier.
+    #[must_use]
+    pub fn accessory_id(&self) -> &[u8] {
+        &self.accessory_id
+    }
+
+    /// Our pairing identifier.
+    #[must_use]
+    pub fn client_id(&self) -> &[u8] {
+        &self.client_id
+    }
+
     /// Text form with the secret key. Store it so that only the owner can read it.
     ///
     /// Get the text with `expose_secret`. It is cleared from memory when dropped.
@@ -125,6 +174,34 @@ mod tests {
         let s = format!("{:?}", sample());
         assert!(s.contains("AA:BB"));
         assert!(!s.contains("ltsk"));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn text_roundtrip_any(
+            ltpk: [u8; 32],
+            ltsk: [u8; 32],
+            accessory_id: Vec<u8>,
+            client_id: Vec<u8>,
+            upper: bool,
+        ) {
+            let c = Credentials::new(ltpk, ltsk.into(), accessory_id, client_id);
+            let secret = c.to_secret_string();
+            let mut text = secret.expose_secret().to_owned();
+            if upper {
+                text.make_ascii_uppercase();
+            }
+            proptest::prop_assert_eq!(text.parse::<Credentials>().unwrap(), c);
+        }
+
+        #[test]
+        fn parse_any_text(text: String) {
+            // Must not panic. Valid text must give the same text back.
+            if let Ok(c) = text.parse::<Credentials>() {
+                let again = c.to_secret_string();
+                proptest::prop_assert_eq!(again.expose_secret(), text.trim().to_ascii_lowercase());
+            }
+        }
     }
 
     #[test]

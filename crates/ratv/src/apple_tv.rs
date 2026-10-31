@@ -13,9 +13,9 @@
 //!
 //! ```no_run
 //! # async fn run(device: ratv::discovery::Device, credentials: ratv::Credentials) -> Result<(), ratv::Error> {
-//! use ratv::{AppleTv, ConnectOptions, Endpoints, Key};
+//! use ratv::{AppleTv, ClientOptions, Endpoints, Key};
 //!
-//! let tv = AppleTv::connect(&Endpoints::from(&device), &credentials, &ConnectOptions::default()).await?;
+//! let tv = AppleTv::connect(&Endpoints::from(&device), &credentials, &ClientOptions::default()).await?;
 //! tv.press(Key::Select).await?;
 //! tv.pause().await?;
 //! if let Some(np) = tv.now_playing() {
@@ -26,15 +26,17 @@
 //! ```
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use tokio::net::TcpStream;
 use tokio::sync::watch;
 
 use crate::companion::{self, Account, App, ButtonState, HidCommand, MediaControl};
 use crate::mrp::{
     self, Artwork, Button, Command, LanguageOption, NowPlaying, RepeatMode, ShuffleMode,
 };
-use crate::{Credentials, Error};
+use crate::{ClientOptions, Credentials, Error, PairOptions};
 
 /// Where the device's services listen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -56,13 +58,37 @@ impl From<&crate::discovery::Device> for Endpoints {
     }
 }
 
-/// Options for [`AppleTv::connect`].
-#[derive(Debug, Clone, Default)]
-pub struct ConnectOptions {
-    /// Companion options.
-    pub companion: companion::ClientOptions,
-    /// MRP options.
-    pub mrp: mrp::ClientOptions,
+/// Starts pairing. The device shows a PIN when this returns.
+///
+/// Uses Companion if `endpoints` has it, else AirPlay. Credentials from
+/// Companion pairing work for both protocols on recent tvOS versions.
+pub async fn pair(endpoints: &Endpoints, options: &PairOptions) -> Result<PinPrompt, Error> {
+    let prompt = match (endpoints.companion, endpoints.airplay) {
+        (Some(addr), _) => Prompt::Companion(companion::pair(addr, options).await?),
+        (None, Some(addr)) => Prompt::Mrp(mrp::pair(addr, options).await?),
+        (None, None) => return Err(Error::NotConnected("no endpoints")),
+    };
+    Ok(PinPrompt(prompt))
+}
+
+/// Pairing that waits for the PIN shown on the device, from [`pair`].
+#[derive(Debug)]
+pub struct PinPrompt(Prompt);
+
+#[derive(Debug)]
+enum Prompt {
+    Companion(companion::PinPrompt<TcpStream>),
+    Mrp(mrp::PinPrompt),
+}
+
+impl PinPrompt {
+    /// Completes pairing with the PIN shown on the device.
+    pub async fn finish(self, pin: &str) -> Result<Credentials, Error> {
+        match self.0 {
+            Prompt::Companion(p) => p.finish(pin).await,
+            Prompt::Mrp(p) => p.finish(pin).await,
+        }
+    }
 }
 
 /// Remote control key.
@@ -147,7 +173,9 @@ impl Key {
 }
 
 /// A connected Apple TV.
-#[derive(Debug)]
+///
+/// Clones share the connections.
+#[derive(Debug, Clone)]
 pub struct AppleTv {
     companion: Option<companion::Client>,
     mrp: Option<mrp::Client>,
@@ -161,19 +189,17 @@ impl AppleTv {
     pub async fn connect(
         endpoints: &Endpoints,
         credentials: &Credentials,
-        options: &ConnectOptions,
+        options: &ClientOptions,
     ) -> Result<Self, Error> {
         let companion = async {
             match endpoints.companion {
-                Some(addr) => {
-                    Some(companion::Client::connect(addr, credentials, &options.companion).await)
-                }
+                Some(addr) => Some(companion::Client::connect(addr, credentials, options).await),
                 None => None,
             }
         };
         let mrp = async {
             match endpoints.airplay {
-                Some(addr) => Some(mrp::Client::connect(addr, credentials, &options.mrp).await),
+                Some(addr) => Some(mrp::Client::connect(addr, credentials, options).await),
                 None => None,
             }
         };
@@ -326,12 +352,12 @@ impl AppleTv {
     }
 
     /// Skips `seconds` forward, or backward if negative.
-    pub async fn skip(&self, seconds: f32) -> Result<(), Error> {
+    pub async fn skip(&self, seconds: f64) -> Result<(), Error> {
         match &self.mrp {
             Some(m) => m.skip(seconds).await,
             None => {
                 self.need_companion()?
-                    .media(MediaControl::SkipBy(f64::from(seconds)))
+                    .media(MediaControl::SkipBy(seconds))
                     .await
             }
         }
@@ -437,7 +463,7 @@ impl AppleTv {
     }
 
     /// Holds Siri. Needs MRP. See [`mrp::Client::start_siri`].
-    pub async fn start_siri(&self) -> Result<mrp::Siri<'_>, Error> {
+    pub async fn start_siri(&self) -> Result<mrp::Siri, Error> {
         self.need_mrp()?.start_siri().await
     }
 
@@ -455,7 +481,7 @@ impl AppleTv {
     pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
         match &self.mrp {
             Some(m) => m.set_volume(volume).await,
-            None => self.need_companion()?.set_volume(f64::from(volume)).await,
+            None => self.need_companion()?.set_volume(volume).await,
         }
     }
 
@@ -556,22 +582,53 @@ impl AppleTv {
     }
 
     /// Closes all connections.
-    pub async fn close(self) -> Result<(), Error> {
+    pub async fn close(&self) -> Result<(), Error> {
         let (a, b) = tokio::join!(
             async {
-                match self.companion {
+                match &self.companion {
                     Some(c) => c.close().await,
                     None => Ok(()),
                 }
             },
             async {
-                match self.mrp {
+                match &self.mrp {
                     Some(m) => m.close().await,
                     None => Ok(()),
                 }
             }
         );
         a.and(b)
+    }
+
+    /// True until one of the connected protocols closes.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.companion
+            .as_ref()
+            .is_none_or(companion::Client::is_connected)
+            && self.mrp.as_ref().is_none_or(mrp::Client::is_connected)
+    }
+
+    /// Waits until one of the connected protocols closes. Returns the error
+    /// that closed it, or `None` after [`close`](Self::close).
+    /// Connect again to get all protocols back.
+    pub async fn closed(&self) -> Option<Arc<Error>> {
+        let companion = async {
+            match &self.companion {
+                Some(c) => c.closed().await,
+                None => std::future::pending().await,
+            }
+        };
+        let mrp = async {
+            match &self.mrp {
+                Some(m) => m.closed().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            reason = companion => reason,
+            reason = mrp => reason,
+        }
     }
 }
 
@@ -625,19 +682,22 @@ mod tests {
         let err = AppleTv::connect(
             &Endpoints::default(),
             &test_credentials(),
-            &ConnectOptions::default(),
+            &ClientOptions::default(),
         )
         .await
         .unwrap_err();
         assert!(matches!(err, Error::NotConnected("no endpoints")));
     }
 
+    #[tokio::test]
+    async fn pair_needs_endpoints() {
+        let err = pair(&Endpoints::default(), &PairOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotConnected("no endpoints")));
+    }
+
     fn test_credentials() -> Credentials {
-        Credentials {
-            accessory_ltpk: [0; 32],
-            client_ltsk: [0; 32].into(),
-            accessory_id: Vec::new(),
-            client_id: Vec::new(),
-        }
+        Credentials::new([0; 32], [0; 32].into(), Vec::new(), Vec::new())
     }
 }

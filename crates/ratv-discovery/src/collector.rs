@@ -6,6 +6,7 @@ use crate::txt::{Txt, parse_features};
 
 /// Service types used by Apple TV.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ServiceKind {
     /// Companion protocol (`_companion-link._tcp`).
     Companion,
@@ -51,6 +52,7 @@ impl ServiceKind {
 
 /// A service on a device.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Service {
     /// Kind.
     pub kind: ServiceKind,
@@ -64,6 +66,7 @@ pub struct Service {
 
 /// A discovered device.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Device {
     /// Host name, for example `Living-Room.local`.
     pub host: String,

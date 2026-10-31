@@ -40,9 +40,13 @@ pub mod companion;
 pub mod discovery;
 mod error;
 #[cfg(any(feature = "companion", feature = "mrp"))]
+mod link;
+#[cfg(any(feature = "companion", feature = "mrp"))]
 mod log;
 #[cfg(feature = "mrp")]
 pub mod mrp;
+#[cfg(any(feature = "companion", feature = "mrp"))]
+mod options;
 #[cfg(any(feature = "companion", feature = "mrp"))]
 mod rng;
 #[cfg(any(feature = "companion", feature = "mrp"))]
@@ -51,8 +55,10 @@ mod tcp;
 mod touch;
 
 #[cfg(all(feature = "companion", feature = "mrp"))]
-pub use apple_tv::{AppleTv, ConnectOptions, Endpoints, Key};
+pub use apple_tv::{AppleTv, Endpoints, Key, PinPrompt, pair};
 pub use error::Error;
+#[cfg(any(feature = "companion", feature = "mrp"))]
+pub use options::{ClientOptions, PairOptions};
 
 #[cfg(all(doctest, feature = "companion", feature = "mrp", feature = "discovery"))]
 #[doc = include_str!("../../../README.md")]

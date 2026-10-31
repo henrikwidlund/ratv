@@ -45,14 +45,14 @@ struct Log {
 }
 
 fn credentials() -> Credentials {
-    Credentials {
-        accessory_ltpk: SigningKey::from_bytes(&DEVICE_LTSK)
+    Credentials::new(
+        SigningKey::from_bytes(&DEVICE_LTSK)
             .verifying_key()
             .to_bytes(),
-        client_ltsk: CLIENT_SEED.into(),
-        accessory_id: DEVICE_ID.to_vec(),
-        client_id: CLIENT_ID.to_vec(),
-    }
+        CLIENT_SEED.into(),
+        DEVICE_ID.to_vec(),
+        CLIENT_ID.to_vec(),
+    )
 }
 
 async fn read_msg(s: &mut TcpStream, ch: &mut Channel) -> Option<Message> {
@@ -95,6 +95,10 @@ enum Fault {
     DataPort,
     /// `DEVICE_INFO` gets no answer.
     DeviceInfo,
+    /// The data stream closes after the connect handshake.
+    DropData,
+    /// Feedback requests get no answer.
+    NoFeedback,
 }
 
 struct Device {
@@ -171,8 +175,9 @@ async fn run_device(listener: TcpListener, log: Arc<Mutex<Log>>, fault: Fault) {
                                 while s.read(&mut [0; 256]).await.is_ok_and(|n| n > 0) {}
                             });
                         }
-                        Fault::None => {
-                            tokio::spawn(data_stream(listener, sec, seed, log.clone()));
+                        Fault::None | Fault::DropData | Fault::NoFeedback => {
+                            let drop = matches!(fault, Fault::DropData);
+                            tokio::spawn(data_stream(listener, sec, seed, log.clone(), drop));
                         }
                     }
                     reply(&mut s, &mut ch, &req, &resp).await;
@@ -181,7 +186,9 @@ async fn run_device(listener: TcpListener, log: Arc<Mutex<Log>>, fault: Fault) {
             ("RECORD", _) => reply(&mut s, &mut ch, &req, b"").await,
             ("POST", "/feedback") => {
                 log.lock().unwrap().feedback += 1;
-                reply(&mut s, &mut ch, &req, b"").await;
+                if !matches!(fault, Fault::NoFeedback) {
+                    reply(&mut s, &mut ch, &req, b"").await;
+                }
             }
             ("TEARDOWN", _) => {
                 log.lock().unwrap().teardown = true;
@@ -206,7 +213,14 @@ async fn event_channel(listener: TcpListener, secret: SharedSecret, log: Arc<Mut
     }
 }
 
-async fn data_stream(listener: TcpListener, secret: SharedSecret, seed: u64, log: Arc<Mutex<Log>>) {
+/// With `drop`, closes after the answer to `CLIENT_UPDATES_CONFIG`.
+async fn data_stream(
+    listener: TcpListener,
+    secret: SharedSecret,
+    seed: u64,
+    log: Arc<Mutex<Log>>,
+    drop: bool,
+) {
     let (mut s, _) = listener.accept().await.unwrap();
     let mut ds = DataStream::new(keys::data_stream(&secret, seed, Side::Device), 500);
     loop {
@@ -217,9 +231,11 @@ async fn data_stream(listener: TcpListener, secret: SharedSecret, seed: u64, log
         if n == 0 {
             return;
         }
+        let mut close = false;
         while let Some(data) = ds.poll().unwrap() {
             for env in frames(data) {
                 let env = env.unwrap();
+                close |= drop && env.is::<proto::ClientUpdatesConfigMessage>();
                 if let Some(out) = handle(&env, &log) {
                     ds.send(&out);
                 }
@@ -227,6 +243,9 @@ async fn data_stream(listener: TcpListener, secret: SharedSecret, seed: u64, log
         }
         if ds.has_transmit() {
             s.write_all(&ds.take_transmit()).await.unwrap();
+        }
+        if close {
+            return;
         }
     }
 }
@@ -642,6 +661,75 @@ async fn siri() {
 }
 
 #[tokio::test]
+async fn closed_by_device() {
+    let device = start_faulty_device(Fault::DropData).await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    let reason = tokio::time::timeout(Duration::from_secs(2), client.closed())
+        .await
+        .unwrap();
+    assert!(
+        matches!(reason.as_deref(), Some(Error::Disconnected | Error::Io(_))),
+        "{reason:?}"
+    );
+    assert!(!client.is_connected());
+    let err = client.press(Button::Select).await.unwrap_err();
+    assert!(matches!(err, Error::Disconnected), "{err}");
+    // Nothing to close any more.
+    client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn closed_without_feedback_answer() {
+    let device = start_faulty_device(Fault::NoFeedback).await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    // Time moves forward by itself while all tasks wait.
+    tokio::time::pause();
+    let reason = client.closed().await;
+    assert!(
+        matches!(reason.as_deref(), Some(Error::Timeout)),
+        "{reason:?}"
+    );
+    assert!(device.log.lock().unwrap().feedback >= 4);
+}
+
+#[tokio::test]
+async fn siri_in_task() {
+    let device = start_device().await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    // `Siri` owns a clone of the client, so it can move to another task.
+    let mut siri = client.start_siri().await.unwrap();
+    tokio::spawn(async move {
+        siri.send(&b"one"[..]).await?;
+        siri.finish().await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    client.close().await.unwrap();
+    assert!(client.closed().await.is_none());
+    let err = client.press(Button::Select).await.unwrap_err();
+    assert!(matches!(err, Error::Disconnected), "{err}");
+    // Lets the device read TEARDOWN.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let log = device.log.lock().unwrap();
+    assert_eq!(log.voice, [(0.0, 3)]);
+    // The release is sent before TEARDOWN.
+    let siri = [(0x0c, 0x04, true), (0x0c, 0x04, false)];
+    assert_eq!(log.buttons, siri);
+    assert!(log.teardown);
+}
+
+#[tokio::test]
 async fn siri_not_recording() {
     let device = start_device().await;
     let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
@@ -704,17 +792,14 @@ async fn siri_pcm() {
 #[cfg(feature = "companion")]
 #[tokio::test]
 async fn apple_tv_chapters_and_subtitles() {
-    use ratv::{AppleTv, ConnectOptions, Endpoints};
+    use ratv::{AppleTv, Endpoints};
 
     let device = start_device().await;
     let endpoints = Endpoints {
         companion: None,
         airplay: Some(format!("127.0.0.1:{}", device.port).parse().unwrap()),
     };
-    let opts = ConnectOptions {
-        mrp: options(),
-        ..ConnectOptions::default()
-    };
+    let opts = options();
     let tv = AppleTv::connect(&endpoints, &credentials(), &opts)
         .await
         .unwrap();
@@ -785,8 +870,13 @@ async fn missing_device_info_sends_teardown() {
 async fn wrong_credentials_fail() {
     let device = start_device().await;
     let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
-    let mut creds = credentials();
-    creds.accessory_ltpk = [1; 32];
+    let good = credentials();
+    let creds = Credentials::new(
+        [1; 32],
+        [0; 32].into(),
+        good.accessory_id().to_vec(),
+        good.client_id().to_vec(),
+    );
     assert!(Client::connect(addr, &creds, &options()).await.is_err());
 }
 
@@ -805,7 +895,7 @@ async fn connection_refused() {
 #[cfg(feature = "companion")]
 #[tokio::test]
 async fn apple_tv_falls_back_to_mrp() {
-    use ratv::{AppleTv, ConnectOptions, Endpoints, Key};
+    use ratv::{AppleTv, Endpoints, Key};
 
     let device = start_device().await;
     let refused = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -815,10 +905,7 @@ async fn apple_tv_falls_back_to_mrp() {
         companion: Some(companion),
         airplay: Some(format!("127.0.0.1:{}", device.port).parse().unwrap()),
     };
-    let opts = ConnectOptions {
-        mrp: options(),
-        ..ConnectOptions::default()
-    };
+    let opts = options();
     let tv = AppleTv::connect(&endpoints, &credentials(), &opts)
         .await
         .unwrap();
@@ -839,7 +926,10 @@ async fn apple_tv_falls_back_to_mrp() {
         tv.launch_app("x").await,
         Err(Error::NotConnected("Companion"))
     ));
-    tv.close().await.unwrap();
+    assert!(tv.is_connected());
+    tv.clone().close().await.unwrap();
+    assert!(tv.closed().await.is_none());
+    assert!(!tv.is_connected());
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let log = device.log.lock().unwrap();
@@ -860,7 +950,7 @@ async fn apple_tv_falls_back_to_mrp() {
 #[cfg(feature = "companion")]
 #[tokio::test]
 async fn apple_tv_fails_when_nothing_connects() {
-    use ratv::{AppleTv, ConnectOptions, Endpoints};
+    use ratv::{AppleTv, Endpoints};
 
     let refused = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = refused.local_addr().unwrap();
@@ -869,7 +959,7 @@ async fn apple_tv_fails_when_nothing_connects() {
         companion: Some(addr),
         airplay: Some(addr),
     };
-    let err = AppleTv::connect(&endpoints, &credentials(), &ConnectOptions::default())
+    let err = AppleTv::connect(&endpoints, &credentials(), &ClientOptions::default())
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Io(_)));
@@ -914,10 +1004,10 @@ async fn pairing() {
         .finish("1234")
         .await
         .unwrap();
-    assert_eq!(creds.accessory_id, DEVICE_ID);
-    assert_eq!(creds.client_id, b"client-9");
+    assert_eq!(creds.accessory_id(), DEVICE_ID);
+    assert_eq!(creds.client_id(), b"client-9");
     assert_eq!(
-        creds.accessory_ltpk,
+        *creds.accessory_ltpk(),
         SigningKey::from_bytes(&DEVICE_LTSK)
             .verifying_key()
             .to_bytes()
