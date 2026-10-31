@@ -370,6 +370,16 @@ impl AppleTv {
         self.double_tap(Key::Home).await
     }
 
+    /// Opens the context menu of the focused item by holding [`Key::Select`] for 1 s.
+    pub async fn context_menu(&self) -> Result<(), Error> {
+        self.hold(Key::Select, Duration::from_secs(1)).await
+    }
+
+    /// Opens Control Center with [`Key::PageDown`]. Needs Companion.
+    pub async fn control_center(&self) -> Result<(), Error> {
+        self.press(Key::PageDown).await
+    }
+
     /// Holds a key for `duration`. The key is released also if the
     /// returned future is dropped.
     pub async fn hold(&self, key: Key, duration: Duration) -> Result<(), Error> {

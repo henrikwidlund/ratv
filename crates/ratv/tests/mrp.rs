@@ -1001,6 +1001,10 @@ async fn apple_tv_falls_back_to_mrp() {
         tv.launch_app("x").await,
         Err(Error::NotConnected("Companion"))
     ));
+    assert!(matches!(
+        tv.control_center().await,
+        Err(Error::NotConnected("Companion"))
+    ));
     assert!(tv.is_connected());
     tv.clone().close().await.unwrap();
     assert!(tv.closed().await.is_none());

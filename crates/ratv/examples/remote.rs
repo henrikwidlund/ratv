@@ -13,7 +13,7 @@
 //! `volume` (print volume and mute), `watch_volume`, `mute`, `unmute`, `page_up`,
 //! `screensaver`, `channel_up`, `channel_down`, `siri`, `tap=<x>,<y>` (0.0 to 1.0),
 //! `speed=<rate>`, `rate=<rating>`, `like`, `unlike`, `dislike`, `undislike`, `accounts`, `account=<id>`,
-//! `app_switcher`, `double_tap=<key>` (key name from this list, for example `home`),
+//! `app_switcher`, `context_menu`, `double_tap=<key>` (key name from this list, for example `home`),
 //! `hold=<key>,<s>` (hold a key for some seconds),
 //! `ff=<s>` and `rw=<s>` (fast forward or rewind for some seconds),
 //! `ff_companion=<s>`, `rw_companion=<s>`, `ff_mrp=<s>`, `rw_mrp=<s>` (the same with one protocol only), `shuffle`, `repeat`
@@ -131,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tv.previous_chapter().await?;
         }
         (None, "app_switcher") => tv.app_switcher().await?,
+        (None, "context_menu") => tv.context_menu().await?,
         (None, "on") => tv.turn_on().await?,
         (None, "off") => tv.turn_off().await?,
         (None, "watch") => watch(&tv).await?,
