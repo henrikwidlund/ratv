@@ -26,7 +26,7 @@ pub enum Error {
     #[error("Opus encoding failed: {0}")]
     Encode(&'static str),
     /// The device returned an error code.
-    #[error("device error {code}: {description}")]
+    #[error("device error {code}: {description:?}")]
     Device {
         /// `ErrorCode` value.
         code: i32,

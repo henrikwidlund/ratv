@@ -4,7 +4,7 @@
 //! ```text
 //! say -o voice.wav --data-format=LEI16@16000 "What's the weather tomorrow"
 //! afconvert -f caff -d opus@16000 -c 1 voice.wav voice.caf
-//! cargo run --example voice_probe -- <credentials> <ip> voice.caf
+//! cargo run --example voice_probe -- <credentials file> <ip> voice.caf
 //! ```
 //!
 //! A `.caf` file must hold 16 kHz mono Opus with 20 ms packets, as `afconvert` writes it.
@@ -15,6 +15,8 @@
 
 #[path = "common/caf.rs"]
 mod caf;
+#[path = "common/credentials.rs"]
+mod credentials;
 #[path = "common/wav.rs"]
 mod wav;
 
@@ -129,7 +131,7 @@ fn print(env: &Envelope) {
 }
 
 async fn connect(credentials: &str, ip: IpAddr) -> Result<AppleTv, Box<dyn std::error::Error>> {
-    let credentials = credentials.parse().map_err(|_| "invalid credentials")?;
+    let credentials = credentials::load(credentials)?;
     let options = ScanOptions {
         targets: vec![SocketAddr::new(ip, MDNS_PORT)],
         ..ScanOptions::default()
@@ -194,7 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (credentials, ip, path, options) = match args.as_slice() {
         [c, i, p] => (c, i, p, ""),
         [c, i, p, o] => (c, i, p, o.as_str()),
-        _ => return Err("usage: voice_probe <credentials> <ip> <file> [options]".into()),
+        _ => return Err("usage: voice_probe <credentials file> <ip> <file> [options]".into()),
     };
     let has = |name: &str| options.split(',').any(|o| o == name);
     let file = std::fs::read(path)?;

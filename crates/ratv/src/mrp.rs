@@ -48,11 +48,13 @@ use ratv_hap::pair_setup::{self, ClientIdentity, NeedPin};
 use tokio::net::TcpStream;
 
 use crate::airplay::{self, Connections, Identity, READ_CHUNK};
-use crate::{Credentials, Error, log, rng};
+use crate::{Credentials, Error, log, rng, tcp};
 
 const COMMAND_CAPACITY: usize = 16;
 const MESSAGE_CAPACITY: usize = 64;
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
+/// Voice packets kept until the device records: 30 s.
+const MAX_PENDING: usize = 1500;
 /// Siri listening to voice input, from [`Client::start_siri`].
 ///
 /// Audio is kept until the device starts recording, then sent.
@@ -112,9 +114,9 @@ impl Siri<'_> {
                 // `send_pending` sees the change.
                 Ok(Ok(_)) => {}
                 Ok(Err(_)) => return Err(Error::Disconnected),
-                Err(e) => {
+                Err(_) => {
                     tracing::debug!(parent: &client.span, "Siri did not start recording");
-                    return Err(e.into());
+                    return Err(Error::SiriNotRecording);
                 }
             }
         }
@@ -137,6 +139,11 @@ impl Siri<'_> {
     /// Sends the kept packets if the device records.
     async fn send_pending(&mut self) -> Result<(), Error> {
         if !self.is_recording() {
+            if self.pending.len() > MAX_PENDING {
+                tracing::debug!(parent: &self.client.span, "Siri did not start recording");
+                self.pending.clear();
+                return Err(Error::SiriNotRecording);
+            }
             return Ok(());
         }
         for packet in &self.pending {
@@ -258,8 +265,7 @@ async fn pair_inner(
     options: &PairOptions,
     span: Span,
 ) -> Result<PinPrompt, Error> {
-    let stream = TcpStream::connect(addr).await?;
-    stream.set_nodelay(true)?;
+    let stream = tcp::connect(addr, options.timeout).await?;
     let local = stream.local_addr()?.ip().to_string();
     let mut link = PairLink {
         stream,
@@ -574,7 +580,9 @@ impl Client {
     /// (feature `opus`), then release Siri with [`Siri::finish`].
     ///
     /// Returns right after the press. Audio is kept until the device records,
-    /// because audio sent before is lost.
+    /// because audio sent before is lost. Sending fails with
+    /// [`Error::SiriNotRecording`] after 30 s of kept audio, and
+    /// [`Siri::finish`] fails with it after the timeout.
     /// Registers a voice input device on first use.
     /// Fails with [`Error::SiriActive`] while another [`Siri`] exists.
     pub async fn start_siri(&self) -> Result<Siri<'_>, Error> {

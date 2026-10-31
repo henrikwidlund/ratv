@@ -40,6 +40,8 @@ struct Log {
     event_acks: usize,
     feedback: usize,
     teardown: bool,
+    /// Siri does not start recording.
+    no_recording: bool,
 }
 
 fn credentials() -> Credentials {
@@ -257,9 +259,10 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
     if env.is::<proto::SendButtonEventMessage>() {
         let b: proto::SendButtonEventMessage = env.payload().unwrap();
         let (page, usage, down) = (b.usage_page?, b.usage?, b.button_down?);
-        log.lock().unwrap().buttons.push((page, usage, down));
+        let mut log = log.lock().unwrap();
+        log.buttons.push((page, usage, down));
         // Siri: the device starts and stops recording.
-        return ((page, usage) == (0x0c, 0x04)).then(|| recording(down));
+        return ((page, usage) == (0x0c, 0x04) && !log.no_recording).then(|| recording(down));
     }
     if env.is::<proto::SendCommandMessage>() {
         let c: proto::SendCommandMessage = env.payload().unwrap();
@@ -636,6 +639,43 @@ async fn siri() {
     assert_eq!(log.voice, [(0.0, 3), (320.0, 5)]);
     let siri = [(0x0c, 0x04, true), (0x0c, 0x04, false)];
     assert_eq!(log.buttons, [siri; 4].concat());
+}
+
+#[tokio::test]
+async fn siri_not_recording() {
+    let device = start_device().await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let opts = ClientOptions {
+        timeout: Duration::from_millis(200),
+        ..options()
+    };
+    let client = Client::connect(addr, &credentials(), &opts).await.unwrap();
+    device.log.lock().unwrap().no_recording = true;
+
+    // Kept audio has a limit.
+    let mut siri = client.start_siri().await.unwrap();
+    let mut result = Ok(());
+    for _ in 0..2000 {
+        result = siri.send(&b"x"[..]).await;
+        if result.is_err() {
+            break;
+        }
+    }
+    assert!(matches!(result, Err(Error::SiriNotRecording)));
+    drop(siri);
+
+    // `finish` waits for the timeout.
+    let mut siri = client.start_siri().await.unwrap();
+    siri.send(&b"x"[..]).await.unwrap();
+    assert!(matches!(siri.finish().await, Err(Error::SiriNotRecording)));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    client.close().await.unwrap();
+
+    let log = device.log.lock().unwrap();
+    assert_eq!(log.voice, []);
+    // Both sessions release Siri.
+    let siri = [(0x0c, 0x04, true), (0x0c, 0x04, false)];
+    assert_eq!(log.buttons, [siri; 2].concat());
 }
 
 #[cfg(feature = "opus")]

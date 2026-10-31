@@ -1,12 +1,14 @@
 use core::fmt;
 use core::str::FromStr;
 
+use secrecy::SecretString;
 use zeroize::Zeroizing;
 
 /// Long-term keys from a completed pair-setup.
 ///
 /// The text form is `ltpk:ltsk:accessory_id:client_id`, each part hex encoded.
 /// This is the same format pyatv uses, so credentials can be shared.
+/// Create it with [`to_secret_string`](Self::to_secret_string) and read it with `parse`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Credentials {
     /// Device long-term Ed25519 public key.
@@ -28,22 +30,29 @@ impl fmt::Debug for Credentials {
     }
 }
 
-fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
-    for b in bytes {
-        write!(f, "{b:02x}")?;
-    }
-    Ok(())
-}
-
-impl fmt::Display for Credentials {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(f, &self.accessory_ltpk)?;
-        f.write_str(":")?;
-        write_hex(f, self.client_ltsk.as_ref())?;
-        f.write_str(":")?;
-        write_hex(f, &self.accessory_id)?;
-        f.write_str(":")?;
-        write_hex(f, &self.client_id)
+impl Credentials {
+    /// Text form with the secret key. Store it so that only the owner can read it.
+    ///
+    /// Get the text with `expose_secret`. It is cleared from memory when dropped.
+    #[must_use]
+    pub fn to_secret_string(&self) -> SecretString {
+        let parts: [&[u8]; 4] = [
+            &self.accessory_ltpk,
+            self.client_ltsk.as_ref(),
+            &self.accessory_id,
+            &self.client_id,
+        ];
+        let len = parts.iter().map(|p| 2 * p.len()).sum::<usize>() + parts.len() - 1;
+        // Exact length, so the buffer is never moved and no copy of the key is left in freed memory.
+        let mut buf = Zeroizing::new(vec![b':'; len]);
+        let mut pos = 0;
+        for part in parts {
+            let end = pos + 2 * part.len();
+            base16ct::lower::encode(part, &mut buf[pos..end]).expect("buffer has the exact length");
+            pos = end + 1;
+        }
+        let text = String::from_utf8(core::mem::take(&mut *buf)).expect("hex is ASCII");
+        SecretString::from(text)
     }
 }
 
@@ -52,22 +61,13 @@ impl fmt::Display for Credentials {
 #[error("invalid credentials string")]
 pub struct ParseCredentialsError;
 
-fn parse_hex(s: &str) -> Result<Vec<u8>, ParseCredentialsError> {
-    if !s.len().is_multiple_of(2) {
-        return Err(ParseCredentialsError);
+/// Decodes hex that must fill `out`.
+fn decode_exact(s: &str, out: &mut [u8]) -> Result<(), ParseCredentialsError> {
+    let len = out.len();
+    match base16ct::mixed::decode(s, out) {
+        Ok(decoded) if decoded.len() == len => Ok(()),
+        _ => Err(ParseCredentialsError),
     }
-    s.as_bytes()
-        .chunks(2)
-        .map(|pair| {
-            let hi = (pair[0] as char)
-                .to_digit(16)
-                .ok_or(ParseCredentialsError)?;
-            let lo = (pair[1] as char)
-                .to_digit(16)
-                .ok_or(ParseCredentialsError)?;
-            Ok((hi * 16 + lo) as u8)
-        })
-        .collect()
 }
 
 impl FromStr for Credentials {
@@ -75,27 +75,20 @@ impl FromStr for Credentials {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut parts = s.trim().split(':');
-        let mut next = || {
-            parts
-                .next()
-                .ok_or(ParseCredentialsError)
-                .and_then(parse_hex)
-        };
-        let ltpk = next()?;
-        let secret = Zeroizing::new(next()?);
-        let accessory_id = next()?;
-        let client_id = next()?;
+        let mut next = || parts.next().ok_or(ParseCredentialsError);
+        let mut accessory_ltpk = [0; 32];
+        decode_exact(next()?, &mut accessory_ltpk)?;
+        let mut client_ltsk = Zeroizing::new([0; 32]);
+        decode_exact(next()?, client_ltsk.as_mut())?;
+        let accessory_id =
+            base16ct::mixed::decode_vec(next()?).map_err(|_| ParseCredentialsError)?;
+        let client_id = base16ct::mixed::decode_vec(next()?).map_err(|_| ParseCredentialsError)?;
         if parts.next().is_some() {
             return Err(ParseCredentialsError);
         }
         Ok(Self {
-            accessory_ltpk: ltpk.try_into().map_err(|_| ParseCredentialsError)?,
-            client_ltsk: Zeroizing::new(
-                secret
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| ParseCredentialsError)?,
-            ),
+            accessory_ltpk,
+            client_ltsk,
             accessory_id,
             client_id,
         })
@@ -104,6 +97,8 @@ impl FromStr for Credentials {
 
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
+
     use super::*;
 
     fn sample() -> Credentials {
@@ -118,7 +113,8 @@ mod tests {
     #[test]
     fn text_roundtrip() {
         let c = sample();
-        let s = c.to_string();
+        let secret = c.to_secret_string();
+        let s = secret.expose_secret();
         assert!(s.starts_with(&"ab".repeat(32)));
         assert!(s.ends_with(":636c69656e74"));
         assert_eq!(s.parse::<Credentials>().unwrap(), c);

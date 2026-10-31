@@ -38,6 +38,9 @@ pub enum Error {
     /// Another Siri session is active.
     #[error("Siri is already active")]
     SiriActive,
+    /// The device did not start recording voice input.
+    #[error("Siri did not start recording")]
+    SiriNotRecording,
     /// The item has no next or previous chapter.
     #[error("no such chapter")]
     NoChapter,

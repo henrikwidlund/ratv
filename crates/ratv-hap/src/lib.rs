@@ -22,6 +22,7 @@ pub mod accessory;
 
 pub use credentials::{Credentials, ParseCredentialsError};
 pub use error::{DeviceError, Error};
+pub use secrecy::{ExposeSecret, SecretString};
 pub use secret::SharedSecret;
 
 /// Random number generator accepted by this crate.

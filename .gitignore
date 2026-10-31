@@ -1,2 +1,4 @@
 /target
 .DS_Store
+# Pairing keys written by the examples.
+*.credentials

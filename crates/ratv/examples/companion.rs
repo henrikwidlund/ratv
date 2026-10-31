@@ -1,14 +1,17 @@
 //! Pair with an Apple TV or send a command.
 //!
 //! ```text
-//! cargo run --example companion -- <ip:port> pair
-//! cargo run --example companion -- <ip:port> <credentials> <command>
+//! cargo run --example companion -- <ip:port> pair <credentials file>
+//! cargo run --example companion -- <ip:port> <credentials file> <command>
 //! ```
 //!
 //! Commands: `up`, `down`, `left`, `right`, `select`, `menu`, `home`, `play_pause`,
 //! `volume_up`, `volume_down`, `on`, `off`, `apps`, `state`, `launch=<bundle id>`.
 //! The port is the one of the `_companion-link._tcp` service.
 //! Set `RUST_LOG=ratv=trace` to log messages.
+
+#[path = "common/credentials.rs"]
+mod credentials;
 
 use std::io::BufRead;
 
@@ -27,15 +30,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Enter PIN shown on the TV:");
         let pin = std::io::stdin().lock().lines().next().ok_or("no PIN")??;
         let credentials = prompt.finish(pin.trim()).await?;
-        println!("Credentials: {credentials}");
+        let path = args.get(2).ok_or("missing credentials file")?;
+        credentials::save(path, &credentials)?;
+        println!("saved credentials to {path}");
         return Ok(());
     }
 
-    let credentials = args
-        .get(1)
-        .ok_or("missing credentials")?
-        .parse()
-        .map_err(|_| "invalid credentials, expected the string printed by `pair`")?;
+    let credentials = credentials::load(args.get(1).ok_or("missing credentials file")?)?;
     let command = args.get(2).ok_or("missing command")?;
     let client = companion::Client::connect(addr, &credentials, &ClientOptions::default()).await?;
     let key = match command.as_str() {

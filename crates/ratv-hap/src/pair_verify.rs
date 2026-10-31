@@ -6,7 +6,7 @@
 //!   AwaitingM4::handle_m4(M4) -> SharedSecret
 //! ```
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ratv_codec::tlv8::{Tlv8, Writer, tag};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -79,7 +79,7 @@ impl AwaitingM2<'_> {
         info.extend_from_slice(self.public.as_bytes());
         VerifyingKey::from_bytes(&self.credentials.accessory_ltpk)
             .map_err(|_| Error::InvalidPublicKey)?
-            .verify(&info, &signature)
+            .verify_strict(&info, &signature)
             .map_err(|_| Error::BadSignature)?;
 
         let client_id = &self.credentials.client_id;

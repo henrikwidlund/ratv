@@ -1,6 +1,6 @@
 //! Accessory (device) side of pairing. Used to build fake devices for tests.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ratv_codec::tlv8::{Tlv8, Writer, tag};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -138,7 +138,7 @@ impl PairSetupServer {
         let info = [&x[..], id, &ltpk].concat();
         VerifyingKey::from_bytes(&ltpk)
             .map_err(|_| Error::InvalidPublicKey)?
-            .verify(&info, &signature)
+            .verify_strict(&info, &signature)
             .map_err(|_| Error::BadSignature)?;
         self.controller = Some(PairedController {
             id: id.to_vec(),
@@ -264,7 +264,7 @@ impl PairVerifyServer {
                 let info = [&st.client_public[..], id, own_public.as_bytes()].concat();
                 let valid = id == self.controller_id
                     && VerifyingKey::from_bytes(&self.controller_ltpk)
-                        .is_ok_and(|k| k.verify(&info, &signature).is_ok());
+                        .is_ok_and(|k| k.verify_strict(&info, &signature).is_ok());
                 if !valid {
                     return Ok(error_reply(4, 2));
                 }

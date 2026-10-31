@@ -14,13 +14,12 @@ use ratv_companion::text_input::{self, TextInputCommand, TextSession};
 use ratv_companion::{Connection, FrameType};
 use ratv_hap::{Credentials, pair_verify};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
 
 use super::io::{flush, pairing_step};
-use crate::{Error, log, rng, touch};
+use crate::{Error, log, rng, tcp, touch};
 
 const EVENT_CAPACITY: usize = 32;
 const COMMAND_CAPACITY: usize = 16;
@@ -85,8 +84,7 @@ impl Client {
         let span = log::session("companion", Some(addr));
         async {
             tracing::debug!("connecting");
-            let stream = TcpStream::connect(addr).await?;
-            stream.set_nodelay(true)?;
+            let stream = tcp::connect(addr, options.timeout).await?;
             Self::start(stream, credentials, options, Span::current()).await
         }
         .instrument(span)

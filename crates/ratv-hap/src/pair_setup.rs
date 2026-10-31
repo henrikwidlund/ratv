@@ -14,7 +14,7 @@
 //!
 //! Messages are raw TLV8. The protocol layer adds its own framing.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ratv_codec::tlv8::{Tlv8, Writer, tag};
 use zeroize::Zeroizing;
 
@@ -239,7 +239,7 @@ impl AwaitingM6 {
         info.extend_from_slice(&ltpk);
         VerifyingKey::from_bytes(&ltpk)
             .map_err(|_| Error::InvalidPublicKey)?
-            .verify(&info, &signature)
+            .verify_strict(&info, &signature)
             .map_err(|_| Error::BadSignature)?;
 
         Ok(Credentials {

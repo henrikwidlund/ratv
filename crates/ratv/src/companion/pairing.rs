@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use ratv_companion::Connection;
 use ratv_companion::pairing::{ClientInfo, Flow};
@@ -9,7 +10,7 @@ use tokio::net::TcpStream;
 use tracing::{Instrument, Span};
 
 use super::io::pairing_step;
-use crate::{Error, log, rng};
+use crate::{Error, log, rng, tcp};
 
 /// Options for Companion pairing.
 #[derive(Debug, Clone)]
@@ -20,6 +21,8 @@ pub struct PairOptions {
     pub model: String,
     /// Pairing identifier. A random UUID is used when `None`.
     pub client_id: Option<String>,
+    /// Time to wait for the connection and each response.
+    pub timeout: Duration,
 }
 
 impl Default for PairOptions {
@@ -28,6 +31,7 @@ impl Default for PairOptions {
             name: "ratv".into(),
             model: "iPhone10,6".into(),
             client_id: None,
+            timeout: Duration::from_secs(5),
         }
     }
 }
@@ -54,8 +58,7 @@ impl<S> core::fmt::Debug for PinPrompt<S> {
 pub async fn pair(addr: SocketAddr, options: &PairOptions) -> Result<PinPrompt<TcpStream>, Error> {
     let span = log::session("companion pairing", Some(addr));
     async {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
+        let stream = tcp::connect(addr, options.timeout).await?;
         start(stream, options, Span::current()).await
     }
     .instrument(span)
@@ -78,7 +81,11 @@ where
     let mut conn = Connection::new();
     let mut buf = Vec::with_capacity(512);
     let (m1, state) = pair_setup::start(false);
-    let m2 = pairing_step(&mut stream, &mut conn, Flow::Setup, true, &m1, &mut buf).await?;
+    let m2 = tokio::time::timeout(
+        options.timeout,
+        pairing_step(&mut stream, &mut conn, Flow::Setup, true, &m1, &mut buf),
+    )
+    .await??;
     let state = state.handle_m2(&m2)?;
     tracing::debug!("waiting for PIN");
     Ok(PinPrompt {
@@ -102,15 +109,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PinPrompt<S> {
         let mut rng = rng::os();
         let mut buf = Vec::with_capacity(1024);
         let (m3, state) = self.state.submit_pin(pin, &mut rng)?;
-        let m4 = pairing_step(
-            &mut self.stream,
-            &mut self.conn,
-            Flow::Setup,
-            false,
-            &m3,
-            &mut buf,
+        let m4 = tokio::time::timeout(
+            self.options.timeout,
+            pairing_step(
+                &mut self.stream,
+                &mut self.conn,
+                Flow::Setup,
+                false,
+                &m3,
+                &mut buf,
+            ),
         )
-        .await?;
+        .await??;
         let verified = state.handle_m4(&m4)?;
         tracing::debug!("PIN accepted");
 
@@ -127,15 +137,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PinPrompt<S> {
             metadata: Some(&metadata),
         };
         let (m5, state) = verified.exchange(identity, &mut rng);
-        let m6 = pairing_step(
-            &mut self.stream,
-            &mut self.conn,
-            Flow::Setup,
-            false,
-            &m5,
-            &mut buf,
+        let m6 = tokio::time::timeout(
+            self.options.timeout,
+            pairing_step(
+                &mut self.stream,
+                &mut self.conn,
+                Flow::Setup,
+                false,
+                &m5,
+                &mut buf,
+            ),
         )
-        .await?;
+        .await??;
         let credentials = state.handle_m6(&m6)?;
         tracing::debug!("paired");
         Ok(credentials)

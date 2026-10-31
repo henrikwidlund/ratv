@@ -1,7 +1,7 @@
 //! Find an Apple TV, connect with Companion and MRP, and send a command.
 //!
 //! ```text
-//! cargo run --example remote -- <credentials> <command> [device name or IP]
+//! cargo run --example remote -- <credentials file> <command> [device name or IP]
 //! ```
 //!
 //! Without a name the first device found is used. Commands: `up`, `down`,
@@ -26,6 +26,8 @@
 
 #[path = "common/caf.rs"]
 mod caf;
+#[path = "common/credentials.rs"]
+mod credentials;
 #[cfg(feature = "opus")]
 #[path = "common/wav.rs"]
 mod wav;
@@ -43,11 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let credentials = args
-        .first()
-        .ok_or("missing credentials")?
-        .parse()
-        .map_err(|_| "invalid credentials, expected the string printed by `pair`")?;
+    let credentials = credentials::load(args.first().ok_or("missing credentials file")?)?;
     let command = args.get(1).ok_or("missing command")?.as_str();
     let wanted = args.get(2);
 

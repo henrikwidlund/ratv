@@ -17,10 +17,11 @@
 //! // First time: pair with the PIN shown on the TV and store the credentials.
 //! let prompt = companion::pair(addr, &companion::PairOptions::default()).await?;
 //! let credentials = prompt.finish("1234").await?;
-//! let stored = credentials.to_string();
+//! let stored = credentials.to_secret_string();
 //!
 //! // Later: connect with the stored credentials.
-//! let credentials = stored.parse().unwrap();
+//! use ratv::ExposeSecret;
+//! let credentials = stored.expose_secret().parse().unwrap();
 //! let client = companion::Client::connect(addr, &credentials, &ClientOptions::default()).await?;
 //! client.press(HidCommand::Select).await?;
 //! client.set_volume(0.3).await?;
@@ -44,6 +45,8 @@ mod log;
 pub mod mrp;
 #[cfg(any(feature = "companion", feature = "mrp"))]
 mod rng;
+#[cfg(any(feature = "companion", feature = "mrp"))]
+mod tcp;
 #[cfg(feature = "companion")]
 mod touch;
 
@@ -54,4 +57,4 @@ pub use error::Error;
 #[cfg(all(doctest, feature = "companion", feature = "mrp", feature = "discovery"))]
 #[doc = include_str!("../../../README.md")]
 struct ReadmeDoctests;
-pub use ratv_hap::Credentials;
+pub use ratv_hap::{Credentials, ExposeSecret, SecretString};

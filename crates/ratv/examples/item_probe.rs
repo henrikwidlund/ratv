@@ -2,8 +2,11 @@
 //! language options, lyrics and keyboard state.
 //!
 //! ```text
-//! cargo run --example item_probe -- <ip:7000> <airplay credentials> [seconds]
+//! cargo run --example item_probe -- <ip:7000> <credentials file> [seconds]
 //! ```
+
+#[path = "common/credentials.rs"]
+mod credentials;
 
 use std::time::Duration;
 
@@ -76,11 +79,7 @@ fn print(env: &Envelope) -> Result<(), ratv::Error> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let addr = args.first().ok_or("missing address")?.parse()?;
-    let credentials = args
-        .get(1)
-        .ok_or("missing credentials")?
-        .parse()
-        .map_err(|_| "invalid credentials")?;
+    let credentials = credentials::load(args.get(1).ok_or("missing credentials file")?)?;
     let seconds = args.get(2).map_or(Ok(10), |s| s.parse())?;
 
     let client = Client::connect(addr, &credentials, &ClientOptions::default()).await?;

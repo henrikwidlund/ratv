@@ -4,6 +4,7 @@
 //! except `S` in `K = H(S)`: Apple devices hash `S` without leading zero bytes.
 
 use std::sync::LazyLock;
+use subtle::ConstantTimeEq;
 
 use num_bigint::BigUint;
 use sha2::{Digest, Sha512};
@@ -143,7 +144,7 @@ impl SrpClient {
 
     /// Checks the device proof `M2` and returns the session key `K`.
     pub fn verify(&self, server_proof: &[u8]) -> Result<&[u8; 64], Error> {
-        if server_proof == self.m2 {
+        if bool::from(server_proof.ct_eq(&self.m2)) {
             Ok(&self.key)
         } else {
             Err(Error::BadProof)
@@ -195,7 +196,7 @@ impl SrpServer {
         let s = (a * self.verifier.modpow(&u, &grp.n)).modpow(&self.b, &grp.n);
         let key = session_key(&s);
         let (m1, m2) = proofs(&a_pad, &self.b_pub, &self.salt, &key);
-        if m1.as_slice() == client_proof {
+        if bool::from(m1.ct_eq(client_proof)) {
             Ok((m2, key))
         } else {
             Err(Error::BadProof)

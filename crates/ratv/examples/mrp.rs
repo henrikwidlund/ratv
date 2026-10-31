@@ -1,18 +1,21 @@
 //! Media Remote Protocol over AirPlay: now playing, playback and buttons.
 //!
 //! ```text
-//! cargo run --example mrp -- <ip:port> pair
-//! cargo run --example mrp -- <ip:port> <credentials> <command>
+//! cargo run --example mrp -- <ip:port> pair <credentials file>
+//! cargo run --example mrp -- <ip:port> <credentials file> <command>
 //! ```
 //!
 //! The port is the one of the `_airplay._tcp` service (usually 7000).
-//! Companion credentials from `cargo run --example companion -- <ip:port> pair` also work.
+//! Companion credentials from `cargo run --example companion -- <ip:port> pair <file>` also work.
 //!
 //! Commands: `watch` (print now playing changes for 30 s), `play`, `pause`,
 //! `toggle`, `next`, `previous`, `stop`, `seek=<seconds>`, `skip=<seconds>`,
 //! `volume=<0..1>`, and buttons `up`, `down`, `left`, `right`, `select`,
 //! `menu`, `home`.
 //! Set `RUST_LOG=ratv=trace` to log messages.
+
+#[path = "common/credentials.rs"]
+mod credentials;
 
 use std::io::BufRead;
 use std::time::{Duration, SystemTime};
@@ -32,15 +35,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Enter PIN shown on the TV:");
         let pin = std::io::stdin().lock().lines().next().ok_or("no PIN")??;
         let credentials = prompt.finish(pin.trim()).await?;
-        println!("Credentials: {credentials}");
+        let path = args.get(2).ok_or("missing credentials file")?;
+        credentials::save(path, &credentials)?;
+        println!("saved credentials to {path}");
         return Ok(());
     }
 
-    let credentials = args
-        .get(1)
-        .ok_or("missing credentials")?
-        .parse()
-        .map_err(|_| "invalid credentials, expected the string printed by `pair`")?;
+    let credentials = credentials::load(args.get(1).ok_or("missing credentials file")?)?;
     let command = args.get(2).map_or("watch", String::as_str);
 
     let client = Client::connect(addr, &credentials, &ClientOptions::default()).await?;

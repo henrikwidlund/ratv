@@ -18,7 +18,7 @@ pub enum Error {
     #[error("missing or invalid field `{0}`")]
     InvalidField(&'static str),
     /// Device answered a request with an error.
-    #[error("device error {code}: {message}")]
+    #[error("device error {code}: {message:?}")]
     Device {
         /// Error code (`_ec`).
         code: i64,

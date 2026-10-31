@@ -6,7 +6,7 @@ use std::time::Duration;
 use ratv::companion::{
     self, AttentionState, ClientOptions, Event, HidCommand, MediaControlFlags, PairOptions,
 };
-use ratv::{Credentials, Error};
+use ratv::{Credentials, Error, ExposeSecret};
 use ratv_codec::opack::{Encoder, Value};
 use ratv_companion::message::{Message, MessageType};
 use ratv_companion::{Connection, FrameType, pairing};
@@ -342,7 +342,14 @@ async fn pairing_creates_credentials() {
     let meta = ratv_codec::opack::decode(controller.metadata.as_deref().unwrap()).unwrap();
     assert_eq!(meta.get("name").and_then(Value::as_str), Some("ratv"));
     // Credentials are the same after conversion to text and back.
-    assert_eq!(creds.to_string().parse::<Credentials>().unwrap(), creds);
+    assert_eq!(
+        creds
+            .to_secret_string()
+            .expose_secret()
+            .parse::<Credentials>()
+            .unwrap(),
+        creds
+    );
 }
 
 #[tokio::test]

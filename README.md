@@ -31,19 +31,34 @@ tokio = { version = "1", features = ["macros", "rt"] }
 ```
 
 Pair one time with the PIN that the TV shows. Save the credentials.
-They work for Companion and MRP.
+They work for Companion and MRP. They contain a secret key, so only the
+owner must be able to read the file.
 
 ```rust
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+use ratv::ExposeSecret;
 use ratv::companion::{self, PairOptions};
 
 async fn pair() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "192.168.1.20:49153".parse()?; // _companion-link._tcp
     let prompt = companion::pair(addr, &PairOptions::default()).await?;
     let credentials = prompt.finish("1234").await?;
-    std::fs::write("tv.credentials", credentials.to_string())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600); // only the owner can read and write
+    options
+        .open("tv.credentials")?
+        .write_all(credentials.to_secret_string().expose_secret().as_bytes())?;
     Ok(())
 }
 ```
+
+On Windows the file gets the permissions of its folder. Use a folder in the
+user profile.
 
 Find the device and connect:
 
@@ -112,7 +127,7 @@ Errors are returned, not logged. Credentials, keys, PINs, text, account data
 and audio are not logged. Feature `sensitive-logs` adds full messages at `trace`.
 
 ```sh
-RUST_LOG=ratv=debug cargo run --example remote -- "$CREDENTIALS" play
+RUST_LOG=ratv=debug cargo run --example remote -- tv.credentials play
 ```
 
 ## Crates
@@ -130,10 +145,10 @@ RUST_LOG=ratv=debug cargo run --example remote -- "$CREDENTIALS" play
 ## Examples
 
 ```sh
-cargo run --example scan                                   # list devices
-cargo run --example companion -- 192.168.1.20:49153 pair   # pair, print credentials
-cargo run --example remote -- "$CREDENTIALS" play          # send a command to the first device
-cargo run --example remote -- "$CREDENTIALS" watch         # print now playing changes
+cargo run --example scan                                                 # list devices
+cargo run --example companion -- 192.168.1.20:49153 pair tv.credentials  # pair, save credentials
+cargo run --example remote -- tv.credentials play                        # send a command to the first device
+cargo run --example remote -- tv.credentials watch                       # print now playing changes
 ```
 
 Each file in [`crates/ratv/examples`](crates/ratv/examples) lists its commands at the top.

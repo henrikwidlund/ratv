@@ -12,7 +12,7 @@ use ratv_hap::{Credentials, pair_verify};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::{Error, rng};
+use crate::{Error, rng, tcp};
 
 pub(crate) const READ_CHUNK: usize = 4096;
 /// Time to send TEARDOWN. The response is not awaited.
@@ -45,8 +45,7 @@ pub(crate) async fn connect(
     identity: &Identity<'_>,
     timeout: Duration,
 ) -> Result<Connections, Error> {
-    let mut control = TcpStream::connect(addr).await?;
-    control.set_nodelay(true)?;
+    let mut control = tcp::connect(addr, timeout).await?;
     let local = control.local_addr()?.ip().to_string();
     let mut channel = Channel::new();
     let mut session = Session::new(&local, rng::u32(), rng::u64(), rng::u32());
@@ -83,8 +82,7 @@ pub(crate) async fn connect(
         let event_port = rtsp::event_port(&resp)?;
         tracing::debug!(event_port, "event SETUP done");
 
-        let mut events = TcpStream::connect(SocketAddr::new(addr.ip(), event_port)).await?;
-        events.set_nodelay(true)?;
+        let mut events = tcp::connect(SocketAddr::new(addr.ip(), event_port), timeout).await?;
         let mut event_channel = Channel::new();
         event_channel.enable_encryption(keys::events(&secret, Side::Client));
 
@@ -115,8 +113,7 @@ pub(crate) async fn connect(
         let (data_port, _) = rtsp::data_stream_port(&resp)?;
         tracing::debug!(data_port, "RECORD and data stream SETUP done");
 
-        let data = TcpStream::connect(SocketAddr::new(addr.ip(), data_port)).await?;
-        data.set_nodelay(true)?;
+        let data = tcp::connect(SocketAddr::new(addr.ip(), data_port), timeout).await?;
         let stream = DataStream::new(
             keys::data_stream(&secret, seed, Side::Client),
             0x1_0000_0000 | u64::from(rng::u32()),
