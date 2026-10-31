@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Sends a CAF file to Siri, one packet every 20 ms.
 async fn ask_siri(tv: &AppleTv, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let file = bytes::Bytes::from(std::fs::read(path)?);
+    let file = bytes::Bytes::from(tokio::fs::read(path).await?);
     let packets = caf::packets(&file)?;
     let mut siri = tv.start_siri().await?;
     println!("pressed, sending {} packets", packets.len());
@@ -153,7 +153,7 @@ async fn ask_siri(tv: &AppleTv, path: &str) -> Result<(), Box<dyn std::error::Er
 /// Sends a WAV file to Siri as PCM, 100 ms every 100 ms.
 #[cfg(feature = "opus")]
 async fn ask_siri_pcm(tv: &AppleTv, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let file = std::fs::read(path)?;
+    let file = tokio::fs::read(path).await?;
     let samples: Vec<i16> = wav::pcm(&file)?
         .as_chunks::<2>()
         .0
@@ -356,7 +356,7 @@ async fn save_artwork(tv: &AppleTv, path: &str) -> Result<(), Box<dyn std::error
     }
     match tv.artwork(512.0, -1.0).await? {
         Some(art) => {
-            std::fs::write(path, &art.data)?;
+            tokio::fs::write(path, &art.data).await?;
             println!(
                 "{} bytes, {}, {}x{}",
                 art.data.len(),

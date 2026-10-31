@@ -199,7 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("usage: voice_probe <credentials file> <ip> <file> [options]".into()),
     };
     let has = |name: &str| options.split(',').any(|o| o == name);
-    let file = std::fs::read(path)?;
+    let file = tokio::fs::read(path).await?;
     let is_caf = std::path::Path::new(path)
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("caf"));
