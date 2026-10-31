@@ -27,14 +27,15 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 
 use crate::companion::{self, Account, App, ButtonState, HidCommand, MediaControl};
 use crate::mrp::{
-    self, Artwork, Button, Command, LanguageOption, NowPlaying, RepeatMode, ShuffleMode,
+    self, Artwork, Button, Command, LanguageOption, NowPlaying, PlaybackState, RepeatMode,
+    ShuffleMode,
 };
 use crate::{ClientOptions, Credentials, Error, PairOptions};
 
@@ -178,14 +179,58 @@ enum Route<'a, A, B> {
     Mrp(&'a mrp::Client, B),
 }
 
+/// Seconds to skip instead of fast forward or rewind, if the app does not say.
+const SCRUB_SKIP: f64 = 10.0;
+/// Time after connect in which playback calls wait for the app's command list.
+const STATE_WAIT: Duration = Duration::from_secs(1);
+/// Apps that list fast forward and rewind, but go back to the start position when it ends.
+const SKIP_ONLY_APPS: &[&str] = &["com.disney.disneyplus"];
+
+/// True if the app has no handler for the command.
+const fn is_unsupported(result: &Result<(), Error>) -> bool {
+    matches!(
+        result,
+        Err(Error::CommandFailed {
+            handler_status: 404,
+            ..
+        })
+    )
+}
+
+/// What the current app says about a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Support {
+    Yes,
+    No,
+    /// MRP is not open, or the app sent no command list.
+    Unknown,
+}
+
+impl Support {
+    fn of(np: &NowPlaying, command: Command) -> Self {
+        if np.commands.is_empty() {
+            Self::Unknown
+        } else if np.supports(command) {
+            Self::Yes
+        } else {
+            Self::No
+        }
+    }
+}
+
 /// A connected Apple TV.
 ///
 /// Clones share the connections. If one protocol closes, calls that the
 /// other protocol supports use the other one.
+///
+/// Playback calls check [`NowPlaying::commands`]. If the app does not list a
+/// command, they use another way to do the same, for example a key press.
+/// In the first second after connect, they first wait until the list arrives.
 #[derive(Debug, Clone)]
 pub struct AppleTv {
     companion: Option<companion::Client>,
     mrp: Option<mrp::Client>,
+    connected_at: Instant,
 }
 
 impl AppleTv {
@@ -215,6 +260,7 @@ impl AppleTv {
         let tv = Self {
             companion: keep("Companion", companion, &mut first_error),
             mrp: keep("MRP", mrp, &mut first_error),
+            connected_at: Instant::now(),
         };
         if tv.companion.is_none() && tv.mrp.is_none() {
             return Err(first_error.unwrap_or(Error::NoEndpoints));
@@ -310,6 +356,19 @@ impl AppleTv {
         }
     }
 
+    /// Presses and releases a key two times fast.
+    pub async fn double_tap(&self, key: Key) -> Result<(), Error> {
+        match self.key_route(key)? {
+            Route::Companion(c, hid) => c.double_tap(hid).await,
+            Route::Mrp(m, button) => m.double_tap(button).await,
+        }
+    }
+
+    /// Opens the app switcher by double tapping [`Key::Home`].
+    pub async fn app_switcher(&self) -> Result<(), Error> {
+        self.double_tap(Key::Home).await
+    }
+
     /// Holds a key for `duration`. The key is released also if the
     /// returned future is dropped.
     pub async fn hold(&self, key: Key, duration: Duration) -> Result<(), Error> {
@@ -334,37 +393,126 @@ impl AppleTv {
         }
     }
 
-    /// Route for a playback call: MRP first.
-    fn media_route<A>(&self, fallback: Option<A>) -> Result<Route<'_, A, ()>, Error> {
-        self.route(true, fallback, Some(()))
+    /// Route for a playback call: MRP first, unless the app does not support it.
+    fn media_route<A>(
+        &self,
+        support: Support,
+        fallback: Option<A>,
+    ) -> Result<Route<'_, A, ()>, Error> {
+        self.route(support != Support::No, fallback, Some(()))
             .ok_or(Error::NotConnected("MRP"))
     }
 
+    /// Reads what the device plays, if MRP is open.
+    fn with_now_playing<R>(&self, f: impl FnOnce(&NowPlaying) -> R) -> Option<R> {
+        let m = self.mrp.as_ref().filter(|m| m.is_connected())?;
+        Some(f(&m.now_playing().borrow()))
+    }
+
+    /// Right after connect, waits until the app's command list arrives, at most
+    /// until [`STATE_WAIT`] after connect. Apps may ignore commands sent before it.
+    async fn wait_for_state(&self) {
+        let Some(m) = self.mrp.as_ref().filter(|m| m.is_connected()) else {
+            return;
+        };
+        let Some(left) = STATE_WAIT.checked_sub(self.connected_at.elapsed()) else {
+            return;
+        };
+        let mut np = m.now_playing();
+        let _ = tokio::time::timeout(left, np.wait_for(|n| !n.commands.is_empty())).await;
+    }
+
+    fn support(&self, command: Command) -> Support {
+        self.with_now_playing(|np| Support::of(np, command))
+            .unwrap_or(Support::Unknown)
+    }
+
+    /// True if playing, false if paused or stopped, `None` if not known.
+    fn playing(&self) -> Option<bool> {
+        self.with_now_playing(|np| match np.state? {
+            PlaybackState::Playing => Some(true),
+            PlaybackState::Paused | PlaybackState::Stopped => Some(false),
+            _ => None,
+        })
+        .flatten()
+    }
+
+    /// Sends `command`, or the Companion `fallback` if the app does not list `check`.
     async fn playback(
         &self,
+        check: Command,
         command: Command,
         fallback: Option<MediaControl>,
     ) -> Result<(), Error> {
-        match self.media_route(fallback)? {
+        self.wait_for_state().await;
+        let support = self.support(check);
+        match self.media_route(support, fallback)? {
             Route::Companion(c, f) => c.media(f).await,
-            Route::Mrp(m, ()) => m.command(command).await,
+            Route::Mrp(m, ()) => {
+                let result = m.command(command).await;
+                // Right after connect the command list may not be known yet.
+                if support == Support::Unknown
+                    && is_unsupported(&result)
+                    && let Some(f) = fallback
+                    && let Some(c) = self.companion.as_ref().filter(|c| c.is_connected())
+                {
+                    return c.media(f).await;
+                }
+                result
+            }
+        }
+    }
+
+    /// Toggles with the MRP command if the app lists it, else with the play/pause key.
+    async fn toggle(&self) -> Result<(), Error> {
+        if self.support(Command::TogglePlayPause) == Support::Yes {
+            self.need_mrp()?.command(Command::TogglePlayPause).await
+        } else {
+            self.press(Key::PlayPause).await
         }
     }
 
     /// Starts playback.
     pub async fn play(&self) -> Result<(), Error> {
-        self.playback(Command::Play, Some(MediaControl::Play)).await
+        self.wait_for_state().await;
+        if self.support(Command::Play) == Support::No {
+            return match self.playing() {
+                Some(true) => Ok(()),
+                _ => self.toggle().await,
+            };
+        }
+        self.playback(Command::Play, Command::Play, Some(MediaControl::Play))
+            .await
     }
 
     /// Pauses playback.
     pub async fn pause(&self) -> Result<(), Error> {
-        self.playback(Command::Pause, Some(MediaControl::Pause))
+        self.wait_for_state().await;
+        if self.support(Command::Pause) == Support::No {
+            return match self.playing() {
+                Some(false) => Ok(()),
+                _ => self.toggle().await,
+            };
+        }
+        self.playback(Command::Pause, Command::Pause, Some(MediaControl::Pause))
             .await
     }
 
     /// Toggles play and pause.
     pub async fn play_pause(&self) -> Result<(), Error> {
-        match self.media_route(Some(HidCommand::PlayPause))? {
+        self.wait_for_state().await;
+        if self.support(Command::TogglePlayPause) == Support::No {
+            let command = match self.playing() {
+                Some(true) => Command::Pause,
+                _ => Command::Play,
+            };
+            if self.support(command) == Support::Yes {
+                return self.need_mrp()?.command(command).await;
+            }
+            return self.press(Key::PlayPause).await;
+        }
+        let support = self.support(Command::TogglePlayPause);
+        match self.media_route(support, Some(HidCommand::PlayPause))? {
             Route::Companion(c, hid) => c.press(hid).await,
             Route::Mrp(m, ()) => m.command(Command::TogglePlayPause).await,
         }
@@ -372,19 +520,23 @@ impl AppleTv {
 
     /// Next track.
     pub async fn next(&self) -> Result<(), Error> {
-        self.playback(Command::NextTrack, Some(MediaControl::NextTrack))
-            .await
+        let c = Command::NextTrack;
+        self.playback(c, c, Some(MediaControl::NextTrack)).await
     }
 
     /// Previous track.
     pub async fn previous(&self) -> Result<(), Error> {
-        self.playback(Command::PreviousTrack, Some(MediaControl::PreviousTrack))
-            .await
+        let c = Command::PreviousTrack;
+        self.playback(c, c, Some(MediaControl::PreviousTrack)).await
     }
 
-    /// Stops playback. Needs MRP.
+    /// Stops playback. Pauses if the app does not support stop. Needs MRP.
     pub async fn stop(&self) -> Result<(), Error> {
-        self.playback(Command::Stop, None).await
+        self.wait_for_state().await;
+        if self.support(Command::Stop) == Support::No {
+            return self.pause().await;
+        }
+        self.playback(Command::Stop, Command::Stop, None).await
     }
 
     /// Seeks to `position` seconds. Needs MRP.
@@ -393,38 +545,134 @@ impl AppleTv {
     }
 
     /// Skips `seconds` forward, or backward if negative.
+    /// Seeks instead if the app supports seeking but not skipping.
     pub async fn skip(&self, seconds: f64) -> Result<(), Error> {
-        match self.media_route(Some(MediaControl::SkipBy(seconds)))? {
+        self.wait_for_state().await;
+        let check = if seconds < 0.0 {
+            Command::SkipBackward
+        } else {
+            Command::SkipForward
+        };
+        if self.support(check) == Support::No
+            && self.support(Command::SeekToPlaybackPosition) == Support::Yes
+            && let Some(pos) = self
+                .with_now_playing(|np| np.position(mrp::cocoa_time(SystemTime::now())))
+                .flatten()
+        {
+            return self.seek((pos + seconds).max(0.0)).await;
+        }
+        match self.media_route(self.support(check), Some(MediaControl::SkipBy(seconds)))? {
             Route::Companion(c, f) => c.media(f).await,
             Route::Mrp(m, ()) => m.skip(seconds).await,
         }
     }
 
     /// Starts fast forward. Stop it with [`end_fast_forward`](Self::end_fast_forward).
+    ///
+    /// Skips forward instead if the app supports skipping but not fast forward,
+    /// or if fast forward is known not to work in the app. The skip uses
+    /// [`NowPlaying::skip_forward_interval`], else 10 s.
     pub async fn begin_fast_forward(&self) -> Result<(), Error> {
-        self.playback(
+        self.begin_scrub(
             Command::BeginFastForward,
-            Some(MediaControl::FastForwardBegin),
+            MediaControl::FastForwardBegin,
+            true,
         )
         .await
     }
 
-    /// Stops fast forward.
+    /// Stops fast forward. Does nothing if [`begin_fast_forward`](Self::begin_fast_forward)
+    /// skipped instead.
     pub async fn end_fast_forward(&self) -> Result<(), Error> {
-        self.playback(Command::EndFastForward, Some(MediaControl::FastForwardEnd))
-            .await
+        self.end_scrub(
+            Command::BeginFastForward,
+            Command::EndFastForward,
+            MediaControl::FastForwardEnd,
+            true,
+        )
+        .await
     }
 
     /// Starts rewind. Stop it with [`end_rewind`](Self::end_rewind).
+    ///
+    /// Skips back instead, like [`begin_fast_forward`](Self::begin_fast_forward).
     pub async fn begin_rewind(&self) -> Result<(), Error> {
-        self.playback(Command::BeginRewind, Some(MediaControl::RewindBegin))
+        self.begin_scrub(Command::BeginRewind, MediaControl::RewindBegin, false)
             .await
     }
 
-    /// Stops rewind.
+    /// Stops rewind. Does nothing if [`begin_rewind`](Self::begin_rewind) skipped instead.
     pub async fn end_rewind(&self) -> Result<(), Error> {
-        self.playback(Command::EndRewind, Some(MediaControl::RewindEnd))
-            .await
+        self.end_scrub(
+            Command::BeginRewind,
+            Command::EndRewind,
+            MediaControl::RewindEnd,
+            false,
+        )
+        .await
+    }
+
+    /// Seconds to skip instead of `begin`, or `None` to use `begin`.
+    fn skip_instead(&self, begin: Command, forward: bool) -> Option<f64> {
+        self.with_now_playing(|np| {
+            let skip = if forward {
+                Command::SkipForward
+            } else {
+                Command::SkipBackward
+            };
+            let known_bad = np
+                .app
+                .as_deref()
+                .is_some_and(|a| SKIP_ONLY_APPS.contains(&a));
+            if Support::of(np, skip) != Support::Yes
+                || (Support::of(np, begin) != Support::No && !known_bad)
+            {
+                return None;
+            }
+            let interval = if forward {
+                np.skip_forward_interval
+            } else {
+                np.skip_backward_interval
+            };
+            let seconds = interval.filter(|s| *s > 0.0).unwrap_or(SCRUB_SKIP);
+            Some(if forward { seconds } else { -seconds })
+        })
+        .flatten()
+    }
+
+    async fn begin_scrub(
+        &self,
+        begin: Command,
+        fallback: MediaControl,
+        forward: bool,
+    ) -> Result<(), Error> {
+        self.wait_for_state().await;
+        if let Some(s) = self.skip_instead(begin, forward) {
+            return self.skip(s).await;
+        }
+        let result = self.playback(begin, begin, Some(fallback)).await;
+        // The command list may have arrived while waiting for the answer.
+        if is_unsupported(&result)
+            && let Some(s) = self.skip_instead(begin, forward)
+        {
+            return self.skip(s).await;
+        }
+        result
+    }
+
+    /// Checks `begin`, so begin and end use the same way.
+    async fn end_scrub(
+        &self,
+        begin: Command,
+        end: Command,
+        fallback: MediaControl,
+        forward: bool,
+    ) -> Result<(), Error> {
+        self.wait_for_state().await;
+        if self.skip_instead(begin, forward).is_some() {
+            return Ok(());
+        }
+        self.playback(begin, end, Some(fallback)).await
     }
 
     /// Sets the shuffle mode. Needs MRP.
@@ -439,12 +687,14 @@ impl AppleTv {
 
     /// Changes to the next shuffle mode. Needs MRP.
     pub async fn cycle_shuffle(&self) -> Result<(), Error> {
-        self.playback(Command::AdvanceShuffleMode, None).await
+        let c = Command::AdvanceShuffleMode;
+        self.playback(c, c, None).await
     }
 
     /// Changes to the next repeat mode. Needs MRP.
     pub async fn cycle_repeat(&self) -> Result<(), Error> {
-        self.playback(Command::AdvanceRepeatMode, None).await
+        let c = Command::AdvanceRepeatMode;
+        self.playback(c, c, None).await
     }
 
     /// Next chapter. Needs MRP. See [`NowPlaying::chapters`], which is filled shortly
@@ -470,6 +720,7 @@ impl AppleTv {
         command: Command,
         target: impl Fn(&NowPlaying, f64) -> Option<f64>,
     ) -> Result<(), Error> {
+        self.wait_for_state().await;
         let m = self.need_mrp()?;
         let start = {
             let np = m.now_playing();
@@ -516,7 +767,10 @@ impl AppleTv {
 
     /// Sets the volume, 0.0 to 1.0.
     pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
-        match self.media_route(Some(()))? {
+        match self
+            .route(true, Some(()), Some(()))
+            .ok_or(Error::NotConnected("MRP"))?
+        {
             Route::Companion(c, ()) => c.set_volume(volume).await,
             Route::Mrp(m, ()) => m.set_volume(volume).await,
         }
@@ -715,6 +969,15 @@ mod tests {
             assert!(key.hid().is_some());
             assert!(key.button().is_some());
         }
+    }
+
+    #[test]
+    fn support() {
+        let mut np = NowPlaying::default();
+        assert_eq!(Support::of(&np, Command::Play), Support::Unknown);
+        np.commands = vec![Command::Pause];
+        assert_eq!(Support::of(&np, Command::Pause), Support::Yes);
+        assert_eq!(Support::of(&np, Command::Play), Support::No);
     }
 
     #[tokio::test]

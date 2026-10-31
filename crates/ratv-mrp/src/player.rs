@@ -164,6 +164,10 @@ pub struct NowPlaying {
     pub commands: Vec<Command>,
     /// Playback rates the app accepts for [`Command::ChangePlaybackRate`].
     pub supported_rates: Vec<f32>,
+    /// Seconds the app prefers for [`Command::SkipForward`], if it says.
+    pub skip_forward_interval: Option<f64>,
+    /// Seconds the app prefers for [`Command::SkipBackward`], if it says.
+    pub skip_backward_interval: Option<f64>,
     /// True when the item is liked. `None` if the app does not support likes.
     pub liked: Option<bool>,
     /// True when the item is disliked. `None` if the app does not support dislikes.
@@ -640,6 +644,9 @@ impl NowPlayingState {
         np.supported_rates = find(Command::ChangePlaybackRate)
             .map(|c| c.supported_rates.clone())
             .unwrap_or_default();
+        let interval = |cmd| find(cmd).and_then(|c| c.preferred_intervals.first().copied());
+        np.skip_forward_interval = interval(Command::SkipForward);
+        np.skip_backward_interval = interval(Command::SkipBackward);
         np.liked = find(Command::LikeTrack).and_then(|c| c.active);
         np.disliked = find(Command::DislikeTrack).and_then(|c| c.active);
         np.rating_range =

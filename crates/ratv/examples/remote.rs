@@ -5,7 +5,7 @@
 //! ```
 //!
 //! Without a name the first device found is used. Commands: `up`, `down`,
-//! `left`, `right`, `select`, `menu`, `home`, `guide`, `control_center`, `play`, `pause`, `toggle`,
+//! `left`, `right`, `select`, `menu`, `home`, `top_menu`, `guide`, `control_center`, `play`, `pause`, `toggle`,
 //! `next`, `previous`, `stop`, `on`, `off`, `seek=<s>`, `skip=<s>`,
 //! `volume=<0..1>`, `launch=<bundle id>`, `artwork=<file>`, `watch`,
 //! `text` (print the focused text field), `text=<text>`, `append=<text>`, `clear_text`,
@@ -13,7 +13,10 @@
 //! `volume` (print volume and mute), `watch_volume`, `mute`, `unmute`, `page_up`,
 //! `screensaver`, `channel_up`, `channel_down`, `siri`, `tap=<x>,<y>` (0.0 to 1.0),
 //! `speed=<rate>`, `rate=<rating>`, `like`, `unlike`, `dislike`, `undislike`, `accounts`, `account=<id>`,
-//! `ff=<s>` and `rw=<s>` (fast forward or rewind for some seconds), `shuffle`, `repeat`
+//! `app_switcher`, `double_tap=<key>` (key name from this list, for example `home`),
+//! `hold=<key>,<s>` (hold a key for some seconds),
+//! `ff=<s>` and `rw=<s>` (fast forward or rewind for some seconds),
+//! `ff_companion=<s>`, `rw_companion=<s>`, `ff_mrp=<s>`, `rw_mrp=<s>` (the same with one protocol only), `shuffle`, `repeat`
 //! (next mode), `shuffle=<off|songs|albums>`, `repeat=<off|one|all>`,
 //! `info` (print all now playing fields), `languages` (list with
 //! tags), `audio=<tag>`, `subtitles=<tag>` (for example `sv`), `subtitles_off`, `queue`,
@@ -35,6 +38,7 @@ mod wav;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime};
 
+use ratv::companion::MediaControl;
 use ratv::discovery::{MDNS_PORT, ScanOptions, scan};
 use ratv::mrp::{self, RepeatMode, ShuffleMode, cocoa_time};
 use ratv::{AppleTv, ClientOptions, Endpoints, Key};
@@ -74,6 +78,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tv.companion().is_some(),
         tv.mrp().is_some()
     );
+    // `ff_*`, `rw_*` and `hold=` do not use the playback calls of `AppleTv`,
+    // which wait for this by themselves. Apps may ignore commands sent before it.
+    if ["ff_", "rw_", "hold="]
+        .iter()
+        .any(|p| command.starts_with(p))
+    {
+        let _ = details(&tv, |n| !n.commands.is_empty()).await;
+    }
 
     if let Some((from, to)) = command.strip_prefix("swipe_").and_then(swipe_points) {
         tv.swipe(from, to, Duration::from_millis(200)).await?;
@@ -118,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             details(&tv, |n| !n.chapters.is_empty()).await?;
             tv.previous_chapter().await?;
         }
+        (None, "app_switcher") => tv.app_switcher().await?,
         (None, "on") => tv.turn_on().await?,
         (None, "off") => tv.turn_off().await?,
         (None, "watch") => watch(&tv).await?,
@@ -229,6 +242,20 @@ async fn run_value(tv: &AppleTv, command: &str) -> Result<(), Box<dyn std::error
         tv.enable_language(option).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
         print_languages_now(tv, "after").await?;
+    } else if let Some(v) = value("hold=") {
+        let (k, s) = v.split_once(',').ok_or("expected hold=<key>,<s>")?;
+        let k = key(k).ok_or("unknown key")?;
+        tv.hold(k, Duration::from_secs_f64(s.parse()?)).await?;
+    } else if let Some(v) = value("ff_companion=") {
+        scrub_companion(tv, true, v.parse()?).await?;
+    } else if let Some(v) = value("rw_companion=") {
+        scrub_companion(tv, false, v.parse()?).await?;
+    } else if let Some(v) = value("ff_mrp=") {
+        scrub_mrp(tv, true, v.parse()?).await?;
+    } else if let Some(v) = value("rw_mrp=") {
+        scrub_mrp(tv, false, v.parse()?).await?;
+    } else if let Some(v) = value("double_tap=") {
+        tv.double_tap(key(v).ok_or("unknown key")?).await?;
     } else if let Some(v) = value("tap=") {
         let (x, y) = v.split_once(',').ok_or("expected tap=<x>,<y>")?;
         tv.tap(x.parse()?, y.parse()?).await?;
@@ -266,6 +293,34 @@ async fn scrub(tv: &AppleTv, forward: bool, seconds: f64) -> Result<(), ratv::Er
     } else {
         tv.end_rewind().await
     }
+}
+
+/// Fast forward or rewind for `seconds` with MRP commands.
+async fn scrub_mrp(tv: &AppleTv, forward: bool, seconds: f64) -> Result<(), ratv::Error> {
+    let m = tv.mrp().ok_or(ratv::Error::NotConnected("MRP"))?;
+    let (begin, end) = if forward {
+        (mrp::Command::BeginFastForward, mrp::Command::EndFastForward)
+    } else {
+        (mrp::Command::BeginRewind, mrp::Command::EndRewind)
+    };
+    m.command(begin).await?;
+    tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+    m.command(end).await
+}
+
+/// Fast forward or rewind for `seconds` with Companion media controls.
+async fn scrub_companion(tv: &AppleTv, forward: bool, seconds: f64) -> Result<(), ratv::Error> {
+    let c = tv
+        .companion()
+        .ok_or(ratv::Error::NotConnected("Companion"))?;
+    let (begin, end) = if forward {
+        (MediaControl::FastForwardBegin, MediaControl::FastForwardEnd)
+    } else {
+        (MediaControl::RewindBegin, MediaControl::RewindEnd)
+    };
+    c.media(begin).await?;
+    tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+    c.media(end).await
 }
 
 /// `off` to `Off`.
@@ -460,6 +515,7 @@ fn key(command: &str) -> Option<Key> {
         "select" => Some(Key::Select),
         "menu" => Some(Key::Menu),
         "home" => Some(Key::Home),
+        "top_menu" => Some(Key::TopMenu),
         "guide" => Some(Key::Guide),
         "control_center" => Some(Key::PageDown),
         "page_up" => Some(Key::PageUp),

@@ -367,13 +367,22 @@ fn initial_state() -> Vec<u8> {
             content_items: vec![video_item()],
             ..Default::default()
         }),
-        // `PreviousChapter` is not supported, so `AppleTv` seeks instead.
+        // Not listed, so `AppleTv` uses another way: `PreviousChapter`, `Play`,
+        // `TogglePlayPause`, `Stop`, `SkipForward`, `BeginFastForward`.
         supported_commands: Some(proto::SupportedCommands {
-            supported_commands: vec![proto::CommandInfo {
-                command: Some(Command::NextChapter as i32),
+            supported_commands: [
+                Command::NextChapter,
+                Command::Pause,
+                Command::SeekToPlaybackPosition,
+                Command::SkipBackward,
+            ]
+            .into_iter()
+            .map(|c| proto::CommandInfo {
+                command: Some(c as i32),
                 enabled: Some(true),
                 ..Default::default()
-            }],
+            })
+            .collect(),
         }),
         ..Default::default()
     };
@@ -828,6 +837,51 @@ async fn apple_tv_chapters_and_subtitles() {
     assert_eq!(log.seeks, [60.0]);
     let archive = &log.language_options[0];
     assert!(archive.windows(6).any(|w| w == b"sub-sv"));
+}
+
+/// The app lists only some commands, so the others use another way.
+#[cfg(feature = "companion")]
+#[tokio::test]
+async fn apple_tv_uses_supported_commands() {
+    use ratv::{AppleTv, Endpoints};
+
+    let device = start_device().await;
+    let endpoints = Endpoints {
+        companion: None,
+        airplay: Some(format!("127.0.0.1:{}", device.port).parse().unwrap()),
+    };
+    let tv = AppleTv::connect(&endpoints, &credentials(), &options())
+        .await
+        .unwrap();
+
+    // Playing at about 100 s. The first call waits for the command list.
+    tv.play().await.unwrap(); // Already playing: nothing is sent.
+    tv.play_pause().await.unwrap(); // Pause.
+    tv.stop().await.unwrap(); // Pause.
+    tv.skip(10.0).await.unwrap(); // Seek.
+    tv.skip(-10.0).await.unwrap(); // SkipBackward.
+    tv.begin_rewind().await.unwrap(); // SkipBackward instead of rewind.
+    tv.end_rewind().await.unwrap(); // Nothing.
+    // No skip forward either and no Companion: MRP is tried.
+    tv.begin_fast_forward().await.unwrap();
+    tv.end_fast_forward().await.unwrap();
+    tv.close().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let log = device.log.lock().unwrap();
+    assert_eq!(
+        log.commands,
+        [
+            Command::Pause as i32,
+            Command::Pause as i32,
+            Command::SeekToPlaybackPosition as i32,
+            Command::SkipBackward as i32,
+            Command::SkipBackward as i32,
+            Command::BeginFastForward as i32,
+            Command::EndFastForward as i32,
+        ]
+    );
+    assert!((110.0..111.0).contains(&log.seeks[0]), "{:?}", log.seeks);
 }
 
 /// Waits until the fake device got TEARDOWN.

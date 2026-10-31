@@ -578,6 +578,20 @@ async fn hold_released_when_cancelled() {
 }
 
 #[tokio::test]
+async fn double_tap_sends_two_clicks() {
+    let (creds, controller) = pair().await;
+    let log = Arc::new(Mutex::new(Log::default()));
+    let (client_io, device_io) = tokio::io::duplex(8192);
+    tokio::spawn(device_session(device_io, controller, log.clone()));
+    let client = companion::Client::connect_stream(client_io, &creds, &options())
+        .await
+        .unwrap();
+    client.double_tap(HidCommand::Home).await.unwrap();
+    let hid = log.lock().unwrap().hid.clone();
+    assert_eq!(hid, [(7, 1), (7, 2), (7, 1), (7, 2)]);
+}
+
+#[tokio::test]
 async fn swipe_lifted_when_cancelled() {
     let (creds, controller) = pair().await;
     let log = Arc::new(Mutex::new(Log::default()));

@@ -367,6 +367,26 @@ impl Client {
         self.button(command, ButtonState::Up).await
     }
 
+    /// Clicks a button two times fast. [`HidCommand::Home`] opens the app switcher.
+    ///
+    /// All events are sent before waiting for answers, so the device sees a double click.
+    pub async fn double_tap(&self, command: HidCommand) -> Result<(), Error> {
+        let mut held = Held {
+            client: self,
+            command,
+            armed: true,
+        };
+        // `try_join!` polls in order, and each request is queued on its first poll.
+        tokio::try_join!(
+            self.button(command, ButtonState::Down),
+            self.button(command, ButtonState::Up),
+            self.button(command, ButtonState::Down),
+            self.button(command, ButtonState::Up),
+        )?;
+        held.armed = false;
+        Ok(())
+    }
+
     /// Holds a button for `duration`. The button is released also if the
     /// returned future is dropped.
     pub async fn hold(&self, command: HidCommand, duration: Duration) -> Result<(), Error> {

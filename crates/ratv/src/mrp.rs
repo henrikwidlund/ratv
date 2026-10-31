@@ -678,6 +678,12 @@ impl Client {
         self.button(button, false).await
     }
 
+    /// Presses and releases a button two times fast.
+    pub async fn double_tap(&self, button: Button) -> Result<(), Error> {
+        self.press(button).await?;
+        self.press(button).await
+    }
+
     /// Holds a button for `duration`. The button is released also if the
     /// returned future is dropped.
     pub async fn hold(&self, button: Button, duration: Duration) -> Result<(), Error> {
