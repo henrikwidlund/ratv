@@ -5,14 +5,24 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
 keywords = ["apple-tv", "airplay", "companion", "remote", "homekit"]
 categories = ["network-programming", "api-bindings"]
 
 [features]
 default = ["companion", "discovery", "mrp"]
-companion = ["dep:ratv-companion", "dep:socket2"]
+companion = ["dep:bytes", "dep:getrandom", "dep:rand_core", "dep:ratv-companion", "dep:socket2"]
 discovery = ["dep:ratv-discovery"]
-mrp = ["dep:ratv-airplay", "dep:ratv-mrp", "dep:socket2"]
+mrp = [
+    "dep:bytes",
+    "dep:getrandom",
+    "dep:rand_core",
+    "dep:ratv-airplay",
+    "dep:ratv-codec",
+    "dep:ratv-mrp",
+    "dep:socket2",
+]
 # Siri voice input from PCM.
 opus = ["mrp", "ratv-mrp/opus"]
 # Logs full messages at trace level. They can contain personal data,
@@ -20,21 +30,22 @@ opus = ["mrp", "ratv-mrp/opus"]
 sensitive-logs = []
 
 [dependencies]
-ratv-codec.workspace = true
+ratv-codec = { workspace = true, optional = true }
 ratv-hap.workspace = true
 ratv-companion = { workspace = true, optional = true }
 ratv-discovery = { workspace = true, optional = true }
 ratv-airplay = { workspace = true, optional = true }
 ratv-mrp = { workspace = true, optional = true }
-bytes.workspace = true
+bytes = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["net", "io-util", "sync", "time", "rt", "macros"] }
-getrandom = { version = "0.4", features = ["sys_rng"] }
-rand_core.workspace = true
+getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
+rand_core = { workspace = true, optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 socket2 = { version = "0.6.5", features = ["all"], optional = true }
 
 [dev-dependencies]
+ratv-codec.workspace = true
 ratv-hap = { workspace = true, features = ["accessory"] }
 ratv-companion.workspace = true
 tokio = { version = "1", features = ["full", "test-util"] }
