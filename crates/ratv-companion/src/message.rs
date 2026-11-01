@@ -552,6 +552,8 @@ pub mod event {
     pub const TV_SYSTEM_STATUS: &str = "TVSystemStatus";
     pub const TEXT_INPUT_STARTED: &str = "_tiStarted";
     pub const TEXT_INPUT_STOPPED: &str = "_tiStopped";
+    /// Sent after `TVRCSessionStart` without registering interest.
+    pub const SUPPORTED_ACTIONS: &str = "SupportedActions";
 }
 
 /// Registers or removes interest in events. This is an event, not a request.
@@ -704,6 +706,12 @@ pub enum Event {
     TextInputStarted,
     /// Text field lost focus.
     TextInputStopped,
+    /// The screen in front changed, for example to the Home Screen or to a video player.
+    /// Not sent for pause or for moving in menus. Does not tell which app is in front.
+    ScreenChanged {
+        /// True if the Guide button does something on the new screen.
+        guide_supported: bool,
+    },
 }
 
 impl Event {
@@ -723,6 +731,12 @@ impl Event {
             )),
             event::TEXT_INPUT_STARTED => Some(Self::TextInputStarted),
             event::TEXT_INPUT_STOPPED => Some(Self::TextInputStopped),
+            event::SUPPORTED_ACTIONS => Some(Self::ScreenChanged {
+                guide_supported: msg
+                    .field("GuideSupportedKey")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }),
             _ => None,
         }
     }
@@ -989,6 +1003,17 @@ mod tests {
         assert_eq!(
             Event::parse(&Message::decode(&raw).unwrap()),
             Some(Event::TextInputStopped)
+        );
+        let raw = event("SupportedActions", |e| {
+            e.dict(1, |e| {
+                e.str("GuideSupportedKey").bool(false);
+            });
+        });
+        assert_eq!(
+            Event::parse(&Message::decode(&raw).unwrap()),
+            Some(Event::ScreenChanged {
+                guide_supported: false
+            })
         );
         let raw = event("other", empty);
         assert_eq!(Event::parse(&Message::decode(&raw).unwrap()), None);

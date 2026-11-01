@@ -14,7 +14,9 @@ use ratv::mrp::{Client, ClientOptions};
 use ratv_mrp::Envelope;
 use ratv_mrp::proto::{
     Command, CommandInfo, ContentItem, KeyboardMessage, PlaybackQueue, PlaybackQueueRequestMessage,
-    SetDefaultSupportedCommandsMessage, SetStateMessage, UpdateContentItemMessage,
+    RemoveClientMessage, RemovePlayerMessage, SetDefaultSupportedCommandsMessage,
+    SetNowPlayingClientMessage, SetNowPlayingPlayerMessage, SetStateMessage, UpdateClientMessage,
+    UpdateContentItemMessage, UpdatePlayerMessage,
 };
 
 fn print_item(label: &str, item: &ContentItem) {
@@ -49,9 +51,54 @@ fn print_commands(label: &str, commands: &[CommandInfo]) {
     }
 }
 
+/// Prints the client and player messages in one line each.
+fn print_path(env: &Envelope) -> Result<bool, ratv::Error> {
+    if env.is::<SetNowPlayingClientMessage>() {
+        println!(
+            "--- SET_NOW_PLAYING_CLIENT: {:?}",
+            env.payload::<SetNowPlayingClientMessage>()?
+        );
+    } else if env.is::<SetNowPlayingPlayerMessage>() {
+        println!(
+            "--- SET_NOW_PLAYING_PLAYER: {:?}",
+            env.payload::<SetNowPlayingPlayerMessage>()?
+        );
+    } else if env.is::<RemoveClientMessage>() {
+        println!(
+            "--- REMOVE_CLIENT: {:?}",
+            env.payload::<RemoveClientMessage>()?
+        );
+    } else if env.is::<RemovePlayerMessage>() {
+        println!(
+            "--- REMOVE_PLAYER: {:?}",
+            env.payload::<RemovePlayerMessage>()?
+        );
+    } else if env.is::<UpdateClientMessage>() {
+        println!(
+            "--- UPDATE_CLIENT: {:?}",
+            env.payload::<UpdateClientMessage>()?
+        );
+    } else if env.is::<UpdatePlayerMessage>() {
+        println!(
+            "--- UPDATE_PLAYER: {:?}",
+            env.payload::<UpdatePlayerMessage>()?
+        );
+    } else {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn print(env: &Envelope) -> Result<(), ratv::Error> {
+    if print_path(env)? {
+        return Ok(());
+    }
     if env.is::<SetStateMessage>() {
         let msg: SetStateMessage = env.payload()?;
+        println!(
+            "--- SET_STATE: state {:?}, player {:?}",
+            msg.playback_state, msg.player_path
+        );
         if let Some(q) = &msg.playback_queue {
             print_queue("SET_STATE queue", q);
         }
@@ -108,13 +155,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("=== pushed messages for {seconds} s");
+    let start = tokio::time::Instant::now();
     let deadline = tokio::time::sleep(Duration::from_secs(seconds));
     tokio::pin!(deadline);
     loop {
         tokio::select! {
             () = &mut deadline => break,
             env = messages.recv() => match env {
-                Ok(env) => print(&env)?,
+                Ok(env) => {
+                    println!("=== {:.1} s, kind {}", start.elapsed().as_secs_f64(), env.kind());
+                    print(&env)?;
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(_) => break,
             },
