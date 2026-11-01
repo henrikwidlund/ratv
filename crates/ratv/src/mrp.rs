@@ -192,8 +192,6 @@ fn is_recording(env: &Envelope) -> bool {
             .is_ok_and(|m| m.state == Some(RecordingState::Recording as i32))
 }
 
-/// Language tag for automatic subtitles.
-const AUTO_LANGUAGE: &str = "__AUTO__";
 /// Current item plus next items to request for [`NowPlaying::up_next`].
 const QUEUE_LENGTH: i32 = 10;
 
@@ -781,7 +779,8 @@ impl Client {
     }
 
     /// Sets the playback rate, 1.0 is normal speed.
-    /// Rates the app accepts are in [`NowPlaying::supported_rates`].
+    /// Rates the app accepts are in [`NowPlaying::supported_rates`], normal speeds in
+    /// [`NowPlaying::playback_speeds`].
     pub async fn set_playback_rate(&self, rate: f32) -> Result<(), Error> {
         self.run_command(&messages::playback_rate(rate)).await
     }
@@ -815,9 +814,12 @@ impl Client {
     /// Turns off subtitles.
     pub async fn disable_subtitles(&self) -> Result<(), Error> {
         // With only the type, the device can show another subtitle track instead.
-        let msg = match self.inner.now_playing.borrow().subtitle_language.as_ref() {
-            Some(o) if o.language_tag() != AUTO_LANGUAGE => messages::disable_language(o),
-            _ => messages::disable_subtitles(),
+        let msg = {
+            let np = self.inner.now_playing.borrow();
+            match np.subtitle_language.as_ref() {
+                Some(o) if !np.subtitles_auto() => messages::disable_language(o),
+                _ => messages::disable_subtitles(),
+            }
         };
         self.run_command(&msg).await
     }

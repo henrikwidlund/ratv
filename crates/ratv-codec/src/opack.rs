@@ -284,6 +284,7 @@ impl<'b> Encoder<'b> {
     }
 
     /// Writes an integer using the smallest encoding.
+    /// The device reads the bytes as signed, so the top bit of the last byte stays 0.
     /// Negative values keep their 64-bit pattern.
     pub fn int(&mut self, v: i64) -> &mut Self {
         if (0..0x28).contains(&v) {
@@ -294,9 +295,9 @@ impl<'b> Encoder<'b> {
         let u = v.cast_unsigned();
         let bytes = u.to_le_bytes();
         let (tag, len) = match u {
-            0..=0xFF => (0x30, 1),
-            0x100..=0xFFFF => (0x31, 2),
-            0x1_0000..=0xFFFF_FFFF => (0x32, 4),
+            0..=0x7F => (0x30, 1),
+            0x80..=0x7FFF => (0x31, 2),
+            0x8000..=0x7FFF_FFFF => (0x32, 4),
             _ => (0x33, 8),
         };
         self.out.push(tag);
@@ -715,7 +716,12 @@ mod tests {
         assert_eq!(enc(&Value::Int(0xF)), [0x17]);
         assert_eq!(enc(&Value::Int(0x27)), [0x2F]);
         assert_eq!(enc(&Value::Int(0x28)), [0x30, 0x28]);
+        assert_eq!(enc(&Value::Int(0x7F)), [0x30, 0x7F]);
+        assert_eq!(enc(&Value::Int(0x80)), [0x31, 0x80, 0x00]);
+        assert_eq!(enc(&Value::Int(0xC8)), [0x31, 0xC8, 0x00]);
         assert_eq!(enc(&Value::Int(0x1FF)), [0x31, 0xFF, 0x01]);
+        assert_eq!(enc(&Value::Int(0x8000)), [0x32, 0x00, 0x80, 0x00, 0x00]);
+        assert_eq!(enc(&Value::Int(0x8000_0000)), hex("330000008000000000"));
         assert_eq!(enc(&Value::Int(0x1FF_FFFF)), [0x32, 0xFF, 0xFF, 0xFF, 0x01]);
         assert_eq!(
             enc(&Value::Int(0x1FF_FFFF_FFFF_FFFF)),
@@ -869,10 +875,10 @@ mod tests {
 
     #[test]
     fn references_track_numbers() {
-        // 0x30 0x80 enters the object table, so "x" is index 1, not 0.
+        // 0x31 0x80 0x00 enters the object table, so "x" is index 1, not 0.
         let v = Value::Array(vec![Value::Int(0x80), s("x1"), s("x1"), Value::Int(0x80)]);
         let out = enc(&v);
-        assert_eq!(out, hex("d43080427831a1a0"));
+        assert_eq!(out, hex("d4318000427831a1a0"));
         assert_eq!(decode(&out).unwrap(), v);
     }
 
@@ -909,7 +915,8 @@ mod tests {
             Some("E1:48:1F:71:F7:8E")
         );
         assert_eq!(c.get("name").and_then(Value::as_str), Some("BunATV Remote"));
-        assert_eq!(enc(&v), bytes);
+        // 128 is written with two bytes, so only the value round trips.
+        assert_eq!(decode(&enc(&v)).unwrap(), v);
     }
 
     #[test]

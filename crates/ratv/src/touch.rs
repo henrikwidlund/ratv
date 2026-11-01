@@ -15,12 +15,15 @@ pub(crate) enum Phase {
     End,
 }
 
-/// Positions between `from` and `to`, one per [`STEP`], without the ends.
+/// Positions after `from` up to and with `to`, one per [`STEP`].
 fn path(from: (f64, f64), to: (f64, f64), duration: Duration) -> impl Iterator<Item = (f64, f64)> {
     let steps = u32::try_from(duration.as_millis() / STEP.as_millis())
         .unwrap_or(u32::MAX)
         .max(1);
-    (1..steps).map(move |i| {
+    (1..=steps).map(move |i| {
+        if i == steps {
+            return to;
+        }
         let t = f64::from(i) / f64::from(steps);
         (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t)
     })
@@ -29,6 +32,7 @@ fn path(from: (f64, f64), to: (f64, f64), duration: Duration) -> impl Iterator<I
 /// Sends a swipe from `from` to `to` that takes about `duration`.
 ///
 /// Waits one step before the first move, so the device sees the press first.
+/// The last move is at `to`, so the finger is still when it is lifted.
 pub(crate) async fn swipe<F, Fut>(
     from: (f64, f64),
     to: (f64, f64),
@@ -57,14 +61,15 @@ mod tests {
     #[test]
     fn path_stays_between_ends() {
         let points: Vec<_> = path((0.8, 0.5), (0.2, 0.5), Duration::from_millis(160)).collect();
-        assert_eq!(points.len(), 9);
+        assert_eq!(points.len(), 10);
+        assert!((points[9].0 - 0.2).abs() < 1e-9);
         assert!(
             points
                 .iter()
                 .all(|p| (0.2..=0.8).contains(&p.0) && (p.1 - 0.5).abs() < 1e-9)
         );
         assert!(points.windows(2).all(|w| w[1].0 < w[0].0));
-        assert_eq!(path((0.0, 0.0), (1.0, 1.0), Duration::ZERO).count(), 0);
+        assert_eq!(path((0.0, 0.0), (1.0, 1.0), Duration::ZERO).count(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -86,8 +91,19 @@ mod tests {
         .unwrap();
         let events = events.into_inner().unwrap();
         let phases: Vec<_> = events.iter().map(|e| e.1).collect();
-        assert_eq!(phases, [Phase::Begin, Phase::Move, Phase::Move, Phase::End]);
+        assert_eq!(
+            phases,
+            [
+                Phase::Begin,
+                Phase::Move,
+                Phase::Move,
+                Phase::Move,
+                Phase::End
+            ]
+        );
+        // The finger stops at the end before it is lifted.
         assert!((events[3].0 - 1.0).abs() < 1e-9);
+        assert!((events[4].0 - 1.0).abs() < 1e-9);
         // One step between all events, also before the first move.
         assert!(events.windows(2).all(|w| w[1].2 - w[0].2 == STEP));
     }

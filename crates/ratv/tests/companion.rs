@@ -443,13 +443,15 @@ async fn session_commands() {
     assert_eq!(log.volume, Some(1.0));
     assert_eq!(log.launched, ["com.netflix.Netflix", "https://example.com"]);
     assert_eq!(log.account.as_deref(), Some("acc-2"));
-    // Press, two moves, release, on a 1000 x 1000 touch area. Then a tap.
+    // Press, three moves ending at the target, release there, on a 1000 x 1000
+    // touch area. Then a tap.
     assert_eq!(
         log.touches,
         [
             (800, 500, 1),
             (600, 500, 3),
             (400, 500, 3),
+            (200, 500, 3),
             (200, 500, 4),
             (250, 750, 1),
             (250, 750, 4)

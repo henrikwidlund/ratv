@@ -1,6 +1,7 @@
 use std::time::{Duration, SystemTime};
 
 use prost::Message as _;
+use ratv_codec::bplist;
 
 use crate::proto::{
     self, Command, CommandInfo, ContentItem, ContentItemMetadata, LanguageOption, NowPlayingClient,
@@ -19,6 +20,20 @@ const COCOA_EPOCH: Duration = Duration::from_secs(978_307_200);
 
 /// Playback state.
 pub type PlaybackState = proto::playback_state::Enum;
+
+/// Language tag of automatic subtitles.
+const AUTO_LANGUAGE: &str = "__AUTO__";
+/// Highest rate in [`NowPlaying::playback_speeds`]. Higher rates are scan speeds.
+const MAX_PLAYBACK_SPEED: f32 = 2.0;
+
+impl LanguageOption {
+    /// True for automatic subtitles: the device shows them only when needed,
+    /// for example when the audio is not in the device language. Tag `__AUTO__`.
+    #[must_use]
+    pub fn is_auto(&self) -> bool {
+        self.language_tag() == AUTO_LANGUAGE
+    }
+}
 
 /// Audio or video.
 pub type MediaType = proto::content_item_metadata::MediaType;
@@ -76,7 +91,7 @@ pub struct NowPlaying {
     pub state: Option<PlaybackState>,
     /// Title.
     pub title: Option<String>,
-    /// Subtitle.
+    /// Subtitle. For an episode in the Apple TV app, the episode title.
     pub subtitle: Option<String>,
     /// Artist.
     pub artist: Option<String>,
@@ -140,7 +155,7 @@ pub struct NowPlaying {
     pub subtitle_languages: Vec<LanguageOption>,
     /// Current audio language.
     pub audio_language: Option<LanguageOption>,
-    /// Current subtitle language. The tag `__AUTO__` means automatic. `None` when off.
+    /// Current subtitle language. `None` when off. See [`subtitles_auto`](Self::subtitles_auto).
     pub subtitle_language: Option<LanguageOption>,
     /// Chapters of the item.
     pub chapters: Vec<Chapter>,
@@ -240,6 +255,34 @@ impl NowPlaying {
             .filter_map(|c| c.start)
             .take_while(|&s| s < position - 3.0)
             .last()
+    }
+
+    /// True if subtitles are set to automatic, see [`LanguageOption::is_auto`].
+    #[must_use]
+    pub fn subtitles_auto(&self) -> bool {
+        self.subtitle_language
+            .as_ref()
+            .is_some_and(LanguageOption::is_auto)
+    }
+
+    /// Rates for [`Command::ChangePlaybackRate`] that play at a normal speed:
+    /// above 0 and up to 2.0, with 1.0, sorted. [`supported_rates`](Self::supported_rates)
+    /// can also have scan speeds. Empty if the app supports only 1.0.
+    #[must_use]
+    pub fn playback_speeds(&self) -> Vec<f32> {
+        let mut speeds: Vec<f32> = self
+            .supported_rates
+            .iter()
+            .copied()
+            .filter(|r| *r > 0.0 && *r <= MAX_PLAYBACK_SPEED)
+            .chain([1.0])
+            .collect();
+        speeds.sort_by(f32::total_cmp);
+        speeds.dedup();
+        if speeds.len() == 1 {
+            speeds.clear();
+        }
+        speeds
     }
 
     /// True if `command` is enabled.
@@ -588,6 +631,9 @@ impl NowPlayingState {
         );
         if let Some(m) = meta {
             copy_metadata(m, &mut np);
+            if let Some(data) = m.now_playing_info_data.as_deref() {
+                copy_additional_metadata(data, &mut np);
+            }
         }
         np.is_live = np.is_live.or_else(|| info?.is_always_live);
         np.is_advertisement = np.is_advertisement.or_else(|| info?.is_advertisement);
@@ -806,6 +852,84 @@ fn copy_metadata(m: &ContentItemMetadata, np: &mut NowPlaying) {
     np.audio_format.clone_from(&m.active_format);
 }
 
+/// Copies fields from `TVRAdditionalMetadata` in an archived info dictionary.
+/// The Apple TV app sends season, episode, genre and rating only there.
+/// Fields that are already set are kept.
+fn copy_additional_metadata(data: &[u8], np: &mut NowPlaying) {
+    if np.season.is_some()
+        && np.episode.is_some()
+        && np.subtitle.is_some()
+        && np.genre.is_some()
+        && np.content_rating.is_some()
+    {
+        return;
+    }
+    let Ok(archive) = bplist::decode(data) else {
+        return;
+    };
+    let Some(objects) = archive.get("$objects").and_then(bplist::Value::as_array) else {
+        return;
+    };
+    let root = archive.get("$top").and_then(|t| t.get("root"));
+    let Some(extra) = root.and_then(|r| archived_entry(objects, r, "TVRAdditionalMetadata")) else {
+        return;
+    };
+    let get = |key| archived_entry(objects, extra, key);
+    let number = |key| {
+        get(key).and_then(|v| match v {
+            bplist::Value::String(s) => s.parse().ok(),
+            _ => v.as_i64().and_then(|n| i32::try_from(n).ok()),
+        })
+    };
+    let string = |key| {
+        get(key)
+            .and_then(bplist::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    np.season = np
+        .season
+        .or_else(|| number("avkt/com.apple.avkit.seasonNumber"));
+    np.episode = np
+        .episode
+        .or_else(|| number("avkt/com.apple.avkit.episodeNumber"));
+    np.subtitle = np
+        .subtitle
+        .take()
+        .or_else(|| string("mdta/com.apple.hls.episode-title"));
+    np.genre = np
+        .genre
+        .take()
+        .or_else(|| string("mdta/com.apple.hls.genre"));
+    np.content_rating = np
+        .content_rating
+        .take()
+        .or_else(|| string("mdta/com.apple.hls.rating-display-name"));
+    // The title of an episode is the series name.
+    if np.series_name.is_none() && np.episode.is_some() {
+        np.series_name.clone_from(&np.title);
+    }
+}
+
+/// Value for `key` in an archived `NSDictionary`, with UID references resolved.
+fn archived_entry<'v, 'a>(
+    objects: &'v [bplist::Value<'a>],
+    dict: &'v bplist::Value<'a>,
+    key: &str,
+) -> Option<&'v bplist::Value<'a>> {
+    let resolve = |v: &'v bplist::Value<'a>| match v {
+        bplist::Value::Uid(i) => objects.get(usize::try_from(*i).ok()?),
+        _ => Some(v),
+    };
+    let dict = resolve(dict)?;
+    let keys = dict.get("NS.keys")?.as_array()?;
+    let values = dict.get("NS.objects")?.as_array()?;
+    let i = keys
+        .iter()
+        .position(|k| resolve(k).and_then(bplist::Value::as_str) == Some(key))?;
+    resolve(values.get(i)?)
+}
+
 fn enabled(commands: &[CommandInfo]) -> Vec<Command> {
     commands
         .iter()
@@ -837,6 +961,55 @@ mod tests {
         let mut out = BytesMut::new();
         encode(p, None, &mut out);
         frames(out.freeze()).next().unwrap().unwrap()
+    }
+
+    #[test]
+    fn additional_metadata() {
+        let data = include_bytes!("../testdata/tv_app_info.bplist");
+        let mut np = NowPlaying {
+            title: Some("Slow Horses".into()),
+            genre: Some("Drama".into()),
+            ..NowPlaying::default()
+        };
+        copy_additional_metadata(data, &mut np);
+        assert_eq!(np.season, Some(1));
+        assert_eq!(np.episode, Some(1));
+        assert_eq!(np.series_name.as_deref(), Some("Slow Horses"));
+        assert_eq!(np.subtitle.as_deref(), Some("Failure\u{2019}s Contagious"));
+        assert_eq!(np.content_rating.as_deref(), Some("12+"));
+        // Values from the metadata are kept.
+        assert_eq!(np.genre.as_deref(), Some("Drama"));
+
+        let mut np = NowPlaying::default();
+        copy_additional_metadata(b"not a plist", &mut np);
+        assert_eq!(np, NowPlaying::default());
+    }
+
+    #[test]
+    fn playback_speeds() {
+        let mut np = NowPlaying::default();
+        assert_eq!(np.playback_speeds(), [] as [f32; 0]);
+        np.supported_rates = vec![1.0];
+        assert_eq!(np.playback_speeds(), [] as [f32; 0]);
+        np.supported_rates = vec![-2.0, 2.0, 0.5, 96.0, 1.5, 0.0, 1.25];
+        assert_eq!(np.playback_speeds(), [0.5, 1.0, 1.25, 1.5, 2.0]);
+    }
+
+    #[test]
+    fn subtitles_auto() {
+        let mut np = NowPlaying::default();
+        assert!(!np.subtitles_auto());
+        let option = |tag: &str| LanguageOption {
+            r#type: Some(LanguageType::Legible as i32),
+            language_tag: Some(tag.into()),
+            ..Default::default()
+        };
+        np.subtitle_language = Some(option("sv"));
+        assert!(!np.subtitles_auto());
+        np.subtitle_language = Some(option(AUTO_LANGUAGE));
+        assert!(np.subtitles_auto());
+        assert!(option(AUTO_LANGUAGE).is_auto());
+        assert!(!option("sv").is_auto());
     }
 
     #[allow(clippy::unnecessary_wraps)]

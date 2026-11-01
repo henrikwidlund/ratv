@@ -113,6 +113,13 @@ impl Device {
             .or_else(|| self.txt(ServiceKind::Companion, "rpMRtID"))
     }
 
+    /// UID of this device in MRP output device lists and messages, from AirPlay `psi`.
+    /// Use it with `add_outputs`, `remove_outputs` and `set_outputs`.
+    #[must_use]
+    pub fn output_uid(&self) -> Option<&str> {
+        self.txt(ServiceKind::AirPlay, "psi")
+    }
+
     /// Model identifier, for example `AppleTV14,1`.
     #[must_use]
     pub fn model(&self) -> Option<&str> {
@@ -318,6 +325,7 @@ mod tests {
                     "features=0x4A7FDFD5,0xBC157FDE",
                     "model=AppleTV14,1",
                     "osvers=26.0",
+                    "psi=DC737A0E-DD5A-4106-8EF9-26D98ED1AEC0",
                 ],
             )
             .ptr("_raop._tcp.local", RAOP)
@@ -348,6 +356,7 @@ mod tests {
         );
         assert_eq!(d.services.len(), 3);
         assert_eq!(d.identifier(), Some("AA:BB:CC:DD:EE:FF"));
+        assert_eq!(d.output_uid(), Some("DC737A0E-DD5A-4106-8EF9-26D98ED1AEC0"));
         assert_eq!(d.model(), Some("AppleTV14,1"));
         assert_eq!(d.os_version(), Some("26.0"));
         assert_eq!(d.airplay_features(), Some(0xBC15_7FDE_4A7F_DFD5));
@@ -381,6 +390,7 @@ mod tests {
         c.add(&r.finish(), None).unwrap();
         let d = &c.devices()[0];
         assert_eq!(d.identifier(), Some("U1"));
+        assert_eq!(d.output_uid(), None);
         assert_eq!(d.model(), Some("Apple TV"));
         assert_eq!(d.addresses, Vec::<IpAddr>::new());
         assert_eq!(d.socket_addr(ServiceKind::MediaRemote), None);

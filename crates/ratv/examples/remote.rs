@@ -15,10 +15,11 @@
 //! `speed=<rate>`, `rate=<rating>`, `like`, `unlike`, `dislike`, `undislike`, `accounts`, `account=<id>`,
 //! `app_switcher`, `context_menu`, `double_tap=<key>` (key name from this list, for example `home`),
 //! `hold=<key>,<s>` (hold a key for some seconds),
+//! `swipe=<x1>,<y1>,<x2>,<y2>,<ms>` (0.0 to 1.0, duration in ms),
 //! `ff=<s>` and `rw=<s>` (fast forward or rewind for some seconds),
 //! `ff_companion=<s>`, `rw_companion=<s>`, `ff_mrp=<s>`, `rw_mrp=<s>` (the same with one protocol only), `shuffle`, `repeat`
 //! (next mode), `shuffle=<off|songs|albums>`, `repeat=<off|one|all>`,
-//! `info` (print all now playing fields), `languages` (list with
+//! `info` (print all now playing fields), `device_info` (print the MRP device info), `outputs=<uid>,...` (set the output devices), `languages` (list with
 //! tags), `audio=<tag>`, `subtitles=<tag>` (for example `sv`), `subtitles_off`, `queue`,
 //! `play_item=<n>` (number from `queue`), `chapters`, `next_chapter`, `previous_chapter`,
 //! `siri=<file.caf>` (ask Siri with 16 kHz mono Opus audio),
@@ -113,6 +114,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, "shuffle") => tv.cycle_shuffle().await?,
         (None, "repeat") => tv.cycle_repeat().await?,
         (None, "info") => info(&tv).await?,
+        (None, "device_info") => println!(
+            "{:#?}",
+            tv.mrp().ok_or("MRP is not connected")?.device_info()
+        ),
         (None, "languages") => print_languages(&tv).await?,
         (None, "subtitles_off") => subtitles_off(&tv).await?,
         (None, "queue") => print_queue(&tv).await?,
@@ -243,6 +248,10 @@ async fn run_value(tv: &AppleTv, command: &str) -> Result<(), Box<dyn std::error
         tv.enable_language(option).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
         print_languages_now(tv, "after").await?;
+    } else if let Some(v) = value("outputs=") {
+        set_outputs(tv, v).await?;
+    } else if let Some(v) = value("swipe=") {
+        swipe(tv, v).await?;
     } else if let Some(v) = value("hold=") {
         let (k, s) = v.split_once(',').ok_or("expected hold=<key>,<s>")?;
         let k = key(k).ok_or("unknown key")?;
@@ -477,6 +486,27 @@ async fn progress(tv: &AppleTv) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Prints the volume once, or every change with `watch`.
+async fn swipe(tv: &AppleTv, v: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let n: Vec<f64> = v.split(',').map(str::parse).collect::<Result<_, _>>()?;
+    let [x1, y1, x2, y2, ms] = n[..] else {
+        return Err("expected swipe=<x1>,<y1>,<x2>,<y2>,<ms>".into());
+    };
+    tv.swipe((x1, y1), (x2, y2), Duration::from_secs_f64(ms / 1000.0))
+        .await?;
+    Ok(())
+}
+
+async fn set_outputs(tv: &AppleTv, uids: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let uids: Vec<&str> = uids.split(',').collect();
+    tv.mrp()
+        .ok_or(ratv::Error::NotConnected("MRP"))?
+        .set_outputs(&uids)
+        .await?;
+    // The new group arrives in a device info update.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    print_volume(tv, false).await
+}
+
 async fn print_volume(tv: &AppleTv, watch: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut rx = tv.volume().ok_or("MRP is not connected")?;
     // The initial values arrive shortly after connect. Availability comes last.

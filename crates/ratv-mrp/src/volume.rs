@@ -74,8 +74,14 @@ impl VolumeState {
     pub fn set_device(&mut self, info: &DeviceInfoMessage) {
         self.uid = output_device_uid(info).map(str::to_owned);
         // The device itself plays audio only when it leads the group and is no proxy.
+        // Its output UID is `device_uid`, the same as AirPlay `psi`, not `unique_identifier`.
         let own = (info.is_group_leader == Some(true) && info.is_proxy_group_player != Some(true))
-            .then_some((info.unique_identifier.as_deref(), info.name.as_str()));
+            .then_some((
+                info.device_uid
+                    .as_deref()
+                    .or(info.unique_identifier.as_deref()),
+                info.name.as_str(),
+            ));
         let grouped = info
             .grouped_devices
             .iter()
@@ -321,7 +327,7 @@ mod tests {
             ..Default::default()
         };
         let info = DeviceInfoMessage {
-            unique_identifier: Some("tv".into()),
+            unique_identifier: Some("mrp-id".into()),
             device_uid: Some("tv".into()),
             name: "Living Room".into(),
             is_group_leader: Some(true),

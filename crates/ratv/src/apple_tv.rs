@@ -790,7 +790,7 @@ impl AppleTv {
     }
 
     /// Sets the playback rate, 1.0 is normal speed. Needs MRP.
-    /// See [`NowPlaying::supported_rates`].
+    /// See [`NowPlaying::playback_speeds`].
     pub async fn set_playback_rate(&self, rate: f32) -> Result<(), Error> {
         self.need_mrp()?.set_playback_rate(rate).await
     }
