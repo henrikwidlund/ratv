@@ -69,6 +69,7 @@ pub enum Error {
     #[error("protocol error: {0}")]
     Protocol(&'static str),
     /// A Companion pairing step failed while waiting for the reply.
+    /// Network errors are [`Error::Io`] instead.
     #[cfg(feature = "companion")]
     #[error("{step}: {source}{}", Skipped(.skipped))]
     PairingStep {
@@ -107,6 +108,18 @@ impl From<tokio::time::error::Elapsed> for Error {
 }
 
 impl Error {
+    /// True if a connect step got no answer in time.
+    #[cfg(any(feature = "companion", feature = "mrp"))]
+    #[cfg_attr(not(feature = "companion"), allow(clippy::missing_const_for_fn))]
+    pub(crate) fn is_stall(&self) -> bool {
+        match self {
+            Self::Timeout => true,
+            #[cfg(feature = "companion")]
+            Self::PairingStep { source, .. } => matches!(**source, Self::Timeout),
+            _ => false,
+        }
+    }
+
     /// True if the device rejected the credentials, or the PIN while pairing.
     /// After a failed connect, pair again to fix it.
     #[must_use]
@@ -147,5 +160,22 @@ mod tests {
         );
         assert!(!Error::Hap(ratv_hap::Error::Decrypt).is_auth());
         assert!(!Error::Timeout.is_auth());
+    }
+
+    #[test]
+    #[cfg(any(feature = "companion", feature = "mrp"))]
+    fn is_stall() {
+        assert!(Error::Timeout.is_stall());
+        assert!(!Error::Disconnected.is_stall());
+        #[cfg(feature = "companion")]
+        {
+            let step = |source| Error::PairingStep {
+                step: "pair-verify M2",
+                skipped: Vec::new(),
+                source: Box::new(source),
+            };
+            assert!(step(Error::Timeout).is_stall());
+            assert!(!step(Error::Disconnected).is_stall());
+        }
     }
 }

@@ -395,15 +395,18 @@ impl Client {
         options: &ClientOptions,
     ) -> Result<Self, Error> {
         let span = log::session("mrp", Some(addr));
-        Self::start(addr, credentials, options, span.clone())
-            .instrument(span)
+        options
+            .connect_with_retry(|step| Self::start(addr, credentials, options, step, span.clone()))
+            .instrument(span.clone())
             .await
     }
 
+    /// `step` is the time to wait for each connect step.
     async fn start(
         addr: SocketAddr,
         credentials: &Credentials,
         options: &ClientOptions,
+        step: Duration,
         span: Span,
     ) -> Result<Self, Error> {
         tracing::debug!("connecting");
@@ -418,7 +421,7 @@ impl Client {
             os_build: &options.os_build,
             device_id: &device_id,
         };
-        let mut conns = airplay::connect(addr, credentials, &identity, options.timeout).await?;
+        let mut conns = airplay::connect(addr, credentials, &identity, step).await?;
 
         // DEVICE_INFO must be answered before anything else is sent.
         let unique = options
@@ -437,11 +440,10 @@ impl Client {
         let (volume_tx, volume) = watch::channel(Volume::default());
         let (recording_tx, recording) = watch::channel(0);
         let mut state = State::new(np_tx, volume_tx, recording_tx);
-        let device =
-            tokio::time::timeout(options.timeout, wait_device_info(&mut conns, &mut state))
-                .await
-                .map_err(Error::from)
-                .and_then(|r| r);
+        let device = tokio::time::timeout(step, wait_device_info(&mut conns, &mut state))
+            .await
+            .map_err(Error::from)
+            .and_then(|r| r);
         let device = match device {
             Ok(d) => d,
             Err(err) => {

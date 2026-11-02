@@ -72,8 +72,8 @@ impl Step {
 }
 
 /// Runs one pairing step: wraps `tlv`, sends it and returns the TLV of the reply.
-/// Frames of other types before the reply are skipped. All errors are
-/// returned as [`Error::PairingStep`].
+/// Frames of other types before the reply are skipped. Errors other than
+/// [`Error::Io`] are returned as [`Error::PairingStep`].
 pub(crate) async fn pairing_step<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     conn: &mut Connection,
@@ -108,11 +108,12 @@ pub(crate) async fn pairing_step<S: AsyncRead + AsyncWrite + Unpin>(
         }
     })
     .await;
-    result
-        .unwrap_or(Err(Error::Timeout))
-        .map_err(|e| Error::PairingStep {
+    result.unwrap_or(Err(Error::Timeout)).map_err(|e| match e {
+        Error::Io(_) => e,
+        e => Error::PairingStep {
             step: step.reply(),
             skipped,
             source: Box::new(e),
-        })
+        },
+    })
 }

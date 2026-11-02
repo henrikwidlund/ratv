@@ -1,7 +1,7 @@
 //! End-to-end tests against a fake AirPlay device on localhost.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use ed25519_dalek::SigningKey;
@@ -965,6 +965,26 @@ async fn connection_refused() {
         Client::connect(addr, &credentials(), &options()).await,
         Err(Error::Io(_) | Error::Timeout)
     ));
+}
+
+#[tokio::test]
+async fn stalled_connect_starts_again() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // The first connection gets no answer.
+        let (_silent, _) = listener.accept().await.unwrap();
+        run_device(listener, Arc::default(), Fault::None).await;
+    });
+    let mut options = options();
+    options.stall_timeout = Some(Duration::from_millis(200));
+    let start = Instant::now();
+    Client::connect(addr, &credentials(), &options)
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
 }
 
 /// Companion is refused, so `AppleTv` uses only MRP.

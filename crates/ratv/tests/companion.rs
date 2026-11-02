@@ -1,7 +1,7 @@
 //! End-to-end tests against a fake Apple TV over an in-memory stream.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratv::companion::{
     self, AttentionState, ClientOptions, Event, HidCommand, MediaControlFlags, PairOptions,
@@ -12,6 +12,7 @@ use ratv_companion::message::{Message, MessageType};
 use ratv_companion::{Connection, FrameType, pairing};
 use ratv_hap::accessory::{PairSetupServer, PairVerifyServer, PairedController};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::net::TcpListener;
 
 const DEVICE_ID: &[u8] = b"58:55:CA:00:00:01";
 const DEVICE_LTSK: [u8; 32] = [0x42; 32];
@@ -626,6 +627,54 @@ async fn verify_with_unknown_credentials_fails() {
         "{err}"
     );
     assert!(err.is_auth(), "{err}");
+}
+
+#[tokio::test]
+async fn stalled_connect_starts_again() {
+    let (creds, controller) = pair().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // The first connection gets no answer.
+        let (_silent, _) = listener.accept().await.unwrap();
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        let (mut client_io, device_io) = tokio::io::duplex(8192);
+        tokio::spawn(device_session(device_io, controller, Arc::default()));
+        let _ = tokio::io::copy_bidirectional(&mut tcp, &mut client_io).await;
+    });
+    let mut options = options();
+    options.stall_timeout = Some(Duration::from_millis(200));
+    let start = Instant::now();
+    companion::Client::connect(addr, &creds, &options)
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+}
+
+#[tokio::test]
+async fn stalled_connect_starts_again_only_once() {
+    let (creds, _) = pair().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = tokio::spawn(async move {
+        let mut open = Vec::new();
+        while let Ok(Ok((s, _))) =
+            tokio::time::timeout(Duration::from_secs(1), listener.accept()).await
+        {
+            open.push(s);
+        }
+        open.len()
+    });
+    let mut options = options();
+    options.timeout = Duration::from_millis(300);
+    options.stall_timeout = Some(Duration::from_millis(100));
+    let err = companion::Client::connect(addr, &creds, &options)
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "pair-verify M2: timed out");
+    assert_eq!(accepted.await.unwrap(), 2);
 }
 
 #[tokio::test]

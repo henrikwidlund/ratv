@@ -104,9 +104,13 @@ impl Client {
     ) -> Result<Self, Error> {
         let span = log::session("companion", Some(addr));
         async {
-            tracing::debug!("connecting");
-            let stream = tcp::connect(addr, options.timeout).await?;
-            Self::start(stream, credentials, options, Span::current()).await
+            options
+                .connect_with_retry(|step| async move {
+                    tracing::debug!("connecting");
+                    let stream = tcp::connect(addr, step).await?;
+                    Self::start(stream, credentials, options, step, Span::current()).await
+                })
+                .await
         }
         .instrument(span)
         .await
@@ -122,15 +126,17 @@ impl Client {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let span = log::session("companion", None);
-        Self::start(stream, credentials, options, span.clone())
+        Self::start(stream, credentials, options, options.timeout, span.clone())
             .instrument(span)
             .await
     }
 
+    /// `step` is the time to wait for each connect step.
     async fn start<S>(
         mut stream: S,
         credentials: &Credentials,
         options: &ClientOptions,
+        step: Duration,
         span: Span,
     ) -> Result<Self, Error>
     where
@@ -140,25 +146,9 @@ impl Client {
         let mut buf = Vec::with_capacity(256);
         let mut rng = rng::os();
         let (m1, state) = pair_verify::start(credentials, &mut rng);
-        let m2 = pairing_step(
-            &mut stream,
-            &mut conn,
-            Step::VerifyM1,
-            &m1,
-            &mut buf,
-            options.timeout,
-        )
-        .await?;
+        let m2 = pairing_step(&mut stream, &mut conn, Step::VerifyM1, &m1, &mut buf, step).await?;
         let (m3, state) = state.handle_m2(&m2)?;
-        let m4 = pairing_step(
-            &mut stream,
-            &mut conn,
-            Step::VerifyM3,
-            &m3,
-            &mut buf,
-            options.timeout,
-        )
-        .await?;
+        let m4 = pairing_step(&mut stream, &mut conn, Step::VerifyM3, &m3, &mut buf, step).await?;
         let secret = state.handle_m4(&m4)?;
         conn.enable_encryption(&secret);
         tracing::debug!("pair-verify done");
@@ -199,22 +189,26 @@ impl Client {
         let session = SessionStart { session_id: ours };
         // Sent in this order without waiting for each reply. Replies are matched by xid.
         let touch_area = TouchStart::default();
-        let (info, touch_start, session, tv_remote, text_input, interest) = tokio::join!(
-            client.request(&info),
-            client.request(&touch_area),
-            client.request(&session),
-            client.request(&TvRemoteSessionStart),
-            // Makes the device send keyboard focus events.
-            client.request(&TextInputStart),
-            client.send_event(&Interest {
-                register: &[
-                    event::MEDIA_CONTROL,
-                    event::SYSTEM_STATUS,
-                    event::TV_SYSTEM_STATUS,
-                ],
-                deregister: &[],
-            }),
-        );
+        let (info, touch_start, session, tv_remote, text_input, interest) =
+            tokio::time::timeout(step, async {
+                tokio::join!(
+                    client.request(&info),
+                    client.request(&touch_area),
+                    client.request(&session),
+                    client.request(&TvRemoteSessionStart),
+                    // Makes the device send keyboard focus events.
+                    client.request(&TextInputStart),
+                    client.send_event(&Interest {
+                        register: &[
+                            event::MEDIA_CONTROL,
+                            event::SYSTEM_STATUS,
+                            event::TV_SYSTEM_STATUS,
+                        ],
+                        deregister: &[],
+                    }),
+                )
+            })
+            .await?;
         info?;
         let device = message::session_start_response(&Message::decode(&session?)?)?;
         client.inner.session_id.store(
