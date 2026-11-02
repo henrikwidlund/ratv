@@ -1391,6 +1391,7 @@ mod tests {
                     identifier: Some("a".into()),
                     metadata: Some(ContentItemMetadata {
                         album_name: Some("Album".into()),
+                        genre: Some("Rock".into()),
                         ..Default::default()
                     }),
                     info: Some("info".into()),
@@ -1403,6 +1404,7 @@ mod tests {
         let np = s.now_playing();
         assert_eq!(np.title.as_deref(), Some("Song"));
         assert_eq!(np.album.as_deref(), Some("Album"));
+        assert_eq!(np.genre.as_deref(), Some("Rock"));
     }
 
     #[test]
