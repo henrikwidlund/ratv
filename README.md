@@ -5,8 +5,14 @@ Rust library to control Apple TV devices on the local network.
 Protocols:
 
 - **Companion**: pairing, buttons, apps, power, volume, accounts, text input, touch.
-- **MRP over AirPlay 2**: now playing, artwork, playback, languages, chapters,
+- **MRP over AirPlay 2**: what is playing (title, artist, position, state),
+  artwork, playback, languages, chapters,
   Up Next, volume, output devices, Siri voice input.
+
+The Apple TV app sends some fields in a separate archive, not in the normal
+metadata fields. `NowPlaying` (from `AppleTv::now_playing`) reads them too:
+genre and age rating for movies and shows, and season, episode number and
+episode title for shows.
 
 `AppleTv` connects with both protocols. Each method uses the protocol that
 supports it.
@@ -21,6 +27,8 @@ Linux, macOS and Windows on x64 and arm64, including ARM Linux boards
 No C dependencies.
 
 Minimum Rust version: 1.88.
+
+Tested on an Apple TV 4K (AppleTV6,2) with tvOS 26.6.1.
 
 ## Usage
 
@@ -104,6 +112,31 @@ Audio is kept until the TV records, then sent. With feature `opus`, send
 
 The TV closes an open Companion connection when a new one connects with the
 same credentials. Share one client with `clone()` instead of connecting again.
+
+## Networks
+
+- Discovery and pairing work when the client and the TV are on different
+  subnets or VLANs, if an mDNS reflector forwards the multicast traffic.
+- If multicast is blocked, set `ScanOptions::targets` to the TV's address.
+  The scan then asks the TV directly.
+- `discovery::scan_until` ends the scan when a test returns true, for
+  example when the wanted device has answered. With multicast, `scan` waits
+  for all of `ScanOptions::timeout`.
+- `ClientOptions::stall_timeout` starts a connect again, one time, when a
+  step gets no answer in that time. This helps when packets are lost, for
+  example right after the network comes up.
+
+## App behavior
+
+Apps decide how they handle commands. Check `NowPlaying::supports` before
+you show a control.
+
+- Fast-forward and rewind: Disney+ does not stop when asked, so `AppleTv`
+  skips forward and back instead. HBO Max and Netflix do not list them.
+  Skip works in all three.
+- Playback speed: some apps list `ChangePlaybackRate` without any rates.
+  Apple Podcasts then skips to the next episode instead. Use
+  `NowPlaying::playback_speeds` and send a speed only when it is not empty.
 
 ## Features
 
