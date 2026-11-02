@@ -57,6 +57,25 @@ impl Default for ScanOptions {
 
 /// Scans the network and returns the devices that answered.
 pub async fn scan(options: &ScanOptions) -> Result<Vec<Device>, Error> {
+    run(options, None::<fn(&Device) -> bool>).await
+}
+
+/// Like [`scan`], but ends as soon as `stop` returns true for a device.
+/// Returns all devices found until then.
+///
+/// `stop` sees only services with all records. A service that has not
+/// answered yet is missing, so check the services you need.
+pub async fn scan_until(
+    options: &ScanOptions,
+    stop: impl FnMut(&Device) -> bool,
+) -> Result<Vec<Device>, Error> {
+    run(options, Some(stop)).await
+}
+
+async fn run(
+    options: &ScanOptions,
+    mut stop: Option<impl FnMut(&Device) -> bool>,
+) -> Result<Vec<Device>, Error> {
     let socket = UdpSocket::bind(SocketAddr::new(options.bind, 0)).await?;
     let initial = query(&options.services);
     let start = Instant::now();
@@ -92,6 +111,11 @@ pub async fn scan(options: &ScanOptions) -> Result<Vec<Device>, Error> {
                     continue;
                 }
                 tracing::trace!(%from, len = n, complete = collector.is_complete(), "mDNS response");
+                if let Some(stop) = &mut stop
+                    && collector.complete_devices().iter().any(&mut *stop)
+                {
+                    break;
+                }
                 if unicast {
                     for (done, target) in answered.iter_mut().zip(&options.targets) {
                         *done |= target.ip() == from.ip();
@@ -165,6 +189,48 @@ mod tests {
             devices[0].service(ServiceKind::Companion).unwrap().port,
             49153
         );
+    }
+
+    #[tokio::test]
+    async fn scan_until_ends_early() {
+        let responder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = responder.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let (_, from) = responder.recv_from(&mut buf).await.unwrap();
+                let mut r = Response::new();
+                let inst = "Den._companion-link._tcp.local";
+                r.ptr("_companion-link._tcp.local", inst)
+                    .srv(inst, 49153, "den.local")
+                    .txt(inst, &["rpMRtID=ABC"])
+                    // Never complete, so a plain scan waits for the timeout.
+                    .ptr("_airplay._tcp.local", "Den._airplay._tcp.local");
+                responder.send_to(&r.finish(), from).await.unwrap();
+            }
+        });
+        let options = ScanOptions {
+            timeout: Duration::from_millis(1500),
+            targets: vec![addr],
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ..ScanOptions::default()
+        };
+        let start = Instant::now();
+        let mut seen = 0;
+        let devices = scan_until(&options, |d| {
+            seen += 1;
+            d.identifier() == Some("ABC")
+        })
+        .await
+        .unwrap();
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert_eq!(seen, 1);
+        assert_eq!(devices.len(), 1);
+
+        let start = Instant::now();
+        let devices = scan_until(&options, |_| false).await.unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(1500));
+        assert_eq!(devices.len(), 1);
     }
 
     #[test]

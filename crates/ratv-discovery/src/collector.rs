@@ -258,14 +258,33 @@ impl Collector {
         })
     }
 
-    /// Returns all devices with at least one complete service.
+    /// Returns all devices with at least one service that has a SRV record.
     #[must_use]
     pub fn devices(&self) -> Vec<Device> {
+        self.build(|_| true)
+    }
+
+    /// Like [`devices`](Self::devices), but uses only services with all
+    /// records: SRV, TXT and an address.
+    #[must_use]
+    pub fn complete_devices(&self) -> Vec<Device> {
+        self.build(|inst| {
+            inst.txt.is_some()
+                && inst.srv.as_ref().is_some_and(|(_, host)| {
+                    inst.source.is_some() || self.addresses.contains_key(host)
+                })
+        })
+    }
+
+    fn build(&self, include: impl Fn(&Instance) -> bool) -> Vec<Device> {
         let mut devices: Vec<Device> = Vec::new();
         let mut keys: Vec<&String> = self.instances.keys().collect();
         keys.sort();
         for key in keys {
             let inst = &self.instances[key];
+            if !include(inst) {
+                continue;
+            }
             let (Some((port, host)), Some((kind, label))) =
                 (&inst.srv, ServiceKind::split(&inst.name))
             else {
@@ -427,6 +446,7 @@ mod tests {
         let q = c.follow_up_query().unwrap();
         assert_eq!(q[4..6], [0, 1]);
         assert_eq!(c.devices()[0].addresses.len(), 0);
+        assert_eq!(c.complete_devices(), []);
         assert!(!c.is_complete());
 
         let mut r = Response::new();
@@ -434,6 +454,7 @@ mod tests {
         c.add(&r.finish(), None).unwrap();
         assert!(c.follow_up_query().is_none());
         assert!(c.is_complete());
+        assert_eq!(c.complete_devices(), c.devices());
     }
 
     #[test]
