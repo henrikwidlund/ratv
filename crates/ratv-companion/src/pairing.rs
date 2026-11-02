@@ -7,7 +7,10 @@ use std::borrow::Cow;
 
 use ratv_codec::opack::{self, Encoder, Value};
 
-use crate::{Error, FrameType};
+use crate::{Error, Frame, FrameType};
+
+/// Payload bytes shown in [`Error::PairingReply`].
+const REPLY_HEAD: usize = 64;
 
 /// Pairing flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +59,18 @@ pub fn decode(payload: &[u8]) -> Result<Cow<'_, [u8]>, Error> {
             _ => None,
         })
         .ok_or(Error::InvalidField("_pd"))
+}
+
+/// Extracts the pairing TLV8 from a reply frame. On error, the frame type,
+/// length and first bytes are in [`Error::PairingReply`].
+pub fn decode_reply(frame: &Frame) -> Result<Cow<'_, [u8]>, Error> {
+    let payload = &frame.payload;
+    decode(payload).map_err(|e| Error::PairingReply {
+        ty: frame.ty.0,
+        len: payload.len(),
+        head: payload[..payload.len().min(REPLY_HEAD)].to_vec(),
+        source: Box::new(e),
+    })
 }
 
 /// Device information sent to the Apple TV during pair-setup (M5).
@@ -127,6 +142,40 @@ mod tests {
         });
         assert!(matches!(decode(&out), Err(Error::InvalidField("_pd"))));
         assert!(matches!(decode(&[0x00]), Err(Error::Opack(_))));
+    }
+
+    #[test]
+    fn decode_reply_shows_frame() {
+        let frame = Frame {
+            ty: FrameType::PAIR_SETUP_NEXT,
+            payload: vec![0xE1; 100].into(),
+        };
+        let err = decode_reply(&frame).unwrap_err();
+        let Error::PairingReply { ty, len, head, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!((*ty, *len, head.len()), (4, 100, 64));
+        let text = err.to_string();
+        assert!(text.contains("frame type 4, 100 bytes"), "{text}");
+        assert!(text.ends_with(&"e1".repeat(64)), "{text}");
+
+        let empty = Frame {
+            ty: FrameType::PAIR_SETUP_NEXT,
+            payload: bytes::Bytes::new(),
+        };
+        let text = decode_reply(&empty).unwrap_err().to_string();
+        assert!(text.contains("unexpected end of input"), "{text}");
+        assert!(text.ends_with("0 bytes, starts with "), "{text}");
+
+        let ok = Frame {
+            ty: FrameType::PAIR_SETUP_NEXT,
+            payload: {
+                let mut out = Vec::new();
+                encode(Flow::Setup, &[6, 1, 2], &mut out);
+                out.into()
+            },
+        };
+        assert_eq!(&*decode_reply(&ok).unwrap(), &[6, 1, 2]);
     }
 
     #[test]

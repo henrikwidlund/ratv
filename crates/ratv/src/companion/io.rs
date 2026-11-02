@@ -1,4 +1,4 @@
-use ratv_companion::{Connection, Frame, FrameType};
+use ratv_companion::{Connection, Frame};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use crate::Error;
@@ -31,19 +31,8 @@ pub(crate) async fn read_frame<S: AsyncRead + Unpin>(
     }
 }
 
-/// Sends a frame and waits for the next frame.
-pub(crate) async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut S,
-    conn: &mut Connection,
-    ty: FrameType,
-    payload: &[u8],
-) -> Result<Frame, Error> {
-    conn.send(ty, payload);
-    flush(stream, conn).await?;
-    read_frame(stream, conn).await
-}
-
 /// Runs one pairing step: wraps `tlv`, sends it and returns the TLV of the reply.
+/// Frames of other types before the reply are skipped.
 pub(crate) async fn pairing_step<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     conn: &mut Connection,
@@ -54,6 +43,18 @@ pub(crate) async fn pairing_step<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<Vec<u8>, Error> {
     buf.clear();
     ratv_companion::pairing::encode(flow, tlv, buf);
-    let frame = exchange(stream, conn, flow.frame_type(first), buf).await?;
-    Ok(ratv_companion::pairing::decode(&frame.payload)?.into_owned())
+    conn.send(flow.frame_type(first), buf);
+    flush(stream, conn).await?;
+    let reply = flow.frame_type(false);
+    loop {
+        let frame = read_frame(stream, conn).await?;
+        if frame.ty == reply {
+            return Ok(ratv_companion::pairing::decode_reply(&frame)?.into_owned());
+        }
+        tracing::warn!(
+            ty = frame.ty.0,
+            len = frame.payload.len(),
+            "skipped frame while waiting for pairing reply"
+        );
+    }
 }

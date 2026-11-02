@@ -104,7 +104,12 @@ fn pair_reply(tlv: &[u8]) -> Vec<u8> {
 }
 
 /// Fake device side of pair-setup. Returns the paired controller.
-async fn device_pair_setup(mut s: DuplexStream) -> PairedController {
+async fn device_pair_setup(s: DuplexStream) -> PairedController {
+    device_pair_setup_with_noise(s, false).await
+}
+
+/// Like [`device_pair_setup`]. With `noise`, sends other frames before each reply.
+async fn device_pair_setup_with_noise(mut s: DuplexStream, noise: bool) -> PairedController {
     let mut conn = Connection::new();
     let mut server = PairSetupServer::new(DEVICE_ID, &DEVICE_LTSK, PIN, [9; 16], &[0x77; 32]);
     while server.controller().is_none() {
@@ -113,6 +118,10 @@ async fn device_pair_setup(mut s: DuplexStream) -> PairedController {
         };
         let tlv = pairing::decode(&frame.payload).unwrap();
         let reply = server.handle(&tlv).unwrap();
+        if noise {
+            send(&mut s, &mut conn, FrameType::NO_OP, &[]).await;
+            send(&mut s, &mut conn, FrameType::U_OPACK, &[0xE0]).await;
+        }
         send(
             &mut s,
             &mut conn,
@@ -350,6 +359,35 @@ async fn pairing_creates_credentials() {
             .parse::<Credentials>()
             .unwrap(),
         creds
+    );
+}
+
+#[tokio::test]
+async fn pairing_skips_other_frames() {
+    let (client, device) = tokio::io::duplex(8192);
+    let device = tokio::spawn(device_pair_setup_with_noise(device, true));
+    let prompt = companion::pair_stream(client, &PairOptions::default())
+        .await
+        .unwrap();
+    let creds = prompt.finish(PIN).await.unwrap();
+    assert_eq!(creds.client_id(), device.await.unwrap().id);
+}
+
+#[tokio::test]
+async fn invalid_pairing_reply_shows_frame() {
+    let (client, mut device) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let mut conn = Connection::new();
+        read_frame(&mut device, &mut conn).await.unwrap();
+        send(&mut device, &mut conn, FrameType::PAIR_SETUP_NEXT, &[]).await;
+        read_frame(&mut device, &mut conn).await;
+    });
+    let err = companion::pair_stream(client, &PairOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "invalid pairing reply (unexpected end of input): frame type 4, 0 bytes, starts with "
     );
 }
 
