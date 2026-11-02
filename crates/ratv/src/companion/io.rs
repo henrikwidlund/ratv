@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use ratv_companion::pairing::Flow;
-use ratv_companion::{Connection, Frame};
+use ratv_companion::{Connection, Frame, FrameType};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 use crate::Error;
@@ -95,13 +95,15 @@ pub(crate) async fn pairing_step<S: AsyncRead + AsyncWrite + Unpin>(
             if frame.ty == reply {
                 return Ok(ratv_companion::pairing::decode_reply(&frame)?.into_owned());
             }
-            tracing::warn!(
-                ty = frame.ty.0,
-                len = frame.payload.len(),
-                "skipped frame while waiting for pairing reply"
-            );
+            let (ty, len) = (frame.ty.0, frame.payload.len());
+            // The device sends NO_OP before each reply to clients on another subnet.
+            if frame.ty == FrameType::NO_OP {
+                tracing::debug!(ty, len, "skipped frame while waiting for pairing reply");
+            } else {
+                tracing::warn!(ty, len, "skipped frame while waiting for pairing reply");
+            }
             if skipped.len() < MAX_SKIPPED {
-                skipped.push((frame.ty.0, frame.payload.len()));
+                skipped.push((ty, len));
             }
         }
     })
