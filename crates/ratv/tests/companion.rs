@@ -678,7 +678,7 @@ async fn stalled_connect_starts_again_only_once() {
 }
 
 #[tokio::test]
-async fn hold_released_when_cancelled() {
+async fn hold_released_when_canceled() {
     let (creds, controller) = pair().await;
     let log = Arc::new(Mutex::new(Log::default()));
     let (client_io, device_io) = tokio::io::duplex(8192);
@@ -714,7 +714,7 @@ async fn double_tap_sends_two_clicks() {
 }
 
 #[tokio::test]
-async fn swipe_lifted_when_cancelled() {
+async fn swipe_lifted_when_canceled() {
     let (creds, controller) = pair().await;
     let log = Arc::new(Mutex::new(Log::default()));
     let (client_io, device_io) = tokio::io::duplex(8192);

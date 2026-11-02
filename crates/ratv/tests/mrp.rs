@@ -1143,7 +1143,7 @@ async fn pairing_with_wrong_pin_fails() {
 }
 
 #[tokio::test]
-async fn hold_released_when_cancelled() {
+async fn hold_released_when_canceled() {
     let device = start_device().await;
     let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
     let client = Client::connect(addr, &credentials(), &options())
