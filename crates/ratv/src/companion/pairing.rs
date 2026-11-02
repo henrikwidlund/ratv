@@ -1,14 +1,14 @@
 use std::net::SocketAddr;
 
 use ratv_companion::Connection;
-use ratv_companion::pairing::{ClientInfo, Flow};
+use ratv_companion::pairing::ClientInfo;
 use ratv_hap::Credentials;
 use ratv_hap::pair_setup::{self, ClientIdentity, NeedPin};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::{Instrument, Span};
 
-use super::io::pairing_step;
+use super::io::{Step, pairing_step};
 use crate::{Error, PairOptions, log, rng, tcp};
 
 /// The device shows a PIN. Call [`PinPrompt::finish`] with it.
@@ -56,11 +56,15 @@ where
     let mut conn = Connection::new();
     let mut buf = Vec::with_capacity(512);
     let (m1, state) = pair_setup::start(false);
-    let m2 = tokio::time::timeout(
+    let m2 = pairing_step(
+        &mut stream,
+        &mut conn,
+        Step::SetupM1,
+        &m1,
+        &mut buf,
         options.timeout,
-        pairing_step(&mut stream, &mut conn, Flow::Setup, true, &m1, &mut buf),
     )
-    .await??;
+    .await?;
     let state = state.handle_m2(&m2)?;
     tracing::debug!("waiting for PIN");
     Ok(PinPrompt {
@@ -84,18 +88,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PinPrompt<S> {
         let mut rng = rng::os();
         let mut buf = Vec::with_capacity(1024);
         let (m3, state) = self.state.submit_pin(pin, &mut rng)?;
-        let m4 = tokio::time::timeout(
+        let m4 = pairing_step(
+            &mut self.stream,
+            &mut self.conn,
+            Step::SetupM3,
+            &m3,
+            &mut buf,
             self.options.timeout,
-            pairing_step(
-                &mut self.stream,
-                &mut self.conn,
-                Flow::Setup,
-                false,
-                &m3,
-                &mut buf,
-            ),
         )
-        .await??;
+        .await?;
         let verified = state.handle_m4(&m4)?;
         tracing::debug!("PIN accepted");
 
@@ -112,18 +113,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PinPrompt<S> {
             metadata: Some(&metadata),
         };
         let (m5, state) = verified.exchange(identity, &mut rng);
-        let m6 = tokio::time::timeout(
+        let m6 = pairing_step(
+            &mut self.stream,
+            &mut self.conn,
+            Step::SetupM5,
+            &m5,
+            &mut buf,
             self.options.timeout,
-            pairing_step(
-                &mut self.stream,
-                &mut self.conn,
-                Flow::Setup,
-                false,
-                &m5,
-                &mut buf,
-            ),
         )
-        .await??;
+        .await?;
         let credentials = state.handle_m6(&m6)?;
         tracing::debug!("paired");
         Ok(credentials)

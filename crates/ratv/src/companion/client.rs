@@ -10,7 +10,6 @@ use ratv_companion::message::{
     Outgoing, SessionStart, SessionStop, SwitchAccount, SystemInfo, TextInputStart, TextInputStop,
     Touch, TouchPhase, TouchStart, TvRemoteSessionStart, event,
 };
-use ratv_companion::pairing::Flow;
 use ratv_companion::text_input::{self, TextInputCommand, TextSession};
 use ratv_companion::{Connection, FrameType};
 use ratv_hap::{Credentials, pair_verify};
@@ -19,7 +18,7 @@ use tokio::sync::{Notify, broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
 
-use super::io::{flush, pairing_step};
+use super::io::{Step, flush, pairing_step};
 use crate::ClientOptions;
 use crate::link::{Link, LinkTx};
 use crate::{Error, log, rng, tcp, touch};
@@ -141,17 +140,25 @@ impl Client {
         let mut buf = Vec::with_capacity(256);
         let mut rng = rng::os();
         let (m1, state) = pair_verify::start(credentials, &mut rng);
-        let m2 = tokio::time::timeout(
+        let m2 = pairing_step(
+            &mut stream,
+            &mut conn,
+            Step::VerifyM1,
+            &m1,
+            &mut buf,
             options.timeout,
-            pairing_step(&mut stream, &mut conn, Flow::Verify, true, &m1, &mut buf),
         )
-        .await??;
+        .await?;
         let (m3, state) = state.handle_m2(&m2)?;
-        let m4 = tokio::time::timeout(
+        let m4 = pairing_step(
+            &mut stream,
+            &mut conn,
+            Step::VerifyM3,
+            &m3,
+            &mut buf,
             options.timeout,
-            pairing_step(&mut stream, &mut conn, Flow::Verify, false, &m3, &mut buf),
         )
-        .await??;
+        .await?;
         let secret = state.handle_m4(&m4)?;
         conn.enable_encryption(&secret);
         tracing::debug!("pair-verify done");

@@ -68,6 +68,36 @@ pub enum Error {
     /// Device sent something unexpected.
     #[error("protocol error: {0}")]
     Protocol(&'static str),
+    /// A Companion pairing step failed while waiting for the reply.
+    #[cfg(feature = "companion")]
+    #[error("{step}: {source}{}", Skipped(.skipped))]
+    PairingStep {
+        /// The reply we waited for, for example `pair-setup M2`.
+        step: &'static str,
+        /// Type and payload length of the first frames skipped while waiting.
+        skipped: Vec<(u8, usize)>,
+        /// The cause.
+        source: Box<Self>,
+    },
+}
+
+/// Shows skipped frames, or nothing if there are none.
+#[cfg(feature = "companion")]
+struct Skipped<'a>(&'a [(u8, usize)]);
+
+#[cfg(feature = "companion")]
+impl core::fmt::Display for Skipped<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (i, (ty, len)) in self.0.iter().enumerate() {
+            let sep = if i == 0 { " (skipped frames: " } else { "; " };
+            write!(f, "{sep}type {ty}, {len} bytes")?;
+        }
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            f.write_str(")")
+        }
+    }
 }
 
 impl From<tokio::time::error::Elapsed> for Error {

@@ -387,8 +387,40 @@ async fn invalid_pairing_reply_shows_frame() {
         .unwrap_err();
     assert_eq!(
         err.to_string(),
-        "invalid pairing reply (unexpected end of input): frame type 4, 0 bytes, starts with "
+        "pair-setup M2: invalid pairing reply (unexpected end of input): frame type 4, 0 bytes, starts with "
     );
+}
+
+#[tokio::test]
+async fn pairing_close_shows_skipped_frames() {
+    let (client, mut device) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let mut conn = Connection::new();
+        read_frame(&mut device, &mut conn).await.unwrap();
+        send(&mut device, &mut conn, FrameType::NO_OP, &[]).await;
+        send(&mut device, &mut conn, FrameType::U_OPACK, &[0xE0]).await;
+    });
+    let err = companion::pair_stream(client, &PairOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "pair-setup M2: connection closed (skipped frames: type 1, 0 bytes; type 7, 1 bytes)"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pairing_timeout_names_step() {
+    let (client, mut device) = tokio::io::duplex(8192);
+    tokio::spawn(async move {
+        let mut conn = Connection::new();
+        read_frame(&mut device, &mut conn).await.unwrap();
+        read_frame(&mut device, &mut conn).await;
+    });
+    let err = companion::pair_stream(client, &PairOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "pair-setup M2: timed out");
 }
 
 #[tokio::test]
