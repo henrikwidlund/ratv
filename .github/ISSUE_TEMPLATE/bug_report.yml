@@ -1,0 +1,81 @@
+name: Bug report
+description: Report a problem
+title: "Bug: "
+labels: [bug]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the existing issues first to see if the bug is already reported.
+        If you have more information about an existing bug, add a comment. Do not open a new issue.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What is the bug?
+    validations:
+      required: true
+  - type: textarea
+    id: steps_to_reproduce
+    attributes:
+      label: How to reproduce
+      description: A minimal code example, or steps with one of the examples in `crates/ratv/examples`.
+      placeholder: |
+        1. ...
+        2. ...
+        3. See error
+    validations:
+      required: true
+  - type: dropdown
+    id: consistent
+    attributes:
+      label: Is the issue consistent?
+      description: Does it happen every time you follow the steps, or only sometimes?
+      options:
+        - "Always"
+        - "Sometimes"
+    validations:
+      required: false
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: input
+    id: ratv_version
+    attributes:
+      label: ratv version
+      description: The crate version, or the git commit if you use a git dependency.
+      placeholder: ex. 0.1.0 or 818b5d2
+    validations:
+      required: true
+  - type: input
+    id: appletv_model
+    attributes:
+      label: Apple TV model and tvOS version
+      placeholder: Apple TV 4K (3rd generation), tvOS 26.6
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: Linux aarch64
+    validations:
+      required: false
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context and logs
+      description: |
+        Add any other context about the problem. Attach debug logs from when the issue happens.
+        The library logs with `tracing`. With `tracing-subscriber`, set `RUST_LOG=ratv=debug`.
+        Use `RUST_LOG=ratv=trace` to also log each message.
+        The logs do not contain credentials, keys or PINs. Do not enable the `sensitive-logs` feature for logs you share.
+
+        Tip: Click this area and drag in images or log files.
+    validations:
+      required: true
