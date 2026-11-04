@@ -562,7 +562,7 @@ impl Client {
             armed: true,
         };
         self.touch(x, y, TouchPhase::Press).await?;
-        tokio::time::sleep(touch::STEP).await;
+        tokio::time::sleep(touch::TAP_HOLD).await;
         down.armed = false;
         self.touch(x, y, TouchPhase::Release).await
     }

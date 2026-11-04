@@ -489,7 +489,9 @@ async fn session_commands() {
         .swipe((0.8, 0.5), (0.2, 0.5), Duration::from_millis(48))
         .await
         .unwrap();
+    let start = Instant::now();
     client.tap(0.25, 0.75).await.unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(100));
 
     match client.launch_app("missing").await.unwrap_err() {
         Error::Companion(ratv_companion::Error::Device { code, message, .. }) => {

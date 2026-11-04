@@ -7,6 +7,9 @@ use crate::Error;
 /// Time between touch events of a swipe.
 pub(crate) const STEP: Duration = Duration::from_millis(16);
 
+/// Time between press and release of a tap. Some apps ignore shorter taps.
+pub(crate) const TAP_HOLD: Duration = Duration::from_millis(100);
+
 /// Phase of a swipe event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
