@@ -8,6 +8,12 @@ use crate::frame::{Frame, FrameType, HEADER_LEN, header};
 /// Default limit for a single received frame.
 pub const DEFAULT_MAX_FRAME_LEN: usize = 1 << 20;
 
+/// Largest frame payload the 3-byte length field can hold.
+const FRAME_LEN_LIMIT: usize = 0xFF_FFFF;
+
+/// Largest message that fits in one encrypted frame.
+pub const MAX_MESSAGE_LEN: usize = FRAME_LEN_LIMIT - TAG_LEN;
+
 const WRITE_INFO: &[u8] = b"ClientEncrypt-main";
 const READ_INFO: &[u8] = b"ServerEncrypt-main";
 
@@ -44,7 +50,7 @@ impl Connection {
             rx: BytesMut::with_capacity(4096),
             tx: BytesMut::with_capacity(1024),
             cipher: None,
-            max_frame_len: max_frame_len.min(0xFF_FFFF),
+            max_frame_len: max_frame_len.min(FRAME_LEN_LIMIT),
         }
     }
 
@@ -111,6 +117,7 @@ impl Connection {
     }
 
     /// Queues a frame for sending, encrypting it when encryption is on.
+    /// `payload` must not be longer than [`MAX_MESSAGE_LEN`].
     pub fn send(&mut self, ty: FrameType, payload: &[u8]) {
         let tag_len = if self.cipher.is_some() { TAG_LEN } else { 0 };
         let hdr = header(ty, payload.len() + tag_len);

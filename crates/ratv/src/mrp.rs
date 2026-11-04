@@ -49,7 +49,7 @@ use ratv_hap::pair_setup::{self, ClientIdentity, NeedPin};
 use tokio::net::TcpStream;
 
 use crate::airplay::{self, Connections, Identity, READ_CHUNK};
-use crate::link::{Link, LinkTx};
+use crate::link::{CloseGuard, Link, LinkTx};
 pub use crate::{ClientOptions, PairOptions};
 use crate::{Credentials, Error, log, rng, tcp};
 
@@ -668,17 +668,20 @@ impl Client {
     }
 
     /// Sends a button down or up event.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn button(&self, button: Button, down: bool) -> Result<(), Error> {
         self.send(&button.event(down)).await
     }
 
     /// Presses and releases a button.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn press(&self, button: Button) -> Result<(), Error> {
         self.button(button, true).await?;
         self.button(button, false).await
     }
 
     /// Presses and releases a button two times fast.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn double_tap(&self, button: Button) -> Result<(), Error> {
         self.press(button).await?;
         self.press(button).await
@@ -686,6 +689,7 @@ impl Client {
 
     /// Holds a button for `duration`. The button is released also if the
     /// returned future is dropped.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn hold(&self, button: Button, duration: Duration) -> Result<(), Error> {
         let mut held = Held {
             client: self,
@@ -757,6 +761,7 @@ impl Client {
 
     /// Sets the volume of the device, 0.0 to 1.0. Fails with
     /// [`Error::VolumeNotAvailable`] if [`Volume::available`] is false.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
         let volume = crate::volume_level(volume)?;
         self.check_volume()?;
@@ -774,6 +779,7 @@ impl Client {
 
     /// Mutes or unmutes the device. Fails with [`Error::VolumeNotAvailable`]
     /// if [`Volume::available`] is false.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn set_muted(&self, muted: bool) -> Result<(), Error> {
         self.check_volume()?;
         self.send(&messages::set_volume_muted(muted, self.output_uid()?))
@@ -833,6 +839,7 @@ impl Client {
     }
 
     /// Sets the volume, 0.0 to 1.0, of one output device. UIDs are in [`Volume::outputs`].
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn set_output_volume(&self, uid: &str, volume: f32) -> Result<(), Error> {
         let volume = crate::volume_level(volume)?;
         self.send(&messages::set_volume(volume, uid)).await
@@ -840,16 +847,19 @@ impl Client {
 
     /// Adds AirPlay output devices, for example `HomePods`, to the group.
     /// The new list arrives in [`Volume::outputs`].
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn add_outputs(&self, uids: &[&str]) -> Result<(), Error> {
         self.send(&messages::add_output_devices(uids)).await
     }
 
     /// Removes AirPlay output devices from the group.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn remove_outputs(&self, uids: &[&str]) -> Result<(), Error> {
         self.send(&messages::remove_output_devices(uids)).await
     }
 
     /// Replaces the output devices of the group.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn set_outputs(&self, uids: &[&str]) -> Result<(), Error> {
         self.send(&messages::set_output_devices(uids)).await
     }
@@ -1023,7 +1033,13 @@ async fn run(
     messages: broadcast::Sender<Envelope>,
     state: State,
 ) {
-    let reason = match run_inner(conns, &shared, &messages, state).await {
+    // Waiting requests fail and `close` returns right away.
+    let mut guard = CloseGuard::new(link, || {
+        let mut out = shared.outbox();
+        out.pending.clear();
+        out.close = None;
+    });
+    guard.reason = match run_inner(conns, &shared, &messages, state).await {
         Ok(()) => {
             tracing::debug!("connection closed");
             None
@@ -1033,11 +1049,6 @@ async fn run(
             Some(Arc::new(err))
         }
     };
-    link.close(reason);
-    // Waiting requests fail and `close` returns right away.
-    let mut out = shared.outbox();
-    out.pending.clear();
-    out.close = None;
 }
 
 async fn run_inner(

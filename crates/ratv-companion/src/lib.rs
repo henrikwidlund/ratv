@@ -16,6 +16,6 @@ pub mod message;
 pub mod pairing;
 pub mod text_input;
 
-pub use connection::{Connection, DEFAULT_MAX_FRAME_LEN};
+pub use connection::{Connection, DEFAULT_MAX_FRAME_LEN, MAX_MESSAGE_LEN};
 pub use error::Error;
 pub use frame::{Frame, FrameType, HEADER_LEN};

@@ -20,7 +20,7 @@ use tracing::{Instrument, Span};
 
 use super::io::{Step, flush, pairing_step};
 use crate::ClientOptions;
-use crate::link::{Link, LinkTx};
+use crate::link::{CloseGuard, Link, LinkTx};
 use crate::{Error, log, rng, tcp, touch};
 
 const EVENT_CAPACITY: usize = 32;
@@ -307,7 +307,12 @@ impl Client {
             let start = out.buf.len();
             out.buf.extend_from_slice(&[0; 4]);
             message::encode(msg, xid, &mut out.buf);
-            let len = u32::try_from(out.buf.len() - start - 4).unwrap_or(u32::MAX);
+            let len = out.buf.len() - start - 4;
+            if len > ratv_companion::MAX_MESSAGE_LEN {
+                out.buf.truncate(start);
+                return Err(ratv_companion::Error::FrameTooLarge(len).into());
+            }
+            let len = u32::try_from(len).unwrap_or(u32::MAX);
             out.buf[start..start + 4].copy_from_slice(&len.to_le_bytes());
             if let Some(reply) = reply {
                 out.pending.retain(|(_, tx)| !tx.is_closed());
@@ -508,6 +513,7 @@ impl Client {
     }
 
     /// Sends a touch event. `x` and `y` range from 0.0 to 1.0.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn touch(&self, x: f64, y: f64, phase: TouchPhase) -> Result<(), Error> {
         self.send_event(&self.touch_event(x, y, phase)).await
     }
@@ -529,6 +535,7 @@ impl Client {
 
     /// Swipes from `from` to `to` in about `duration`. Coordinates range from 0.0 to 1.0.
     /// The finger is lifted also if the returned future is dropped.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn swipe(
         &self,
         from: (f64, f64),
@@ -555,6 +562,7 @@ impl Client {
 
     /// Taps at `x`, `y` without a click. Coordinates range from 0.0 to 1.0.
     /// The finger is lifted also if the returned future is dropped.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn tap(&self, x: f64, y: f64) -> Result<(), Error> {
         let mut down = Touching {
             client: self,
@@ -650,6 +658,8 @@ async fn run<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Waiting requests fail right away.
+    let mut guard = CloseGuard::new(link, || shared.outbox().pending.clear());
     // Swapped with the outbox buffer, so both keep their capacity.
     let mut batch = Vec::new();
     let result: Result<(), Error> = async {
@@ -689,7 +699,7 @@ async fn run<S>(
         }
     }
     .await;
-    let reason = match result {
+    guard.reason = match result {
         Ok(()) => {
             tracing::debug!("connection closed");
             None
@@ -699,9 +709,7 @@ async fn run<S>(
             Some(Arc::new(err))
         }
     };
-    link.close(reason);
-    // Waiting requests fail right away.
-    shared.outbox().pending.clear();
+    drop(guard);
     let _ = stream.shutdown().await;
 }
 

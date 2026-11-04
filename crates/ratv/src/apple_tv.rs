@@ -27,6 +27,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::net::TcpStream;
@@ -219,6 +220,25 @@ impl Support {
     }
 }
 
+/// What the last `begin_*` call did, per direction (rewind, fast forward).
+#[derive(Debug, Default)]
+struct Scrubs([AtomicU8; 2]);
+
+impl Scrubs {
+    const UNKNOWN: u8 = 0;
+    const SKIPPED: u8 = 1;
+    const STARTED: u8 = 2;
+
+    fn set(&self, forward: bool, state: u8) {
+        self.0[usize::from(forward)].store(state, Ordering::Relaxed);
+    }
+
+    /// Returns the state and sets it back to unknown.
+    fn take(&self, forward: bool) -> u8 {
+        self.0[usize::from(forward)].swap(Self::UNKNOWN, Ordering::Relaxed)
+    }
+}
+
 /// A connected Apple TV.
 ///
 /// Clones share the connections. If one protocol closes, calls that the
@@ -232,6 +252,7 @@ pub struct AppleTv {
     companion: Option<companion::Client>,
     mrp: Option<mrp::Client>,
     connected_at: Instant,
+    scrubs: Arc<Scrubs>,
 }
 
 impl AppleTv {
@@ -262,6 +283,7 @@ impl AppleTv {
             companion: keep("Companion", companion, &mut first_error),
             mrp: keep("MRP", mrp, &mut first_error),
             connected_at: Instant::now(),
+            scrubs: Arc::default(),
         };
         if tv.companion.is_none() && tv.mrp.is_none() {
             return Err(first_error.unwrap_or(Error::NoEndpoints));
@@ -350,6 +372,7 @@ impl AppleTv {
     }
 
     /// Presses and releases a key.
+    /// Over MRP the device does not answer, so `Ok` only means that the message was sent.
     pub async fn press(&self, key: Key) -> Result<(), Error> {
         match self.key_route(key)? {
             Route::Companion(c, hid) => c.press(hid).await,
@@ -358,6 +381,7 @@ impl AppleTv {
     }
 
     /// Presses and releases a key two times fast.
+    /// Over MRP the device does not answer, so `Ok` only means that the message was sent.
     pub async fn double_tap(&self, key: Key) -> Result<(), Error> {
         match self.key_route(key)? {
             Route::Companion(c, hid) => c.double_tap(hid).await,
@@ -382,6 +406,7 @@ impl AppleTv {
 
     /// Holds a key for `duration`. The key is released also if the
     /// returned future is dropped.
+    /// Over MRP the device does not answer, so `Ok` only means that the message was sent.
     pub async fn hold(&self, key: Key, duration: Duration) -> Result<(), Error> {
         match self.key_route(key)? {
             Route::Companion(c, hid) => c.hold(hid, duration).await,
@@ -390,6 +415,7 @@ impl AppleTv {
     }
 
     /// Sends a key down or up event.
+    /// Over MRP the device does not answer, so `Ok` only means that the message was sent.
     pub async fn key(&self, key: Key, down: bool) -> Result<(), Error> {
         match self.key_route(key)? {
             Route::Companion(c, hid) => {
@@ -659,6 +685,7 @@ impl AppleTv {
     ) -> Result<(), Error> {
         self.wait_for_state().await;
         if let Some(s) = self.skip_instead(begin, forward) {
+            self.scrubs.set(forward, Scrubs::SKIPPED);
             return self.skip(s).await;
         }
         let result = self.playback(begin, begin, Some(fallback)).await;
@@ -666,12 +693,20 @@ impl AppleTv {
         if is_unsupported(&result)
             && let Some(s) = self.skip_instead(begin, forward)
         {
+            self.scrubs.set(forward, Scrubs::SKIPPED);
             return self.skip(s).await;
         }
+        let state = if result.is_ok() {
+            Scrubs::STARTED
+        } else {
+            Scrubs::UNKNOWN
+        };
+        self.scrubs.set(forward, state);
         result
     }
 
-    /// Checks `begin`, so begin and end use the same way.
+    /// Does the opposite of the last begin. If it is not known, checks `begin`
+    /// again.
     async fn end_scrub(
         &self,
         begin: Command,
@@ -679,9 +714,15 @@ impl AppleTv {
         fallback: MediaControl,
         forward: bool,
     ) -> Result<(), Error> {
-        self.wait_for_state().await;
-        if self.skip_instead(begin, forward).is_some() {
-            return Ok(());
+        match self.scrubs.take(forward) {
+            Scrubs::SKIPPED => return Ok(()),
+            Scrubs::STARTED => {}
+            _ => {
+                self.wait_for_state().await;
+                if self.skip_instead(begin, forward).is_some() {
+                    return Ok(());
+                }
+            }
         }
         self.playback(begin, end, Some(fallback)).await
     }
@@ -778,6 +819,7 @@ impl AppleTv {
 
     /// Sets the volume, 0.0 to 1.0. Fails with [`Error::VolumeNotAvailable`] if MRP
     /// reports that the device cannot change it.
+    /// Over MRP the device does not answer, so `Ok` only means that the message was sent.
     pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
         self.check_volume().await?;
         match self
@@ -812,6 +854,7 @@ impl AppleTv {
 
     /// Mutes or unmutes the device. Needs MRP. Fails with [`Error::VolumeNotAvailable`]
     /// if the device cannot change the volume.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn set_muted(&self, muted: bool) -> Result<(), Error> {
         self.check_volume().await?;
         self.need_mrp()?.set_muted(muted).await
@@ -870,6 +913,7 @@ impl AppleTv {
 
     /// Swipes from `from` to `to` in about `duration`. Coordinates range from 0.0 to 1.0.
     /// Needs Companion.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn swipe(
         &self,
         from: (f64, f64),
@@ -880,6 +924,7 @@ impl AppleTv {
     }
 
     /// Taps at `x`, `y` without a click. Coordinates range from 0.0 to 1.0. Needs Companion.
+    /// The device does not answer, so `Ok` only means that the message was sent.
     pub async fn tap(&self, x: f64, y: f64) -> Result<(), Error> {
         self.need_companion()?.tap(x, y).await
     }
@@ -976,6 +1021,16 @@ fn keep<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrubs_are_kept_per_direction_until_taken() {
+        let scrubs = Scrubs::default();
+        scrubs.set(true, Scrubs::STARTED);
+        scrubs.set(false, Scrubs::SKIPPED);
+        assert_eq!(scrubs.take(true), Scrubs::STARTED);
+        assert_eq!(scrubs.take(true), Scrubs::UNKNOWN);
+        assert_eq!(scrubs.take(false), Scrubs::SKIPPED);
+    }
 
     #[test]
     fn key_mapping() {

@@ -716,6 +716,26 @@ async fn double_tap_sends_two_clicks() {
 }
 
 #[tokio::test]
+async fn too_large_message_fails_and_connection_stays() {
+    let (creds, controller) = pair().await;
+    let log = Arc::new(Mutex::new(Log::default()));
+    let (client_io, device_io) = tokio::io::duplex(8192);
+    tokio::spawn(device_session(device_io, controller, log.clone()));
+    let client = companion::Client::connect_stream(client_io, &creds, &options())
+        .await
+        .unwrap();
+    let url = "a".repeat(ratv_companion::MAX_MESSAGE_LEN);
+    match client.open_url(&url).await.unwrap_err() {
+        Error::Companion(ratv_companion::Error::FrameTooLarge(len)) => {
+            assert!(len > ratv_companion::MAX_MESSAGE_LEN);
+        }
+        other => panic!("unexpected {other}"),
+    }
+    client.double_tap(HidCommand::Home).await.unwrap();
+    assert_eq!(log.lock().unwrap().hid.len(), 4);
+}
+
+#[tokio::test]
 async fn swipe_lifted_when_canceled() {
     let (creds, controller) = pair().await;
     let log = Arc::new(Mutex::new(Log::default()));
