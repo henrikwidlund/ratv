@@ -740,6 +740,26 @@ async fn siri_in_task() {
 }
 
 #[tokio::test]
+async fn siri_without_audio() {
+    let device = start_device().await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    let siri = client.start_siri().await.unwrap();
+    assert!(matches!(siri.finish().await, Err(Error::SiriNoAudio)));
+    // Siri is released, so a new start works.
+    drop(client.start_siri().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    client.close().await.unwrap();
+
+    let log = device.log.lock().unwrap();
+    assert_eq!(log.voice, []);
+    let siri = [(0x0c, 0x04, true), (0x0c, 0x04, false)];
+    assert_eq!(log.buttons, [siri; 2].concat());
+}
+
+#[tokio::test]
 async fn volume_not_available() {
     let device = start_device().await;
     device.log.lock().unwrap().no_volume_control = true;

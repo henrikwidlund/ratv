@@ -47,6 +47,9 @@ pub enum Error {
     /// The device did not start recording voice input.
     #[error("Siri did not start recording")]
     SiriNotRecording,
+    /// Siri was released without audio.
+    #[error("no audio was sent to Siri")]
+    SiriNoAudio,
     /// The device cannot change the volume, for example with HDMI audio without CEC.
     #[error("volume control is not available")]
     VolumeNotAvailable,

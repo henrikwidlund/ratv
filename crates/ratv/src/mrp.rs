@@ -108,11 +108,18 @@ impl Siri {
     /// Sends the rest of the audio and releases Siri. The device then answers.
     ///
     /// Waits for the device to record if it has not started yet.
+    /// Fails with [`Error::SiriNoAudio`] if no audio was given.
     pub async fn finish(mut self) -> Result<(), Error> {
         #[cfg(feature = "opus")]
         if let Some(encoder) = &mut self.encoder {
             let pending = &mut self.pending;
             encoder.flush(|p| pending.push(Bytes::copy_from_slice(p)))?;
+        }
+        if self.pending.is_empty() && self.sample == 0 {
+            let result = self.client.button(Button::Siri, false).await;
+            self.held = false;
+            tracing::debug!(parent: &self.client.inner.span, "Siri released without audio");
+            return result.and(Err(Error::SiriNoAudio));
         }
         if !self.pending.is_empty() && !self.is_recording() {
             let (start, client) = (self.start, self.client.clone());
@@ -177,19 +184,17 @@ impl Drop for Siri {
         }
         self.client
             .inner
+            .shared
             .siri_active
             .store(false, Ordering::Release);
     }
 }
 
-/// True for `SetRecordingStateMessage` with `Recording`.
-fn is_recording(env: &Envelope) -> bool {
-    use proto::set_recording_state_message::RecordingState;
-
-    env.is::<proto::SetRecordingStateMessage>()
-        && env
-            .payload::<proto::SetRecordingStateMessage>()
-            .is_ok_and(|m| m.state == Some(RecordingState::Recording as i32))
+/// Logs a message received while Siri is active, to find messages that tvOS sends for voice input.
+fn log_siri_message(env: &Envelope) {
+    let name =
+        proto::protocol_message::Type::try_from(env.kind()).map_or("unknown", |t| t.as_str_name());
+    tracing::debug!(kind = env.kind(), name, "received during Siri");
 }
 
 /// Current item plus next items to request for [`NowPlaying::up_next`].
@@ -337,8 +342,6 @@ struct Inner {
     task: JoinHandle<()>,
     /// Voice input device id, registered on first use of Siri.
     voice_device: tokio::sync::OnceCell<i32>,
-    /// True while a [`Siri`] exists.
-    siri_active: AtomicBool,
     span: Span,
 }
 
@@ -353,6 +356,8 @@ impl Drop for Inner {
 struct Shared {
     outbox: Mutex<Outbox>,
     wake: Notify,
+    /// True while a [`Siri`] exists.
+    siri_active: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -500,7 +505,6 @@ impl Client {
             output_uid,
             next_id: AtomicU32::new(6),
             voice_device: tokio::sync::OnceCell::new(),
-            siri_active: AtomicBool::new(false),
             timeout: options.timeout,
             task,
             span,
@@ -621,7 +625,7 @@ impl Client {
     /// Registers a voice input device on first use.
     /// Fails with [`Error::SiriActive`] while another [`Siri`] exists.
     pub async fn start_siri(&self) -> Result<Siri, Error> {
-        if self.inner.siri_active.swap(true, Ordering::AcqRel) {
+        if self.inner.shared.siri_active.swap(true, Ordering::AcqRel) {
             return Err(Error::SiriActive);
         }
         let recording = self.inner.recording.clone();
@@ -989,8 +993,17 @@ impl State {
             Ok(changed) => self.volume_changed |= changed,
             Err(err) => tracing::debug!(%err, kind = env.kind(), "invalid volume message"),
         }
-        if is_recording(env) {
-            self.recording_tx.send_modify(|n| *n = n.wrapping_add(1));
+        if env.is::<proto::SetRecordingStateMessage>() {
+            use proto::set_recording_state_message::RecordingState;
+
+            let state = env
+                .payload::<proto::SetRecordingStateMessage>()
+                .ok()
+                .and_then(|m| m.state);
+            tracing::debug!(?state, "recording state");
+            if state == Some(RecordingState::Recording as i32) {
+                self.recording_tx.send_modify(|n| *n = n.wrapping_add(1));
+            }
         }
     }
 
@@ -1133,9 +1146,13 @@ async fn run_inner(
                 if n? == 0 {
                     return Err(Error::Disconnected);
                 }
+                let siri = shared.siri_active.load(Ordering::Acquire);
                 while let Some(bytes) = stream.poll()? {
                     for env in frames(bytes) {
                         let env = env?;
+                        if siri {
+                            log_siri_message(&env);
+                        }
                         state.apply(&env);
                         received.push(env);
                     }
