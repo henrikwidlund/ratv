@@ -45,6 +45,7 @@ pub enum Error {
     #[error("Siri is already active")]
     SiriActive,
     /// The device did not start recording voice input.
+    /// Siri may be off in the device settings.
     #[error("Siri did not start recording")]
     SiriNotRecording,
     /// Siri was released without audio.

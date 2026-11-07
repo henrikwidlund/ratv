@@ -94,7 +94,8 @@ async fn control() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Siri voice input. Audio is Opus, 16 kHz, mono, 20 ms per packet:
+Siri voice input. Siri must be on in the Apple TV settings (Settings > General >
+Siri). Audio is Opus, 16 kHz, mono, 20 ms per packet:
 
 ```rust
 async fn ask_siri(tv: &ratv::AppleTv, packets: Vec<Vec<u8>>) -> Result<(), ratv::Error> {

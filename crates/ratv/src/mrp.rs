@@ -622,6 +622,7 @@ impl Client {
     /// because audio sent before is lost. Sending fails with
     /// [`Error::SiriNotRecording`] after 30 s of kept audio, and
     /// [`Siri::finish`] fails with it after the timeout.
+    /// The device does not record when Siri is off in its settings.
     /// Registers a voice input device on first use.
     /// Fails with [`Error::SiriActive`] while another [`Siri`] exists.
     pub async fn start_siri(&self) -> Result<Siri, Error> {
