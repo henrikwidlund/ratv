@@ -6,7 +6,7 @@ default-members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/henrikwidlund/ratv"
 
@@ -17,13 +17,13 @@ ratv-companion = { path = "crates/ratv-companion", version = "0.1.0" }
 ratv-discovery = { path = "crates/ratv-discovery", version = "0.1.0" }
 ratv-airplay = { path = "crates/ratv-airplay", version = "0.1.0" }
 ratv-mrp = { path = "crates/ratv-mrp", version = "0.1.0" }
-bytes = "1"
-thiserror = "2"
-proptest = "1"
-prost = { version = "0.14", default-features = false, features = ["std"] }
-rand_core = "0.10"
-ed25519-dalek = "3"
-criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+bytes = "1.12.1"
+thiserror = "2.0.21"
+proptest = "1.12.0"
+prost = { version = "0.14.4", default-features = false, features = ["std"] }
+rand_core = "0.10.1"
+ed25519-dalek = "3.0.0"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
