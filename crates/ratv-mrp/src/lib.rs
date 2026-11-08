@@ -10,8 +10,10 @@
 //! - [`NowPlayingState`] tracks what is playing.
 //! - [`artwork`] reads the image of the current item.
 //! - `VoiceEncoder` (feature `opus`) encodes PCM for voice input.
+//! - [`Fields`] shows encoded fields as text, for logs.
 
 mod artwork;
+mod dump;
 mod envelope;
 mod error;
 pub mod hid;
@@ -36,6 +38,7 @@ pub mod proto {
 }
 
 pub use artwork::{Artwork, artwork};
+pub use dump::Fields;
 pub use envelope::{Envelope, Frames, encode, encode_type, frames};
 pub use error::Error;
 pub use player::{

@@ -35,11 +35,12 @@ pub use ratv_mrp::{
     PlaybackState, QueueItem, Volume, cocoa_time, four_cc,
 };
 use ratv_mrp::{
-    NowPlayingState, Payload, VolumeState, encode, encode_type, frames, messages, proto,
+    Fields, NowPlayingState, Payload, VolumeState, encode, encode_type, frames, messages, proto,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Notify, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{Instrument, Span};
 
 use ratv_airplay::Channel;
@@ -90,9 +91,15 @@ pub struct Siri {
     /// See [`Siri::set_paced`].
     paced: bool,
     /// Earliest time to send the next packet when paced.
-    next: Option<tokio::time::Instant>,
+    next: Option<Instant>,
     /// See [`Siri::set_release_delay`].
     release_delay: Duration,
+    /// When [`Client::start_siri`] was called.
+    begin: Instant,
+    /// Audio bytes sent.
+    bytes: usize,
+    /// Times since `begin` when the first and the last packet were sent.
+    sent: Option<(Duration, Duration)>,
 }
 
 impl Siri {
@@ -140,7 +147,7 @@ impl Siri {
         if self.pending.is_empty() && self.sample == 0 {
             let result = self.client.button(Button::Siri, false).await;
             self.held = false;
-            tracing::debug!(parent: &self.client.inner.span, "Siri released without audio");
+            tracing::debug!(parent: &self.client.inner.span, elapsed = ?self.begin.elapsed(), "Siri released without audio");
             return result.and(Err(Error::SiriNoAudio));
         }
         if !self.pending.is_empty() && !self.is_recording() {
@@ -151,7 +158,7 @@ impl Siri {
                 Ok(Ok(_)) => {}
                 Ok(Err(_)) => return Err(Error::Disconnected),
                 Err(_) => {
-                    tracing::debug!(parent: &client.inner.span, "Siri did not start recording");
+                    tracing::debug!(parent: &client.inner.span, elapsed = ?self.begin.elapsed(), "Siri did not start recording");
                     return Err(Error::SiriNotRecording);
                 }
             }
@@ -162,7 +169,18 @@ impl Siri {
         }
         let result = self.client.button(Button::Siri, false).await;
         self.held = false;
-        tracing::debug!(parent: &self.client.inner.span, packets = self.sample / messages::VOICE_FRAMES, "Siri released");
+        tracing::debug!(
+            parent: &self.client.inner.span,
+            elapsed = ?self.begin.elapsed(),
+            packets = self.sample / messages::VOICE_FRAMES,
+            last_sample = self.sample.saturating_sub(messages::VOICE_FRAMES),
+            bytes = self.bytes,
+            first_sent = ?self.sent.map(|s| s.0),
+            last_sent = ?self.sent.map(|s| s.1),
+            paced = self.paced,
+            release_delay = ?self.release_delay,
+            "Siri released"
+        );
         result
     }
 
@@ -170,7 +188,7 @@ impl Siri {
     fn is_recording(&mut self) -> bool {
         if !self.started && *self.recording.borrow() != self.start {
             self.started = true;
-            tracing::debug!(parent: &self.client.inner.span, kept = self.pending.len(), paced = self.paced, "Siri recording");
+            tracing::debug!(parent: &self.client.inner.span, elapsed = ?self.begin.elapsed(), kept = self.pending.len(), paced = self.paced, "Siri recording");
         }
         self.started
     }
@@ -187,14 +205,21 @@ impl Siri {
         }
         while let Some(packet) = self.pending.front() {
             if self.paced {
-                let now = tokio::time::Instant::now();
+                let now = Instant::now();
                 // A late packet does not make later packets go faster.
                 let at = self.next.map_or(now, |next| next.max(now));
                 tokio::time::sleep_until(at).await;
                 self.next = Some(at + VOICE_PACKET);
             }
+            let len = packet.len();
             let msg = messages::voice_input(packet.clone(), self.sample);
             self.client.send(&msg).await?;
+            let elapsed = self.begin.elapsed();
+            if self.sample == 0 {
+                log_first_packet(&self.client.inner.span, msg, elapsed);
+            }
+            self.sent = Some((self.sent.map_or(elapsed, |s| s.0), elapsed));
+            self.bytes += len;
             // Sent packets are not sent again.
             self.pending.pop_front();
             self.sample = self.sample.wrapping_add(messages::VOICE_FRAMES);
@@ -217,11 +242,40 @@ impl Drop for Siri {
     }
 }
 
+/// Name of a message type, for logs.
+fn type_name(kind: i32) -> &'static str {
+    proto::protocol_message::Type::try_from(kind).map_or("unknown", |t| t.as_str_name())
+}
+
 /// Logs a message received while Siri is active, to find messages that tvOS sends for voice input.
-fn log_siri_message(env: &Envelope) {
-    let name =
-        proto::protocol_message::Type::try_from(env.kind()).map_or("unknown", |t| t.as_str_name());
-    tracing::debug!(kind = env.kind(), name, "received during Siri");
+/// Shows the payload fields; bytes that are not text or messages are shown as length only.
+fn log_siri_message(env: &Envelope, elapsed: Duration) {
+    tracing::debug!(
+        kind = env.kind(),
+        name = type_name(env.kind()),
+        ?elapsed,
+        error = ?env.error(),
+        fields = %env.payload_bytes().map_or(Fields(&[]), |b| Fields(b)),
+        "received during Siri"
+    );
+}
+
+/// Encodes a payload without the envelope, for logs.
+fn encode_payload<P: Payload>(msg: &P) -> Vec<u8> {
+    msg.encode_to_vec()
+}
+
+/// Logs the fields of the first voice packet, with the audio as length only.
+fn log_first_packet(span: &Span, mut msg: proto::SendVoiceInputMessage, elapsed: Duration) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let buffer = msg.data_block.as_mut().and_then(|d| d.buffer.as_mut());
+    let audio = buffer
+        .and_then(|b| b.contents.take())
+        .map_or(0, |c| c.len());
+    let fields = encode_payload(&msg);
+    tracing::debug!(parent: span, ?elapsed, audio, fields = %Fields(&fields), "first voice packet");
 }
 
 /// Current item plus next items to request for [`NowPlaying::up_next`].
@@ -385,6 +439,8 @@ struct Shared {
     wake: Notify,
     /// True while a [`Siri`] exists.
     siri_active: AtomicBool,
+    /// When the active [`Siri`] began.
+    siri_begin: Mutex<Option<Instant>>,
 }
 
 #[derive(Debug, Default)]
@@ -401,6 +457,18 @@ impl Shared {
     /// Locks the outbox. A panic while locked cannot leave it invalid.
     fn outbox(&self) -> MutexGuard<'_, Outbox> {
         self.outbox.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Time since the active [`Siri`] began, or `None` without one.
+    fn siri_elapsed(&self) -> Option<Duration> {
+        if !self.siri_active.load(Ordering::Acquire) {
+            return None;
+        }
+        let begin = *self
+            .siri_begin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        begin.map(|b| b.elapsed())
     }
 }
 
@@ -591,6 +659,14 @@ impl Client {
     ) -> Result<(), Error> {
         let mut buf = [0; 10];
         let id_text = id.map(|n| id_str(n, &mut buf));
+        // Voice packets are logged by `Siri`.
+        if P::TYPE != proto::SendVoiceInputMessage::TYPE
+            && tracing::enabled!(tracing::Level::DEBUG)
+            && let Some(elapsed) = self.inner.shared.siri_elapsed()
+        {
+            let fields = encode_payload(msg);
+            tracing::debug!(parent: &self.inner.span, kind = P::TYPE, name = type_name(P::TYPE), ?elapsed, fields = %Fields(&fields), "sent during Siri");
+        }
         {
             let mut out = self.inner.shared.outbox();
             // Checked while locked: the task clears `pending` after the link closes.
@@ -656,6 +732,13 @@ impl Client {
         if self.inner.shared.siri_active.swap(true, Ordering::AcqRel) {
             return Err(Error::SiriActive);
         }
+        let begin = Instant::now();
+        *self
+            .inner
+            .shared
+            .siri_begin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(begin);
         let recording = self.inner.recording.clone();
         let start = *recording.borrow();
         // Releases the button and the flag if a step fails or the future is dropped.
@@ -672,11 +755,14 @@ impl Client {
             paced: false,
             next: None,
             release_delay: Duration::ZERO,
+            begin,
+            bytes: 0,
+            sent: None,
         };
-        self.voice_device().await?;
+        let device = self.voice_device().await?;
         self.button(Button::Siri, true).await?;
         siri.held = true;
-        tracing::debug!(parent: &self.inner.span, "Siri pressed");
+        tracing::debug!(parent: &self.inner.span, elapsed = ?begin.elapsed(), device, "Siri pressed");
         Ok(siri)
     }
 
@@ -1112,9 +1198,9 @@ async fn run_inner(
     } = conns;
     let mut details = BytesMut::new();
     let mut received = Vec::new();
-    let start = tokio::time::Instant::now() + FEEDBACK_INTERVAL;
+    let start = Instant::now() + FEEDBACK_INTERVAL;
     let mut feedback = tokio::time::interval_at(start, FEEDBACK_INTERVAL);
-    let mut last_control = tokio::time::Instant::now();
+    let mut last_control = Instant::now();
 
     loop {
         // Pushed items often lack languages, chapters and next items.
@@ -1160,7 +1246,7 @@ async fn run_inner(
                 if n? == 0 {
                     return Err(Error::Disconnected);
                 }
-                last_control = tokio::time::Instant::now();
+                last_control = Instant::now();
                 while let Some(m) = channel.poll_message()? {
                     if m.status() != Some(200) {
                         tracing::debug!(status = ?m.status(), "control response");
@@ -1177,12 +1263,12 @@ async fn run_inner(
                 if n? == 0 {
                     return Err(Error::Disconnected);
                 }
-                let siri = shared.siri_active.load(Ordering::Acquire);
+                let siri = shared.siri_elapsed();
                 while let Some(bytes) = stream.poll()? {
                     for env in frames(bytes) {
                         let env = env?;
-                        if siri {
-                            log_siri_message(&env);
+                        if let Some(elapsed) = siri {
+                            log_siri_message(&env, elapsed);
                         }
                         state.apply(&env);
                         received.push(env);

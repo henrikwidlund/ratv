@@ -761,6 +761,11 @@ async fn siri_without_audio() {
 
 #[tokio::test]
 async fn siri_paced() {
+    // Runs the Siri debug logs.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("ratv=debug")
+        .with_test_writer()
+        .try_init();
     let device = start_device().await;
     let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
     let client = Client::connect(addr, &credentials(), &options())
