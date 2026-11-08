@@ -760,6 +760,36 @@ async fn siri_without_audio() {
 }
 
 #[tokio::test]
+async fn siri_paced() {
+    let device = start_device().await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    let mut siri = client.start_siri().await.unwrap();
+    siri.set_paced(true);
+    siri.set_release_delay(Duration::from_millis(100));
+    let start = Instant::now();
+    for _ in 0..10 {
+        siri.send(&b"x"[..]).await.unwrap();
+    }
+    siri.finish().await.unwrap();
+    // 9 waits of 20 ms between 10 packets, then the release delay.
+    assert!(start.elapsed() >= Duration::from_millis(280));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    client.close().await.unwrap();
+
+    let log = device.log.lock().unwrap();
+    let times: Vec<f64> = log.voice.iter().map(|&(t, _)| t).collect();
+    assert_eq!(
+        times,
+        (0..10).map(|i| f64::from(i * 320)).collect::<Vec<_>>()
+    );
+    let siri = [(0x0c, 0x04, true), (0x0c, 0x04, false)];
+    assert_eq!(log.buttons, siri);
+}
+
+#[tokio::test]
 async fn volume_not_available() {
     let device = start_device().await;
     device.log.lock().unwrap().no_volume_control = true;

@@ -20,6 +20,7 @@
 //! # }
 //! ```
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -62,6 +63,8 @@ const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
 const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Voice packets kept until the device records: 30 s.
 const MAX_PENDING: usize = 1500;
+/// Audio length of one voice packet.
+const VOICE_PACKET: Duration = Duration::from_millis(20);
 /// Siri listening to voice input, from [`Client::start_siri`].
 ///
 /// Audio is kept until the device starts recording, then sent.
@@ -76,7 +79,7 @@ pub struct Siri {
     /// True after the device started recording.
     started: bool,
     /// Packets kept until the device records.
-    pending: Vec<Bytes>,
+    pending: VecDeque<Bytes>,
     #[cfg(feature = "opus")]
     /// Boxed because it is large.
     encoder: Option<Box<ratv_mrp::VoiceEncoder>>,
@@ -84,13 +87,19 @@ pub struct Siri {
     sample: u32,
     /// True while the button is held.
     held: bool,
+    /// See [`Siri::set_paced`].
+    paced: bool,
+    /// Earliest time to send the next packet when paced.
+    next: Option<tokio::time::Instant>,
+    /// See [`Siri::set_release_delay`].
+    release_delay: Duration,
 }
 
 impl Siri {
     /// Sends one Opus packet of 20 ms, 16 kHz, mono.
     /// Send one packet every 20 ms.
     pub async fn send(&mut self, packet: impl Into<Bytes>) -> Result<(), Error> {
-        self.pending.push(packet.into());
+        self.pending.push_back(packet.into());
         self.send_pending().await
     }
 
@@ -101,8 +110,21 @@ impl Siri {
         let pending = &mut self.pending;
         self.encoder
             .get_or_insert_with(Box::default)
-            .push(pcm, |p| pending.push(Bytes::copy_from_slice(p)))?;
+            .push(pcm, |p| pending.push_back(Bytes::copy_from_slice(p)))?;
         self.send_pending().await
+    }
+
+    /// Sends the audio no faster than real time, one packet each 20 ms.
+    /// Then [`send`](Self::send), `push_pcm` and [`finish`](Self::finish) wait
+    /// until the audio is sent.
+    /// Off by default: the kept audio is sent at once when the device starts recording.
+    pub const fn set_paced(&mut self, paced: bool) {
+        self.paced = paced;
+    }
+
+    /// Time to wait after the last audio before Siri is released. Default: zero.
+    pub const fn set_release_delay(&mut self, delay: Duration) {
+        self.release_delay = delay;
     }
 
     /// Sends the rest of the audio and releases Siri. The device then answers.
@@ -113,7 +135,7 @@ impl Siri {
         #[cfg(feature = "opus")]
         if let Some(encoder) = &mut self.encoder {
             let pending = &mut self.pending;
-            encoder.flush(|p| pending.push(Bytes::copy_from_slice(p)))?;
+            encoder.flush(|p| pending.push_back(Bytes::copy_from_slice(p)))?;
         }
         if self.pending.is_empty() && self.sample == 0 {
             let result = self.client.button(Button::Siri, false).await;
@@ -135,6 +157,9 @@ impl Siri {
             }
         }
         self.send_pending().await?;
+        if !self.release_delay.is_zero() {
+            tokio::time::sleep(self.release_delay).await;
+        }
         let result = self.client.button(Button::Siri, false).await;
         self.held = false;
         tracing::debug!(parent: &self.client.inner.span, packets = self.sample / messages::VOICE_FRAMES, "Siri released");
@@ -145,7 +170,7 @@ impl Siri {
     fn is_recording(&mut self) -> bool {
         if !self.started && *self.recording.borrow() != self.start {
             self.started = true;
-            tracing::debug!(parent: &self.client.inner.span, kept = self.pending.len(), "Siri recording");
+            tracing::debug!(parent: &self.client.inner.span, kept = self.pending.len(), paced = self.paced, "Siri recording");
         }
         self.started
     }
@@ -160,18 +185,20 @@ impl Siri {
             }
             return Ok(());
         }
-        let mut sent = 0;
-        while let Some(packet) = self.pending.get(sent) {
-            let msg = messages::voice_input(packet.clone(), self.sample);
-            if let Err(err) = self.client.send(&msg).await {
-                // Sent packets are not sent again.
-                self.pending.drain(..sent);
-                return Err(err);
+        while let Some(packet) = self.pending.front() {
+            if self.paced {
+                let now = tokio::time::Instant::now();
+                // A late packet does not make later packets go faster.
+                let at = self.next.map_or(now, |next| next.max(now));
+                tokio::time::sleep_until(at).await;
+                self.next = Some(at + VOICE_PACKET);
             }
-            sent += 1;
+            let msg = messages::voice_input(packet.clone(), self.sample);
+            self.client.send(&msg).await?;
+            // Sent packets are not sent again.
+            self.pending.pop_front();
             self.sample = self.sample.wrapping_add(messages::VOICE_FRAMES);
         }
-        self.pending.clear();
         Ok(())
     }
 }
@@ -637,11 +664,14 @@ impl Client {
             start,
             recording,
             started: false,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
             #[cfg(feature = "opus")]
             encoder: None,
             sample: 0,
             held: false,
+            paced: false,
+            next: None,
+            release_delay: Duration::ZERO,
         };
         self.voice_device().await?;
         self.button(Button::Siri, true).await?;
