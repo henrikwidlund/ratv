@@ -107,8 +107,9 @@ async fn ask_siri(tv: &ratv::AppleTv, packets: Vec<Vec<u8>>) -> Result<(), ratv:
 }
 ```
 
-Audio is kept until the TV records, then sent. With feature `opus`, send
-16-bit, 16 kHz, mono PCM in chunks of any size with `push_pcm` instead.
+Siri uses Companion, as the iPhone remote does, and MRP if Companion is not
+connected. With feature `opus`, send 16-bit, 16 kHz, mono PCM in chunks of any
+size with `push_pcm` instead.
 `AppleTv` and the clients are cheap to clone, and `Siri` can move to another task.
 
 The TV closes an open Companion connection when a new one connects with the

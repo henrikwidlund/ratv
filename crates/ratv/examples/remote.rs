@@ -23,7 +23,8 @@
 //! tags), `audio=<tag>`, `subtitles=<tag>` (for example `sv`), `subtitles_off`, `queue`,
 //! `play_item=<n>` (number from `queue`), `chapters`, `next_chapter`, `previous_chapter`,
 //! `siri=<file.caf>` (ask Siri with 16 kHz mono Opus audio),
-//! `siri_pcm=<file.wav>` (ask Siri with 16-bit 16 kHz mono PCM, feature `opus`).
+//! `siri_pcm=<file.wav>` (ask Siri with 16-bit 16 kHz mono PCM, feature `opus`),
+//! `siri_mrp_pcm=<file.wav>` (the same over MRP).
 //! `watch` prints changes until the connection ends or Ctrl+C.
 //! `progress` prints the position every second and marks updates from the device.
 //! Set `RUST_LOG=ratv=debug` to see which protocols connect.
@@ -169,9 +170,13 @@ async fn ask_siri(tv: &AppleTv, path: &str) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// Sends a WAV file to Siri as PCM, 100 ms every 100 ms.
+/// Sends a WAV file to Siri as PCM, 100 ms every 100 ms. With `mrp`, over MRP.
 #[cfg(feature = "opus")]
-async fn ask_siri_pcm(tv: &AppleTv, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn ask_siri_pcm(
+    tv: &AppleTv,
+    path: &str,
+    mrp: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let file = tokio::fs::read(path).await?;
     let samples: Vec<i16> = wav::pcm(&file)?
         .as_chunks::<2>()
@@ -179,11 +184,24 @@ async fn ask_siri_pcm(tv: &AppleTv, path: &str) -> Result<(), Box<dyn std::error
         .iter()
         .map(|&b| i16::from_le_bytes(b))
         .collect();
-    let mut siri = tv.start_siri().await?;
-    println!("pressed, sending {} samples", samples.len());
+    let mut siri = if mrp {
+        let client = tv.mrp().ok_or("MRP is not connected")?;
+        ratv::Siri::Mrp(client.start_siri().await?)
+    } else {
+        tv.start_siri().await?
+    };
+    let protocol = match siri {
+        ratv::Siri::Companion(_) => "Companion",
+        ratv::Siri::Mrp(_) => "MRP",
+    };
+    println!("pressed ({protocol}), sending {} samples", samples.len());
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     for chunk in samples.chunks(1600) {
         tick.tick().await;
+        if siri.ended() {
+            println!("the TV stopped recording");
+            break;
+        }
         siri.push_pcm(chunk).await?;
     }
     siri.finish().await?;
@@ -279,11 +297,14 @@ async fn run_value(tv: &AppleTv, command: &str) -> Result<(), Box<dyn std::error
         save_artwork(tv, path).await?;
     } else if let Some(path) = value("siri=") {
         ask_siri(tv, path).await?;
-    } else if let Some(path) = value("siri_pcm=") {
+    } else if let Some((path, mrp)) = value("siri_pcm=")
+        .map(|p| (p, false))
+        .or_else(|| value("siri_mrp_pcm=").map(|p| (p, true)))
+    {
         #[cfg(feature = "opus")]
-        ask_siri_pcm(tv, path).await?;
+        ask_siri_pcm(tv, path, mrp).await?;
         #[cfg(not(feature = "opus"))]
-        return Err(format!("siri_pcm needs feature opus, not {path}").into());
+        return Err(format!("siri_pcm needs feature opus, not {path} {mrp}").into());
     } else {
         return Err(format!("unknown command {command}").into());
     }

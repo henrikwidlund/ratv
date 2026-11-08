@@ -49,6 +49,8 @@ pub mod mrp;
 mod options;
 #[cfg(any(feature = "companion", feature = "mrp"))]
 mod rng;
+#[cfg(all(feature = "companion", feature = "mrp"))]
+mod siri;
 #[cfg(any(feature = "companion", feature = "mrp"))]
 mod tcp;
 #[cfg(feature = "companion")]
@@ -59,6 +61,8 @@ pub use apple_tv::{AppleTv, Endpoints, Key, PinPrompt, pair};
 pub use error::Error;
 #[cfg(any(feature = "companion", feature = "mrp"))]
 pub use options::{ClientOptions, PairOptions};
+#[cfg(all(feature = "companion", feature = "mrp"))]
+pub use siri::Siri;
 
 /// Checks a volume and limits it to 0.0 to 1.0.
 #[cfg(any(feature = "companion", feature = "mrp"))]

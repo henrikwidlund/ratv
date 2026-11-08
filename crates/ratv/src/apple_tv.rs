@@ -10,6 +10,7 @@
 //! | seek, stop, shuffle, repeat, speed, rating, like, languages, chapters, queue, now playing, artwork, volume state, mute | MRP |
 //! | volume | MRP, else Companion |
 //! | power, apps, accounts, text input, swipe, tap | Companion |
+//! | Siri | Companion, else MRP |
 //!
 //! ```no_run
 //! # async fn run(device: ratv::discovery::Device, credentials: ratv::Credentials) -> Result<(), ratv::Error> {
@@ -38,7 +39,7 @@ use crate::mrp::{
     self, Artwork, Button, Command, LanguageOption, NowPlaying, PlaybackState, RepeatMode,
     ShuffleMode,
 };
-use crate::{ClientOptions, Credentials, Error, PairOptions};
+use crate::{ClientOptions, Credentials, Error, PairOptions, Siri};
 
 /// Where the device's services listen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -802,9 +803,20 @@ impl AppleTv {
         self.need_mrp()?.disable_language(option).await
     }
 
-    /// Holds Siri. Needs MRP. See [`mrp::Client::start_siri`].
-    pub async fn start_siri(&self) -> Result<mrp::Siri, Error> {
-        self.need_mrp()?.start_siri().await
+    /// Holds Siri. Send the audio, then call [`Siri::finish`].
+    ///
+    /// Uses Companion, as the iPhone remote does, else MRP. Siri must be on
+    /// in the device settings. To choose, use
+    /// [`companion::Client::start_siri`] or [`mrp::Client::start_siri`].
+    pub async fn start_siri(&self) -> Result<Siri, Error> {
+        match self.route(false, Some(()), Some(())) {
+            Some(Route::Companion(c, ())) => c
+                .start_siri(&companion::SiriOptions::default())
+                .await
+                .map(Siri::Companion),
+            Some(Route::Mrp(m, ())) => m.start_siri().await.map(Siri::Mrp),
+            None => Err(Error::NoEndpoints),
+        }
     }
 
     /// Turns off subtitles. Needs MRP.
