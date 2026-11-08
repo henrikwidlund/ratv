@@ -760,7 +760,7 @@ async fn siri_without_audio() {
 }
 
 #[tokio::test]
-async fn siri_paced() {
+async fn siri_debug_logs() {
     // Runs the Siri debug logs.
     let _ = tracing_subscriber::fmt()
         .with_env_filter("ratv=debug")
@@ -772,15 +772,10 @@ async fn siri_paced() {
         .await
         .unwrap();
     let mut siri = client.start_siri().await.unwrap();
-    siri.set_paced(true);
-    siri.set_release_delay(Duration::from_millis(100));
-    let start = Instant::now();
     for _ in 0..10 {
         siri.send(&b"x"[..]).await.unwrap();
     }
     siri.finish().await.unwrap();
-    // 9 waits of 20 ms between 10 packets, then the release delay.
-    assert!(start.elapsed() >= Duration::from_millis(280));
     tokio::time::sleep(Duration::from_millis(50)).await;
     client.close().await.unwrap();
 

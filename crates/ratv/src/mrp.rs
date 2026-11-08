@@ -64,8 +64,6 @@ const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
 const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Voice packets kept until the device records: 30 s.
 const MAX_PENDING: usize = 1500;
-/// Audio length of one voice packet.
-const VOICE_PACKET: Duration = Duration::from_millis(20);
 /// Siri listening to voice input, from [`Client::start_siri`].
 ///
 /// Audio is kept until the device starts recording, then sent.
@@ -88,12 +86,6 @@ pub struct Siri {
     sample: u32,
     /// True while the button is held.
     held: bool,
-    /// See [`Siri::set_paced`].
-    paced: bool,
-    /// Earliest time to send the next packet when paced.
-    next: Option<Instant>,
-    /// See [`Siri::set_release_delay`].
-    release_delay: Duration,
     /// When [`Client::start_siri`] was called.
     begin: Instant,
     /// Audio bytes sent.
@@ -119,19 +111,6 @@ impl Siri {
             .get_or_insert_with(Box::default)
             .push(pcm, |p| pending.push_back(Bytes::copy_from_slice(p)))?;
         self.send_pending().await
-    }
-
-    /// Sends the audio no faster than real time, one packet each 20 ms.
-    /// Then [`send`](Self::send), `push_pcm` and [`finish`](Self::finish) wait
-    /// until the audio is sent.
-    /// Off by default: the kept audio is sent at once when the device starts recording.
-    pub const fn set_paced(&mut self, paced: bool) {
-        self.paced = paced;
-    }
-
-    /// Time to wait after the last audio before Siri is released. Default: zero.
-    pub const fn set_release_delay(&mut self, delay: Duration) {
-        self.release_delay = delay;
     }
 
     /// Sends the rest of the audio and releases Siri. The device then answers.
@@ -164,9 +143,6 @@ impl Siri {
             }
         }
         self.send_pending().await?;
-        if !self.release_delay.is_zero() {
-            tokio::time::sleep(self.release_delay).await;
-        }
         let result = self.client.button(Button::Siri, false).await;
         self.held = false;
         tracing::debug!(
@@ -177,8 +153,6 @@ impl Siri {
             bytes = self.bytes,
             first_sent = ?self.sent.map(|s| s.0),
             last_sent = ?self.sent.map(|s| s.1),
-            paced = self.paced,
-            release_delay = ?self.release_delay,
             "Siri released"
         );
         result
@@ -188,7 +162,7 @@ impl Siri {
     fn is_recording(&mut self) -> bool {
         if !self.started && *self.recording.borrow() != self.start {
             self.started = true;
-            tracing::debug!(parent: &self.client.inner.span, elapsed = ?self.begin.elapsed(), kept = self.pending.len(), paced = self.paced, "Siri recording");
+            tracing::debug!(parent: &self.client.inner.span, elapsed = ?self.begin.elapsed(), kept = self.pending.len(), "Siri recording");
         }
         self.started
     }
@@ -204,13 +178,6 @@ impl Siri {
             return Ok(());
         }
         while let Some(packet) = self.pending.front() {
-            if self.paced {
-                let now = Instant::now();
-                // A late packet does not make later packets go faster.
-                let at = self.next.map_or(now, |next| next.max(now));
-                tokio::time::sleep_until(at).await;
-                self.next = Some(at + VOICE_PACKET);
-            }
             let len = packet.len();
             let msg = messages::voice_input(packet.clone(), self.sample);
             self.client.send(&msg).await?;
@@ -757,9 +724,6 @@ impl Client {
             encoder: None,
             sample: 0,
             held: false,
-            paced: false,
-            next: None,
-            release_delay: Duration::ZERO,
             begin,
             bytes: 0,
             sent: None,
