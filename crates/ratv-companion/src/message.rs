@@ -31,16 +31,25 @@ pub trait Outgoing {
     const TYPE: MessageType = MessageType::Request;
     /// Writes the `_c` value.
     fn content(&self, e: &mut Encoder<'_>);
+
+    /// Number of fields that [`header`](Self::header) writes.
+    fn header_len(&self) -> usize {
+        0
+    }
+
+    /// Writes more fields next to `_i`, `_x`, `_t` and `_c`.
+    fn header(&self, _e: &mut Encoder<'_>) {}
 }
 
 /// Encodes `msg` with transaction id `xid` and appends it to `out`.
 pub fn encode<M: Outgoing>(msg: &M, xid: u32, out: &mut Vec<u8>) {
-    Encoder::new(out).dict(4, |e| {
+    Encoder::new(out).dict(4 + msg.header_len(), |e| {
         e.str("_i").str(M::ID);
         e.str("_x").int(xid.into());
         e.str("_t").int(M::TYPE as i64);
         e.str("_c");
         msg.content(e);
+        msg.header(e);
     });
 }
 
@@ -554,6 +563,8 @@ pub mod event {
     pub const TEXT_INPUT_STOPPED: &str = "_tiStopped";
     /// Sent after `TVRCSessionStart` without registering interest.
     pub const SUPPORTED_ACTIONS: &str = "SupportedActions";
+    /// Siri stopped recording. Sent as a request; reply with [`SiriEndpointReply`](super::SiriEndpointReply).
+    pub const SIRI_ENDPOINT: &str = "_siriEndpoint";
 }
 
 /// Registers or removes interest in events. This is an event, not a request.
@@ -694,6 +705,126 @@ impl Outgoing for TextInputStop {
     }
 }
 
+/// Starts Siri, like holding the Siri button. Then send [`SiriAudio`]
+/// events and [`SiriStop`]. The response is empty.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SiriStart {
+    /// Also send `_isVT = 0` and `_pttEligible = 1`.
+    /// The iPhone gives these as options; it is not known if they are sent.
+    pub ptt_flags: bool,
+}
+
+impl Outgoing for SiriStart {
+    const ID: &str = "_siriStart";
+
+    fn content(&self, e: &mut Encoder<'_>) {
+        siri_content(e);
+    }
+
+    fn header_len(&self) -> usize {
+        siri_header_len(self.ptt_flags)
+    }
+
+    fn header(&self, e: &mut Encoder<'_>) {
+        siri_header(self.ptt_flags, e);
+    }
+}
+
+/// Ends Siri, like releasing the Siri button. Siri then answers.
+/// The response is empty.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SiriStop {
+    /// See [`SiriStart::ptt_flags`].
+    pub ptt_flags: bool,
+}
+
+impl Outgoing for SiriStop {
+    const ID: &str = "_siriStop";
+
+    fn content(&self, e: &mut Encoder<'_>) {
+        siri_content(e);
+    }
+
+    fn header_len(&self) -> usize {
+        siri_header_len(self.ptt_flags)
+    }
+
+    fn header(&self, e: &mut Encoder<'_>) {
+        siri_header(self.ptt_flags, e);
+    }
+}
+
+/// Content of [`SiriStart`] and [`SiriStop`]: no voice trigger ("Hey Siri").
+fn siri_content(e: &mut Encoder<'_>) {
+    e.dict(2, |e| {
+        e.str("_vtDurMs").int(0);
+        e.str("_vtTwoShotSec").int(0);
+    });
+}
+
+const fn siri_header_len(ptt_flags: bool) -> usize {
+    if ptt_flags { 2 } else { 0 }
+}
+
+/// Not a voice trigger, push to talk.
+fn siri_header(ptt_flags: bool, e: &mut Encoder<'_>) {
+    if ptt_flags {
+        e.str("_isVT").int(0);
+        e.str("_pttEligible").int(1);
+    }
+}
+
+/// Opus packets for Siri: 16 kHz, mono, 20 ms each. This is an event.
+///
+/// The iPhone sends 5 packets (100 ms) in each event.
+#[derive(Debug, Clone, Copy)]
+pub struct SiriAudio<'a> {
+    /// The packets, one after the other.
+    pub data: &'a [u8],
+    /// Size of each packet in `data`, in order. The sizes add up to `data.len()`.
+    pub sizes: &'a [u16],
+}
+
+impl Outgoing for SiriAudio<'_> {
+    const ID: &str = "_siA";
+    const TYPE: MessageType = MessageType::Event;
+
+    fn content(&self, e: &mut Encoder<'_>) {
+        debug_assert_eq!(
+            self.sizes.iter().map(|&s| usize::from(s)).sum::<usize>(),
+            self.data.len()
+        );
+        e.dict(3, |e| {
+            e.int(3).data(self.data);
+            // Linear gain.
+            e.int(4).float(1.0);
+            e.int(5).array(self.sizes.len(), |e| {
+                let mut offset = 0;
+                for &size in self.sizes {
+                    e.dict(2, |e| {
+                        e.int(1).int(size.into());
+                        e.int(2).int(offset);
+                    });
+                    offset += i64::from(size);
+                }
+            });
+        });
+    }
+}
+
+/// Empty reply to [`Event::SiriEndpoint`]. Use the xid of the request.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SiriEndpointReply;
+
+impl Outgoing for SiriEndpointReply {
+    const ID: &'static str = event::SIRI_ENDPOINT;
+    const TYPE: MessageType = MessageType::Response;
+
+    fn content(&self, e: &mut Encoder<'_>) {
+        empty(e);
+    }
+}
+
 /// Known events from the device.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
@@ -712,12 +843,18 @@ pub enum Event {
         /// True if the Guide button does something on the new screen.
         guide_supported: bool,
     },
+    /// Siri stopped recording. The iPhone then stops sending audio.
+    /// Sent as a request; reply with [`SiriEndpointReply`].
+    SiriEndpoint,
 }
 
 impl Event {
     /// Parses a known event. Returns `None` for other messages.
     #[must_use]
     pub fn parse(msg: &Message<'_>) -> Option<Self> {
+        if msg.kind() == Some(MessageType::Request) && msg.id() == Some(event::SIRI_ENDPOINT) {
+            return Some(Self::SiriEndpoint);
+        }
         if msg.kind() != Some(MessageType::Event) {
             return None;
         }
@@ -784,6 +921,60 @@ mod tests {
             Some(&b"4874b16b-4b77-4998-b9d5-091ef8cf486a"[..])
         );
         assert_eq!(string(&m, "name"), Some("BunATV Remote"));
+    }
+
+    #[test]
+    fn siri_messages() {
+        for m in [
+            roundtrip(&SiriStart::default()),
+            roundtrip(&SiriStop::default()),
+        ] {
+            assert_eq!(int(&m, "_vtDurMs"), Some(0));
+            assert_eq!(int(&m, "_vtTwoShotSec"), Some(0));
+            assert_eq!(m.value().get("_pttEligible"), None);
+        }
+        let flags = |m: Message<'_>| {
+            let v = m.value();
+            (
+                v.get("_isVT").and_then(Value::as_i64),
+                v.get("_pttEligible").and_then(Value::as_i64),
+            )
+        };
+        assert_eq!(
+            flags(roundtrip(&SiriStart { ptt_flags: true })),
+            (Some(0), Some(1))
+        );
+        assert_eq!(
+            flags(roundtrip(&SiriStop { ptt_flags: true })),
+            (Some(0), Some(1))
+        );
+        let m = roundtrip(&SiriAudio {
+            data: &[1, 2, 3, 4, 5],
+            sizes: &[3, 2],
+        });
+        // Integer keys, as the iPhone sends them.
+        let field = |v: &Value<'static>, k: i64| {
+            v.as_dict()
+                .and_then(|d| d.iter().find(|(key, _)| key.as_i64() == Some(k)))
+                .map(|(_, v)| v.clone())
+        };
+        let c = m.content().unwrap();
+        assert_eq!(
+            field(c, 3).and_then(|v| v.as_bytes().map(<[u8]>::to_vec)),
+            Some(vec![1, 2, 3, 4, 5])
+        );
+        assert_eq!(field(c, 4).and_then(|v| v.as_f64()), Some(1.0));
+        let packets = field(c, 5).unwrap();
+        let packets: Vec<(i64, i64)> = packets
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                let get = |k| field(p, k).and_then(|v| v.as_i64()).unwrap();
+                (get(1), get(2))
+            })
+            .collect();
+        assert_eq!(packets, [(3, 0), (2, 3)]);
     }
 
     #[test]
@@ -1003,6 +1194,24 @@ mod tests {
         assert_eq!(
             Event::parse(&Message::decode(&raw).unwrap()),
             Some(Event::TextInputStopped)
+        );
+        let raw = event("_siriEndpoint", empty);
+        assert_eq!(Event::parse(&Message::decode(&raw).unwrap()), None);
+        let mut raw = Vec::new();
+        encode(&SiriEndpointReply, 9, &mut raw);
+        let reply = Message::decode(&raw).unwrap();
+        assert_eq!(reply.kind(), Some(MessageType::Response));
+        assert_eq!(reply.xid(), Some(9));
+        let mut raw = Vec::new();
+        Encoder::new(&mut raw).dict(4, |e| {
+            e.str("_i").str("_siriEndpoint");
+            e.str("_x").int(5);
+            e.str("_t").int(MessageType::Request as i64);
+            e.str("_c").dict(0, |_| {});
+        });
+        assert_eq!(
+            Event::parse(&Message::decode(&raw).unwrap()),
+            Some(Event::SiriEndpoint)
         );
         let raw = event("SupportedActions", |e| {
             e.dict(1, |e| {

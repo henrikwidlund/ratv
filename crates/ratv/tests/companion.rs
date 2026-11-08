@@ -27,6 +27,35 @@ struct Log {
     session_stopped: bool,
     /// `_hidT` events as (x, y, phase).
     touches: Vec<(i64, i64, i64)>,
+    /// Siri messages in order: `start`, `stop`, or the packet sizes of an audio event.
+    siri: Vec<String>,
+    /// `_pttEligible` of each Siri start and stop.
+    siri_ptt: Vec<Option<i64>>,
+}
+
+/// Value of an integer key in an OPACK dictionary.
+fn int_key<'v>(v: &'v Value<'_>, key: i64) -> Option<&'v Value<'v>> {
+    v.as_dict()?
+        .iter()
+        .find(|(k, _)| k.as_i64() == Some(key))
+        .map(|(_, v)| v)
+}
+
+/// Checks a `_siA` event and returns its packet sizes, like `3+2`.
+fn siri_audio(msg: &Message<'_>) -> String {
+    let c = msg.content().unwrap();
+    let data = int_key(c, 3).and_then(Value::as_bytes).unwrap();
+    assert_eq!(int_key(c, 4).and_then(Value::as_f64), Some(1.0));
+    let mut offset = 0;
+    let mut sizes = Vec::new();
+    for p in int_key(c, 5).and_then(Value::as_array).unwrap() {
+        let size = int_key(p, 1).and_then(Value::as_i64).unwrap();
+        assert_eq!(int_key(p, 2).and_then(Value::as_i64), Some(offset));
+        offset += size;
+        sizes.push(size.to_string());
+    }
+    assert_eq!(usize::try_from(offset).unwrap(), data.len());
+    sizes.join("+")
 }
 
 /// `_tiD` archive of a focused text field, shaped like the one tvOS sends.
@@ -207,6 +236,8 @@ async fn device_session(mut s: DuplexStream, controller: PairedController, log: 
         let int = |k: &str| msg.field(k).and_then(Value::as_i64);
         let reply = match id.as_str() {
             "_interest" => {
+                let reg = msg.field("_regEvents").and_then(Value::as_array).unwrap();
+                assert!(reg.iter().any(|v| v.as_str() == Some("_siriEndpoint")));
                 let mut ev = Vec::new();
                 Encoder::new(&mut ev).dict(4, |e| {
                     e.str("_i").str("_iMC");
@@ -316,6 +347,36 @@ async fn device_session(mut s: DuplexStream, controller: PairedController, log: 
                 assert_eq!(int("_tiV"), Some(1));
                 let data = msg.field("_tiD").and_then(Value::as_bytes).unwrap();
                 apply_text_operation(data, &mut text);
+                None
+            }
+            "_siriStart" | "_siriStop" => {
+                assert_eq!(int("_vtDurMs"), Some(0));
+                let mut log = log.lock().unwrap();
+                log.siri.push(id.trim_start_matches("_siri").to_lowercase());
+                log.siri_ptt
+                    .push(msg.value().get("_pttEligible").and_then(Value::as_i64));
+                Some(response(xid, &id, empty))
+            }
+            "_siA" => {
+                let audio = siri_audio(&msg);
+                // A packet of 99 bytes stands for the end of speech.
+                let end = audio.starts_with("99");
+                log.lock().unwrap().siri.push(audio);
+                end.then(|| {
+                    let mut ev = Vec::new();
+                    Encoder::new(&mut ev).dict(4, |e| {
+                        e.str("_i").str("_siriEndpoint");
+                        e.str("_x").int(2);
+                        e.str("_t").int(MessageType::Request as i64);
+                        e.str("_c").dict(0, |_| {});
+                    });
+                    ev
+                })
+            }
+            "_siriEndpoint" => {
+                assert_eq!(msg.kind(), Some(MessageType::Response));
+                assert_eq!(xid, 2);
+                log.lock().unwrap().siri.push("endpoint reply".into());
                 None
             }
             "silent" => None,
@@ -756,4 +817,165 @@ async fn swipe_lifted_when_canceled() {
     // Press (1), moves (3), then release (4) from the dropped future.
     assert_eq!(phases.first(), Some(&1), "{touches:?}");
     assert_eq!(phases.last(), Some(&4), "{touches:?}");
+}
+
+async fn connect() -> (companion::Client, Arc<Mutex<Log>>) {
+    let (creds, controller) = pair().await;
+    let log = Arc::new(Mutex::new(Log::default()));
+    let (client_io, device_io) = tokio::io::duplex(8192);
+    tokio::spawn(device_session(device_io, controller, log.clone()));
+    let client = companion::Client::connect_stream(client_io, &creds, &options())
+        .await
+        .unwrap();
+    (client, log)
+}
+
+/// Waits until the device has read all messages that were sent before.
+async fn settle(client: &companion::Client) {
+    client.volume().await.unwrap();
+}
+
+#[tokio::test]
+async fn siri() {
+    let (client, log) = connect().await;
+    let options = companion::SiriOptions::default();
+    let mut siri = client.start_siri(&options).await.unwrap();
+    assert!(matches!(
+        client.start_siri(&options).await,
+        Err(Error::SiriActive)
+    ));
+    let start = Instant::now();
+    for size in 1..=12 {
+        siri.send(&vec![0; size]).await.unwrap();
+    }
+    siri.finish().await.unwrap();
+    // Events of 100 ms, no faster than real time: the third is sent after 200 ms.
+    assert!(start.elapsed() >= Duration::from_millis(200));
+    // Dropping releases Siri too.
+    drop(client.start_siri(&options).await.unwrap());
+    settle(&client).await;
+
+    let log = log.lock().unwrap();
+    assert_eq!(
+        log.siri,
+        [
+            "start",
+            "1+2+3+4+5",
+            "6+7+8+9+10",
+            "11+12",
+            "stop",
+            "start",
+            "stop"
+        ]
+    );
+    assert_eq!(log.siri_ptt, [None; 4]);
+}
+
+#[tokio::test]
+async fn siri_endpoint() {
+    let (client, log) = connect().await;
+    let mut siri = client
+        .start_siri(&companion::SiriOptions::default())
+        .await
+        .unwrap();
+    for size in [99, 1, 1, 1, 1] {
+        siri.send(&vec![0; size]).await.unwrap();
+    }
+    assert!(!siri.ended());
+    // The device answers the first event with `_siriEndpoint`.
+    for _ in 0..10 {
+        siri.send(&[2]).await.unwrap();
+    }
+    assert!(siri.ended());
+    siri.send(&[3]).await.unwrap();
+    siri.finish().await.unwrap();
+    settle(&client).await;
+    assert_eq!(
+        log.lock().unwrap().siri,
+        ["start", "99+1+1+1+1", "endpoint reply", "stop"]
+    );
+}
+
+#[tokio::test]
+async fn siri_without_audio() {
+    let (client, log) = connect().await;
+    let siri = client
+        .start_siri(&companion::SiriOptions::default())
+        .await
+        .unwrap();
+    assert!(matches!(siri.finish().await, Err(Error::SiriNoAudio)));
+    settle(&client).await;
+    assert_eq!(log.lock().unwrap().siri, ["start", "stop"]);
+}
+
+#[tokio::test]
+async fn siri_ptt_flags() {
+    let (client, log) = connect().await;
+    let mut options = companion::SiriOptions::default();
+    options.ptt_flags = true;
+    let mut siri = client.start_siri(&options).await.unwrap();
+    siri.send(&[1, 2]).await.unwrap();
+    siri.finish().await.unwrap();
+    assert_eq!(log.lock().unwrap().siri_ptt, [Some(1); 2]);
+}
+
+#[tokio::test]
+async fn siri_packet_too_large() {
+    let (client, _log) = connect().await;
+    let mut siri = client
+        .start_siri(&companion::SiriOptions::default())
+        .await
+        .unwrap();
+    let err = siri.send(&vec![0; 70_000]).await.unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidArgument("packet size")),
+        "{err}"
+    );
+}
+
+#[cfg(feature = "opus")]
+#[tokio::test]
+async fn siri_pcm() {
+    let (client, log) = connect().await;
+    let mut siri = client
+        .start_siri(&companion::SiriOptions::default())
+        .await
+        .unwrap();
+    // 100 + 600 samples: two packets now, the rest padded by `finish`.
+    siri.push_pcm(&[100; 100]).await.unwrap();
+    siri.push_pcm(&[-100; 600]).await.unwrap();
+    siri.finish().await.unwrap();
+    let log = log.lock().unwrap();
+    assert_eq!(log.siri.len(), 3);
+    assert_eq!(log.siri[1].split('+').count(), 3);
+}
+
+#[cfg(feature = "mrp")]
+#[tokio::test]
+async fn apple_tv_siri_uses_companion() {
+    use ratv::{AppleTv, Endpoints, Siri};
+
+    let (creds, controller) = pair().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log = Arc::new(Mutex::new(Log::default()));
+    let device_log = log.clone();
+    tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        let (mut client_io, device_io) = tokio::io::duplex(8192);
+        tokio::spawn(device_session(device_io, controller, device_log));
+        let _ = tokio::io::copy_bidirectional(&mut tcp, &mut client_io).await;
+    });
+    let endpoints = Endpoints {
+        companion: Some(addr),
+        airplay: None,
+    };
+    let tv = AppleTv::connect(&endpoints, &creds, &options())
+        .await
+        .unwrap();
+    let mut siri = tv.start_siri().await.unwrap();
+    assert!(matches!(siri, Siri::Companion(_)));
+    siri.send(vec![1, 2, 3]).await.unwrap();
+    siri.finish().await.unwrap();
+    assert_eq!(log.lock().unwrap().siri, ["start", "3", "stop"]);
 }

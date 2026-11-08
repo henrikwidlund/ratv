@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -7,8 +7,8 @@ use bytes::Bytes;
 use ratv_companion::message::{
     self, Account, App, AttentionState, ButtonState, Event, FetchAccounts, FetchApps,
     FetchAttentionState, Hid, HidCommand, Interest, LaunchApp, MediaControl, Message, MessageType,
-    Outgoing, SessionStart, SessionStop, SwitchAccount, SystemInfo, TextInputStart, TextInputStop,
-    Touch, TouchPhase, TouchStart, TvRemoteSessionStart, event,
+    Outgoing, SessionStart, SessionStop, SiriEndpointReply, SwitchAccount, SystemInfo,
+    TextInputStart, TextInputStop, Touch, TouchPhase, TouchStart, TvRemoteSessionStart, event,
 };
 use ratv_companion::text_input::{self, TextInputCommand, TextSession};
 use ratv_companion::{Connection, FrameType};
@@ -52,6 +52,8 @@ struct Inner {
     session_id: AtomicU64,
     /// Start of the touch session, for touch timestamps.
     touch_base: Instant,
+    /// True while a [`Siri`](super::Siri) exists.
+    siri_active: AtomicBool,
     task: JoinHandle<()>,
     span: Span,
 }
@@ -85,6 +87,26 @@ struct Outbox {
 
 /// Response payload, or the error the device sent.
 type Reply = Result<Bytes, ratv_companion::Error>;
+
+impl Outbox {
+    /// Encodes `msg` with its length in front.
+    fn push<M: Outgoing>(&mut self, msg: &M, xid: u32) -> Result<(), Error> {
+        if self.buf.len() > MAX_OUTBOX {
+            return Err(Error::QueueFull);
+        }
+        let start = self.buf.len();
+        self.buf.extend_from_slice(&[0; 4]);
+        message::encode(msg, xid, &mut self.buf);
+        let len = self.buf.len() - start - 4;
+        if len > ratv_companion::MAX_MESSAGE_LEN {
+            self.buf.truncate(start);
+            return Err(ratv_companion::Error::FrameTooLarge(len).into());
+        }
+        let len = u32::try_from(len).unwrap_or(u32::MAX);
+        self.buf[start..start + 4].copy_from_slice(&len.to_le_bytes());
+        Ok(())
+    }
+}
 
 impl Shared {
     /// Locks the outbox. A panic while locked cannot leave it invalid.
@@ -169,6 +191,7 @@ impl Client {
                 silent_timeouts: AtomicU32::new(0),
                 session_id: AtomicU64::new(0),
                 touch_base: Instant::now(),
+                siri_active: AtomicBool::new(false),
                 task,
                 span,
             }),
@@ -203,6 +226,7 @@ impl Client {
                             event::MEDIA_CONTROL,
                             event::SYSTEM_STATUS,
                             event::TV_SYSTEM_STATUS,
+                            event::SIRI_ENDPOINT,
                         ],
                         deregister: &[],
                     }),
@@ -288,6 +312,22 @@ impl Client {
         self.queue(msg, xid, None)
     }
 
+    /// Sends a request without waiting for the response.
+    pub(super) fn request_no_wait<M: Outgoing>(&self, msg: &M) -> Result<(), Error> {
+        let xid = self.next_xid();
+        tracing::trace!(parent: &self.inner.span, id = M::ID, xid, "request without wait");
+        self.queue(msg, xid, None)
+    }
+
+    /// Flag that is true while a [`Siri`](super::Siri) exists.
+    pub(super) fn siri_active(&self) -> &AtomicBool {
+        &self.inner.siri_active
+    }
+
+    pub(super) fn span(&self) -> &Span {
+        &self.inner.span
+    }
+
     /// Encodes `msg` into the outbox and wakes the background task.
     fn queue<M: Outgoing>(
         &self,
@@ -301,19 +341,7 @@ impl Client {
             if !self.inner.link.is_open() {
                 return Err(Error::Disconnected);
             }
-            if out.buf.len() > MAX_OUTBOX {
-                return Err(Error::QueueFull);
-            }
-            let start = out.buf.len();
-            out.buf.extend_from_slice(&[0; 4]);
-            message::encode(msg, xid, &mut out.buf);
-            let len = out.buf.len() - start - 4;
-            if len > ratv_companion::MAX_MESSAGE_LEN {
-                out.buf.truncate(start);
-                return Err(ratv_companion::Error::FrameTooLarge(len).into());
-            }
-            let len = u32::try_from(len).unwrap_or(u32::MAX);
-            out.buf[start..start + 4].copy_from_slice(&len.to_le_bytes());
+            out.push(msg, xid)?;
             if let Some(reply) = reply {
                 out.pending.retain(|(_, tx)| !tx.is_closed());
                 out.pending.push((xid, reply));
@@ -751,6 +779,19 @@ fn dispatch(ty: FrameType, payload: Bytes, shared: &Shared, events: &broadcast::
                 tracing::trace!(xid, "response without request");
             }
         }
-        Some(MessageType::Request) => tracing::trace!(id = ?msg.id(), "ignoring device request"),
+        Some(MessageType::Request) => {
+            if let Some(event @ Event::SiriEndpoint) = Event::parse(&msg) {
+                // The iPhone replies with an empty response.
+                if let Some(xid) = msg.xid()
+                    && let Err(err) = shared.outbox().push(&SiriEndpointReply, xid)
+                {
+                    tracing::debug!(%err, "_siriEndpoint reply failed");
+                }
+                shared.wake.notify_one();
+                let _ = events.send(event);
+            } else {
+                tracing::trace!(id = ?msg.id(), "ignoring device request");
+            }
+        }
     }
 }

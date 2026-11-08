@@ -876,6 +876,28 @@ async fn siri_pcm() {
 
 #[cfg(feature = "companion")]
 #[tokio::test]
+async fn apple_tv_siri_without_companion_uses_mrp() {
+    use ratv::{AppleTv, Endpoints, Siri};
+
+    let device = start_device().await;
+    let endpoints = Endpoints {
+        companion: None,
+        airplay: Some(format!("127.0.0.1:{}", device.port).parse().unwrap()),
+    };
+    let tv = AppleTv::connect(&endpoints, &credentials(), &options())
+        .await
+        .unwrap();
+    let mut siri = tv.start_siri().await.unwrap();
+    assert!(matches!(siri, Siri::Mrp(_)));
+    siri.send(&b"one"[..]).await.unwrap();
+    siri.finish().await.unwrap();
+    tv.close().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(device.log.lock().unwrap().voice, [(0.0, 3)]);
+}
+
+#[cfg(feature = "companion")]
+#[tokio::test]
 async fn apple_tv_chapters_and_subtitles() {
     use ratv::{AppleTv, Endpoints};
 
