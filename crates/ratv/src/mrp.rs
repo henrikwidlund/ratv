@@ -216,7 +216,7 @@ impl Siri {
             self.client.send(&msg).await?;
             let elapsed = self.begin.elapsed();
             if self.sample == 0 {
-                log_first_packet(&self.client.inner.span, msg, elapsed);
+                tracing::debug!(parent: &self.client.inner.span, ?elapsed, audio = len, fields = %VoiceFields(&msg), "first voice packet");
             }
             self.sent = Some((self.sent.map_or(elapsed, |s| s.0), elapsed));
             self.bytes += len;
@@ -260,22 +260,29 @@ fn log_siri_message(env: &Envelope, elapsed: Duration) {
     );
 }
 
-/// Encodes a payload without the envelope, for logs.
-fn encode_payload<P: Payload>(msg: &P) -> Vec<u8> {
-    msg.encode_to_vec()
+/// Shows the fields of a payload, for logs. Encodes only when shown.
+///
+/// Do not use `tracing::enabled!` to skip the work: it is false when the
+/// events go to the `log` crate.
+struct PayloadFields<'a, P>(&'a P);
+
+impl<P: Payload> core::fmt::Display for PayloadFields<'_, P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        Fields(&self.0.encode_to_vec()).fmt(f)
+    }
 }
 
-/// Logs the fields of the first voice packet, with the audio as length only.
-fn log_first_packet(span: &Span, mut msg: proto::SendVoiceInputMessage, elapsed: Duration) {
-    if !tracing::enabled!(tracing::Level::DEBUG) {
-        return;
+/// Shows the fields of a voice packet without the audio, for logs.
+struct VoiceFields<'a>(&'a proto::SendVoiceInputMessage);
+
+impl core::fmt::Display for VoiceFields<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut msg = self.0.clone();
+        if let Some(b) = msg.data_block.as_mut().and_then(|d| d.buffer.as_mut()) {
+            b.contents = None;
+        }
+        PayloadFields(&msg).fmt(f)
     }
-    let buffer = msg.data_block.as_mut().and_then(|d| d.buffer.as_mut());
-    let audio = buffer
-        .and_then(|b| b.contents.take())
-        .map_or(0, |c| c.len());
-    let fields = encode_payload(&msg);
-    tracing::debug!(parent: span, ?elapsed, audio, fields = %Fields(&fields), "first voice packet");
 }
 
 /// Current item plus next items to request for [`NowPlaying::up_next`].
@@ -661,11 +668,9 @@ impl Client {
         let id_text = id.map(|n| id_str(n, &mut buf));
         // Voice packets are logged by `Siri`.
         if P::TYPE != proto::SendVoiceInputMessage::TYPE
-            && tracing::enabled!(tracing::Level::DEBUG)
             && let Some(elapsed) = self.inner.shared.siri_elapsed()
         {
-            let fields = encode_payload(msg);
-            tracing::debug!(parent: &self.inner.span, kind = P::TYPE, name = type_name(P::TYPE), ?elapsed, fields = %Fields(&fields), "sent during Siri");
+            tracing::debug!(parent: &self.inner.span, kind = P::TYPE, name = type_name(P::TYPE), ?elapsed, fields = %PayloadFields(msg), "sent during Siri");
         }
         {
             let mut out = self.inner.shared.outbox();
