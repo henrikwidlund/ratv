@@ -15,8 +15,8 @@ use crate::{Envelope, Error};
 /// Player used when a message has no player.
 pub const DEFAULT_PLAYER: &str = "MediaRemote-DefaultPlayer";
 
-/// Seconds from 1970-01-01 to 2001-01-01.
-const COCOA_EPOCH: Duration = Duration::from_secs(978_307_200);
+/// Time from 1970-01-01 to 2001-01-01.
+const COCOA_EPOCH: Duration = Duration::from_hours(271_752);
 
 /// Playback state.
 pub type PlaybackState = proto::playback_state::Enum;
