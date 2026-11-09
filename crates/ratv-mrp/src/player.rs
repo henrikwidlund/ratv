@@ -193,6 +193,10 @@ pub struct NowPlaying {
     pub artwork_id: Option<String>,
     /// Artwork URL, if the app provides one.
     pub artwork_url: Option<String>,
+    /// Image of the item, usually JPEG. Not sent over MRP; filled from Companion.
+    pub artwork_data: Option<bytes::Bytes>,
+    /// True if subtitles are shown. Not sent over MRP; filled from Companion.
+    pub captions_enabled: Option<bool>,
 }
 
 impl NowPlaying {

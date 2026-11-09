@@ -4,7 +4,8 @@ Rust library to control Apple TV devices on the local network.
 
 Protocols:
 
-- **Companion**: pairing, buttons, apps, power, volume, accounts, text input, touch.
+- **Companion**: pairing, buttons, apps, power, volume, accounts, text input, touch,
+  what is playing (title, state, position, artwork).
 - **MRP over AirPlay 2**: what is playing (title, artist, position, state),
   artwork, playback, languages, chapters,
   Up Next, volume, output devices, Siri voice input.
@@ -15,7 +16,8 @@ genre and age rating for movies and shows, and season, episode number and
 episode title for shows.
 
 `AppleTv` connects with both protocols. Each method uses the protocol that
-supports it.
+supports it. `AppleTv::now_playing` uses the MRP data, with state and
+position from Companion, which change about 0.5 s sooner.
 
 The protocol crates do no I/O. They take bytes and return bytes. The `ratv`
 crate runs them with tokio.

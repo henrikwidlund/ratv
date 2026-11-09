@@ -13,6 +13,7 @@ mod connection;
 mod error;
 mod frame;
 pub mod message;
+pub mod now_playing;
 pub mod pairing;
 pub mod text_input;
 

@@ -11,11 +11,12 @@ use ratv_companion::message::{
     SystemInfo, TextInputStart, TextInputStop, Touch, TouchPhase, TouchStart, TvRemoteSessionStart,
     event,
 };
+use ratv_companion::now_playing::{FetchNowPlaying, NowPlaying};
 use ratv_companion::text_input::{self, TextInputCommand, TextSession};
 use ratv_companion::{Connection, FrameType};
 use ratv_hap::{Credentials, pair_verify};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, broadcast, oneshot};
+use tokio::sync::{Notify, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
 
@@ -46,6 +47,7 @@ struct Inner {
     shared: Arc<Shared>,
     link: Link,
     events: broadcast::Sender<Event>,
+    now_playing: watch::Receiver<NowPlaying>,
     xid: AtomicU32,
     timeout: Duration,
     /// Requests in a row that timed out while nothing was received.
@@ -200,14 +202,17 @@ impl Client {
         let shared = Arc::new(Shared::default());
         let (link_tx, link) = Link::new();
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
+        let (np_tx, now_playing) = watch::channel(NowPlaying::default());
         let task = tokio::spawn(
-            run(stream, conn, shared.clone(), link_tx, events.clone()).instrument(span.clone()),
+            run(stream, conn, shared.clone(), link_tx, events.clone(), np_tx)
+                .instrument(span.clone()),
         );
         let client = Self {
             inner: Arc::new(Inner {
                 shared,
                 link,
                 events,
+                now_playing,
                 xid: AtomicU32::new(rng::u32() >> 16),
                 timeout: options.timeout,
                 silent_timeouts: AtomicU32::new(0),
@@ -234,7 +239,7 @@ impl Client {
         let session = SessionStart { session_id: ours };
         // Sent in this order without waiting for each reply. Replies are matched by xid.
         let touch_area = TouchStart::default();
-        let (info, touch_start, session, tv_remote, text_input, interest, actions) =
+        let (info, touch_start, session, tv_remote, text_input, interest, actions, playing) =
             tokio::time::timeout(step, async {
                 tokio::join!(
                     client.request(&info),
@@ -250,40 +255,38 @@ impl Client {
                             event::TV_SYSTEM_STATUS,
                             event::SIRI_ENDPOINT,
                             event::SUPPORTED_ACTIONS,
+                            event::NOW_PLAYING_INFO,
                         ],
                         deregister: &[],
                     }),
                     // The device then sends the current state as an event.
                     client.request(&FetchSupportedActions),
+                    // The device then sends what plays as an event.
+                    client.request(&FetchNowPlaying),
                 )
             })
             .await?;
         let siri = message::siri_enabled(&Message::decode(&info?)?);
         tracing::debug!(?siri, "Siri enabled");
         // An `Event::SiriStatus` may have come first. It is newer.
-        let _ = client.inner.shared.siri_enabled.compare_exchange(
-            0,
-            to_flag(siri),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        let flag = &client.inner.shared.siri_enabled;
+        let _ = flag.compare_exchange(0, to_flag(siri), Ordering::Relaxed, Ordering::Relaxed);
         let device = message::session_start_response(&Message::decode(&session?)?)?;
         client.inner.session_id.store(
             message::combined_session_id(device, ours),
             Ordering::Relaxed,
         );
-        // Older tvOS versions may not support it.
-        if let Err(err) = touch_start {
-            tracing::debug!(%err, "_touchStart failed");
-        }
-        if let Err(err) = tv_remote {
-            tracing::debug!(%err, "TVRCSessionStart failed");
-        }
-        if let Err(err) = text_input {
-            tracing::debug!(%err, "_tiStart failed");
-        }
-        if let Err(err) = actions {
-            tracing::debug!(%err, "FetchSupportedActionsEvent failed");
+        // Older tvOS versions may not support these.
+        for (id, result) in [
+            ("_touchStart", touch_start),
+            ("TVRCSessionStart", tv_remote),
+            ("_tiStart", text_input),
+            ("FetchSupportedActionsEvent", actions),
+            ("FetchCurrentNowPlayingInfoEvent", playing),
+        ] {
+            if let Err(err) = result {
+                tracing::debug!(%err, "{id} failed");
+            }
         }
         interest?;
         tracing::debug!("connected");
@@ -401,6 +404,13 @@ impl Client {
     #[must_use]
     pub fn siri_enabled(&self) -> Option<bool> {
         from_flag(self.inner.shared.siri_enabled.load(Ordering::Relaxed))
+    }
+
+    /// What the device plays. Faster than MRP, but has less data, and may not
+    /// hold an item that was paused before connecting.
+    #[must_use]
+    pub fn now_playing(&self) -> watch::Receiver<NowPlaying> {
+        self.inner.now_playing.clone()
     }
 
     /// True if the Guide button does something on the current screen.
@@ -735,6 +745,7 @@ async fn run<S>(
     shared: Arc<Shared>,
     link: LinkTx,
     events: broadcast::Sender<Event>,
+    now_playing: watch::Sender<NowPlaying>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -772,7 +783,7 @@ async fn run<S>(
                     }
                     shared.reads.fetch_add(1, Ordering::Relaxed);
                     while let Some(frame) = conn.poll_frame()? {
-                        dispatch(frame.ty, frame.payload, &shared, &events);
+                        dispatch(frame.ty, frame.payload, &shared, &events, &now_playing);
                     }
                 }
             }
@@ -793,7 +804,13 @@ async fn run<S>(
     let _ = stream.shutdown().await;
 }
 
-fn dispatch(ty: FrameType, payload: Bytes, shared: &Shared, events: &broadcast::Sender<Event>) {
+fn dispatch(
+    ty: FrameType,
+    payload: Bytes,
+    shared: &Shared,
+    events: &broadcast::Sender<Event>,
+    now_playing: &watch::Sender<NowPlaying>,
+) {
     if ty != FrameType::E_OPACK {
         tracing::trace!(ty = ty.0, "ignoring frame");
         return;
@@ -811,6 +828,9 @@ fn dispatch(ty: FrameType, payload: Bytes, shared: &Shared, events: &broadcast::
     #[cfg(feature = "sensitive-logs")]
     tracing::trace!(?msg, "received");
     match msg.kind() {
+        Some(MessageType::Event) if msg.id() == Some(event::NOW_PLAYING_INFO) => {
+            now_playing.send_if_modified(|np| np.apply(&msg));
+        }
         Some(MessageType::Event) => {
             if let Some(event) = Event::parse(&msg) {
                 match event {
