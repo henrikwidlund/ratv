@@ -39,7 +39,7 @@ use crate::mrp::{
     self, Artwork, Button, Command, LanguageOption, NowPlaying, PlaybackState, RepeatMode,
     ShuffleMode,
 };
-use crate::{ClientOptions, Credentials, Error, PairOptions, Siri};
+use crate::{ClientOptions, Credentials, Error, PairOptions, Siri, now_playing};
 
 /// Where the device's services listen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -254,6 +254,8 @@ pub struct AppleTv {
     mrp: Option<mrp::Client>,
     connected_at: Instant,
     scrubs: Arc<Scrubs>,
+    /// Merged MRP and Companion now playing, while Companion is connected.
+    now_playing: Option<(watch::Receiver<NowPlaying>, Arc<now_playing::MergeTask>)>,
 }
 
 impl AppleTv {
@@ -280,11 +282,19 @@ impl AppleTv {
         };
         let (companion, mrp) = tokio::join!(companion, mrp);
         let mut first_error = None;
+        let companion = keep("Companion", companion, &mut first_error);
+        let mrp = keep("MRP", mrp, &mut first_error);
+        let now_playing = companion.as_ref().map(|c| {
+            let (rx, task) =
+                now_playing::spawn(mrp.as_ref().map(mrp::Client::now_playing), c.now_playing());
+            (rx, Arc::new(task))
+        });
         let tv = Self {
-            companion: keep("Companion", companion, &mut first_error),
-            mrp: keep("MRP", mrp, &mut first_error),
+            companion,
+            mrp,
             connected_at: Instant::now(),
             scrubs: Arc::default(),
+            now_playing,
         };
         if tv.companion.is_none() && tv.mrp.is_none() {
             return Err(first_error.unwrap_or(Error::NoEndpoints));
@@ -355,10 +365,18 @@ impl AppleTv {
         })
     }
 
-    /// What the device plays. Needs MRP.
+    /// What the device plays.
+    ///
+    /// MRP data. With Companion, state and position change about 0.5 s
+    /// sooner, and [`NowPlaying::artwork_data`] and
+    /// [`NowPlaying::captions_enabled`] are set. Without MRP, only the
+    /// Companion data: title, app, state, position and artwork.
     #[must_use]
     pub fn now_playing(&self) -> Option<watch::Receiver<NowPlaying>> {
-        self.mrp.as_ref().map(mrp::Client::now_playing)
+        self.now_playing
+            .as_ref()
+            .map(|(rx, _)| rx.clone())
+            .or_else(|| self.mrp.as_ref().map(mrp::Client::now_playing))
     }
 
     /// Volume and mute state. Needs MRP.

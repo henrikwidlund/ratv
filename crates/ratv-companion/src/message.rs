@@ -610,6 +610,8 @@ pub mod event {
     pub const TEXT_INPUT_STOPPED: &str = "_tiStopped";
     /// Sent after `TVRCSessionStart` without registering interest.
     pub const SUPPORTED_ACTIONS: &str = "SupportedActions";
+    /// What the device plays, see [`now_playing`](crate::now_playing).
+    pub const NOW_PLAYING_INFO: &str = "NowPlayingInfo";
     /// Siri info, as in the `_systemInfo` response. Sent without registering interest.
     pub const SIRI_STATUS: &str = "SiriStatus";
     /// Siri stopped recording. Sent as a request; reply with [`SiriEndpointReply`](super::SiriEndpointReply).

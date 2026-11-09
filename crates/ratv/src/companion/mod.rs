@@ -14,4 +14,5 @@ pub use ratv_companion::message::{
     Account, App, AttentionState, ButtonState, Event, HidCommand, MediaControl, MediaControlFlags,
     TouchPhase,
 };
+pub use ratv_companion::now_playing::{NowPlaying, PlaybackState};
 pub use siri::{Siri, SiriOptions};

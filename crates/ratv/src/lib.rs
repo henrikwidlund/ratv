@@ -45,6 +45,8 @@ mod link;
 mod log;
 #[cfg(feature = "mrp")]
 pub mod mrp;
+#[cfg(all(feature = "companion", feature = "mrp"))]
+mod now_playing;
 #[cfg(any(feature = "companion", feature = "mrp"))]
 mod options;
 #[cfg(any(feature = "companion", feature = "mrp"))]

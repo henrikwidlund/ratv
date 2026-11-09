@@ -212,6 +212,49 @@ fn siri_capability(status: i64) -> Vec<u8> {
     .encode()
 }
 
+/// `NowPlayingInfo` event with a keyed archive, as the device sends it.
+fn now_playing_event(title: &str, state: i64) -> Vec<u8> {
+    use ratv_codec::bplist::Value as P;
+    let dict = |entries: Vec<(&'static str, P<'static>)>| -> P<'static> {
+        P::Dict(entries.into_iter().map(|(k, v)| (k.into(), v)).collect())
+    };
+    let archive = dict(vec![
+        ("$top", dict(vec![("root", P::Uid(1))])),
+        (
+            "$objects",
+            P::Array(vec![
+                P::String("$null".into()),
+                dict(vec![
+                    ("playbackState", P::Uid(2)),
+                    ("playbackRate", P::Uid(3)),
+                    ("metadata", P::Uid(4)),
+                    ("imageData", P::Uid(5)),
+                ]),
+                P::Int(state),
+                P::Real(if state == 1 { 1.0 } else { 0.0 }),
+                dict(vec![
+                    ("title", P::Uid(6)),
+                    ("timeOffset", P::Real(12.0)),
+                    ("timestamp", P::Real(100.0)),
+                ]),
+                P::Data(b"jpeg".to_vec().into()),
+                P::String(title.to_owned().into()),
+            ]),
+        ),
+    ])
+    .encode();
+    let mut ev = Vec::new();
+    Encoder::new(&mut ev).dict(4, |e| {
+        e.str("_i").str("NowPlayingInfo");
+        e.str("_x").int(5);
+        e.str("_t").int(MessageType::Event as i64);
+        e.str("_c").dict(1, |e| {
+            e.str("NowPlayingInfoKey").data(&archive);
+        });
+    });
+    ev
+}
+
 fn empty(e: &mut Encoder<'_>) {
     e.dict(0, |_| {});
 }
@@ -354,6 +397,11 @@ async fn device_session(mut s: DuplexStream, controller: PairedController, log: 
                         e.str("GuideSupportedKey").bool(true);
                     });
                 });
+                send(&mut s, &mut conn, FrameType::E_OPACK, &ev).await;
+                Some(response(xid, &id, empty))
+            }
+            "FetchCurrentNowPlayingInfoEvent" => {
+                let ev = now_playing_event("Nocturne", 1);
                 send(&mut s, &mut conn, FrameType::E_OPACK, &ev).await;
                 Some(response(xid, &id, empty))
             }
@@ -953,6 +1001,15 @@ async fn state_read_when_connecting() {
 }
 
 #[tokio::test]
+async fn now_playing_read_when_connecting() {
+    let (client, _) = connect().await;
+    let np = client.now_playing().borrow().clone();
+    assert_eq!(np.title.as_deref(), Some("Nocturne"));
+    assert_eq!(np.state, Some(companion::PlaybackState::Playing));
+    assert_eq!(np.artwork.as_deref(), Some(&b"jpeg"[..]));
+}
+
+#[tokio::test]
 async fn siri_off_fails_before_start() {
     let (client, log) = connect_with(Log {
         siri_off: true,
@@ -1093,6 +1150,12 @@ async fn apple_tv_siri_uses_companion() {
     let tv = AppleTv::connect(&endpoints, &creds, &options())
         .await
         .unwrap();
+    // Without MRP, now playing comes from Companion.
+    let np = tv.now_playing().unwrap().borrow().clone();
+    assert_eq!(np.title.as_deref(), Some("Nocturne"));
+    assert_eq!(np.state, Some(ratv::mrp::PlaybackState::Playing));
+    assert_eq!(np.elapsed, Some(12.0));
+    assert_eq!(np.artwork_data.as_deref(), Some(&b"jpeg"[..]));
     let mut siri = tv.start_siri().await.unwrap();
     assert!(matches!(siri, Siri::Companion(_)));
     siri.send(vec![1, 2, 3]).await.unwrap();
