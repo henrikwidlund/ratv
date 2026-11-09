@@ -4,6 +4,7 @@
 //! `_i` identifier, `_x` transaction id, `_t` [`MessageType`], `_c` content.
 //! Responses use the `_x` of their request. Errors use `_ec`, `_ed` and `_em`.
 
+use ratv_codec::bplist;
 use ratv_codec::opack::{self, Encoder, Value};
 
 use crate::Error;
@@ -553,6 +554,52 @@ pub fn attention_response(msg: &Message<'_>) -> Result<AttentionState, Error> {
         .ok_or(Error::InvalidField("state"))
 }
 
+/// Reads from a [`SystemInfo`] response if Siri is on in the device settings.
+/// `None` if the response does not say.
+#[must_use]
+pub fn siri_enabled(msg: &Message<'_>) -> Option<bool> {
+    siri_info_enabled(msg.field("_siriInfo")?)
+}
+
+/// Reads if Siri is on from Siri info, as in `_siriInfo` or [`event::SIRI_STATUS`].
+fn siri_info_enabled(info: &Value<'_>) -> Option<bool> {
+    info.get("deviceCapabilitiesV2")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_bytes)
+        .find_map(assistant_enabled)
+}
+
+/// Reads `AssistantEnabledCapability` from one archived Siri capability.
+fn assistant_enabled(data: &[u8]) -> Option<bool> {
+    let archive = bplist::decode(data).ok()?;
+    let objects = archive.get("$objects")?.as_array()?;
+    let resolve = |v: &bplist::Value<'_>| match *v {
+        bplist::Value::Uid(i) => objects.get(usize::try_from(i).ok()?),
+        _ => None,
+    };
+    let root = resolve(archive.get("$top")?.get("root")?)?;
+    let backing = resolve(root.get("SVDAssistantEnabledCapabilityBacking")?)?;
+    let status = resolve(backing.get("primitivesMap_AssistantEnabledCapability::supportStatus")?)?;
+    match status.get("supportStatus")?.as_i64()? {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+/// Makes the device send [`event::SUPPORTED_ACTIONS`] now. The response is empty.
+#[derive(Debug, Clone, Copy)]
+pub struct FetchSupportedActions;
+
+impl Outgoing for FetchSupportedActions {
+    const ID: &str = "FetchSupportedActionsEvent";
+
+    fn content(&self, e: &mut Encoder<'_>) {
+        empty(e);
+    }
+}
+
 /// Event names for [`Interest`].
 #[allow(missing_docs)]
 pub mod event {
@@ -563,6 +610,8 @@ pub mod event {
     pub const TEXT_INPUT_STOPPED: &str = "_tiStopped";
     /// Sent after `TVRCSessionStart` without registering interest.
     pub const SUPPORTED_ACTIONS: &str = "SupportedActions";
+    /// Siri info, as in the `_systemInfo` response. Sent without registering interest.
+    pub const SIRI_STATUS: &str = "SiriStatus";
     /// Siri stopped recording. Sent as a request; reply with [`SiriEndpointReply`](super::SiriEndpointReply).
     pub const SIRI_ENDPOINT: &str = "_siriEndpoint";
 }
@@ -843,6 +892,11 @@ pub enum Event {
         /// True if the Guide button does something on the new screen.
         guide_supported: bool,
     },
+    /// Siri was turned on or off, or the user account changed.
+    SiriStatus {
+        /// True if Siri is on in the device settings.
+        enabled: bool,
+    },
     /// Siri stopped recording. The iPhone then stops sending audio.
     /// Sent as a request; reply with [`SiriEndpointReply`].
     SiriEndpoint,
@@ -866,6 +920,9 @@ impl Event {
             event::SYSTEM_STATUS | event::TV_SYSTEM_STATUS => Some(Self::SystemStatus(
                 AttentionState::from_code(msg.field("state").and_then(Value::as_i64).unwrap_or(0)),
             )),
+            event::SIRI_STATUS => Some(Self::SiriStatus {
+                enabled: siri_info_enabled(msg.content()?)?,
+            }),
             event::TEXT_INPUT_STARTED => Some(Self::TextInputStarted),
             event::TEXT_INPUT_STOPPED => Some(Self::TextInputStopped),
             event::SUPPORTED_ACTIONS => Some(Self::ScreenChanged {
@@ -1091,6 +1148,80 @@ mod tests {
                 name: "Ben".into()
             }
         );
+    }
+
+    /// Siri capability archive as the device sends it.
+    fn siri_capability(status: i64) -> Vec<u8> {
+        use bplist::Value as P;
+        let dict = |entries: Vec<(&'static str, P<'static>)>| -> P<'static> {
+            P::Dict(entries.into_iter().map(|(k, v)| (k.into(), v)).collect())
+        };
+        dict(vec![
+            ("$archiver", P::String("NSKeyedArchiver".into())),
+            ("$top", dict(vec![("root", P::Uid(1))])),
+            (
+                "$objects",
+                P::Array(vec![
+                    P::String("$null".into()),
+                    dict(vec![("SVDAssistantEnabledCapabilityBacking", P::Uid(2))]),
+                    dict(vec![(
+                        "primitivesMap_AssistantEnabledCapability::supportStatus",
+                        P::Uid(3),
+                    )]),
+                    dict(vec![("supportStatus", P::Int(status))]),
+                ]),
+            ),
+        ])
+        .encode()
+    }
+
+    fn system_info_response(capabilities: &[&[u8]]) -> Message<'static> {
+        let mut out = Vec::new();
+        Encoder::new(&mut out).dict(2, |e| {
+            e.str("_t").int(3);
+            e.str("_c").dict(1, |e| {
+                e.str("_siriInfo").dict(1, |e| {
+                    e.str("deviceCapabilitiesV2")
+                        .array(capabilities.len(), |e| {
+                            for c in capabilities {
+                                e.data(c);
+                            }
+                        });
+                });
+            });
+        });
+        Message::decode(&out).unwrap().into_owned()
+    }
+
+    #[test]
+    fn siri_status() {
+        let on = siri_capability(1);
+        let off = siri_capability(2);
+        assert_eq!(
+            siri_enabled(&system_info_response(&[b"x", &on])),
+            Some(true)
+        );
+        assert_eq!(siri_enabled(&system_info_response(&[&off])), Some(false));
+        assert_eq!(
+            siri_enabled(&system_info_response(&[&siri_capability(0)])),
+            None
+        );
+        assert_eq!(siri_enabled(&system_info_response(&[])), None);
+        assert_eq!(siri_enabled(&roundtrip(&FetchSupportedActions)), None);
+
+        let raw = event("SiriStatus", |e| {
+            e.dict(1, |e| {
+                e.str("deviceCapabilitiesV2").array(1, |e| {
+                    e.data(&off);
+                });
+            });
+        });
+        assert_eq!(
+            Event::parse(&Message::decode(&raw).unwrap()),
+            Some(Event::SiriStatus { enabled: false })
+        );
+        let raw = event("SiriStatus", empty);
+        assert_eq!(Event::parse(&Message::decode(&raw).unwrap()), None);
     }
 
     #[test]

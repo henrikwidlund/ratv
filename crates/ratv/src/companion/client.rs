@@ -1,14 +1,15 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ratv_companion::message::{
     self, Account, App, AttentionState, ButtonState, Event, FetchAccounts, FetchApps,
-    FetchAttentionState, Hid, HidCommand, Interest, LaunchApp, MediaControl, Message, MessageType,
-    Outgoing, SessionStart, SessionStop, SiriEndpointReply, SwitchAccount, SystemInfo,
-    TextInputStart, TextInputStop, Touch, TouchPhase, TouchStart, TvRemoteSessionStart, event,
+    FetchAttentionState, FetchSupportedActions, Hid, HidCommand, Interest, LaunchApp, MediaControl,
+    Message, MessageType, Outgoing, SessionStart, SessionStop, SiriEndpointReply, SwitchAccount,
+    SystemInfo, TextInputStart, TextInputStop, Touch, TouchPhase, TouchStart, TvRemoteSessionStart,
+    event,
 };
 use ratv_companion::text_input::{self, TextInputCommand, TextSession};
 use ratv_companion::{Connection, FrameType};
@@ -71,6 +72,27 @@ struct Shared {
     wake: Notify,
     /// Number of reads with data, to see if the device sends anything.
     reads: AtomicU64,
+    /// Last [`Event::ScreenChanged`], see [`to_flag`].
+    guide_supported: AtomicU8,
+    /// Siri on in the device settings, see [`to_flag`].
+    siri_enabled: AtomicU8,
+}
+
+/// Stores an `Option<bool>` in an atomic: 0 unknown, 1 false, 2 true.
+const fn to_flag(v: Option<bool>) -> u8 {
+    match v {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }
+}
+
+const fn from_flag(v: u8) -> Option<bool> {
+    match v {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -212,7 +234,7 @@ impl Client {
         let session = SessionStart { session_id: ours };
         // Sent in this order without waiting for each reply. Replies are matched by xid.
         let touch_area = TouchStart::default();
-        let (info, touch_start, session, tv_remote, text_input, interest) =
+        let (info, touch_start, session, tv_remote, text_input, interest, actions) =
             tokio::time::timeout(step, async {
                 tokio::join!(
                     client.request(&info),
@@ -227,13 +249,24 @@ impl Client {
                             event::SYSTEM_STATUS,
                             event::TV_SYSTEM_STATUS,
                             event::SIRI_ENDPOINT,
+                            event::SUPPORTED_ACTIONS,
                         ],
                         deregister: &[],
                     }),
+                    // The device then sends the current state as an event.
+                    client.request(&FetchSupportedActions),
                 )
             })
             .await?;
-        info?;
+        let siri = message::siri_enabled(&Message::decode(&info?)?);
+        tracing::debug!(?siri, "Siri enabled");
+        // An `Event::SiriStatus` may have come first. It is newer.
+        let _ = client.inner.shared.siri_enabled.compare_exchange(
+            0,
+            to_flag(siri),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
         let device = message::session_start_response(&Message::decode(&session?)?)?;
         client.inner.session_id.store(
             message::combined_session_id(device, ours),
@@ -248,6 +281,9 @@ impl Client {
         }
         if let Err(err) = text_input {
             tracing::debug!(%err, "_tiStart failed");
+        }
+        if let Err(err) = actions {
+            tracing::debug!(%err, "FetchSupportedActionsEvent failed");
         }
         interest?;
         tracing::debug!("connected");
@@ -357,6 +393,22 @@ impl Client {
     #[must_use]
     pub fn events(&self) -> broadcast::Receiver<Event> {
         self.inner.events.subscribe()
+    }
+
+    /// True if Siri is on in the device settings.
+    /// Read when connecting and updated with [`Event::SiriStatus`].
+    /// `None` if the device does not say.
+    #[must_use]
+    pub fn siri_enabled(&self) -> Option<bool> {
+        from_flag(self.inner.shared.siri_enabled.load(Ordering::Relaxed))
+    }
+
+    /// True if the Guide button does something on the current screen.
+    /// Read when connecting and updated with [`Event::ScreenChanged`].
+    /// `None` if the device did not say.
+    #[must_use]
+    pub fn guide_supported(&self) -> Option<bool> {
+        from_flag(self.inner.shared.guide_supported.load(Ordering::Relaxed))
     }
 
     /// Combined session id.
@@ -761,6 +813,15 @@ fn dispatch(ty: FrameType, payload: Bytes, shared: &Shared, events: &broadcast::
     match msg.kind() {
         Some(MessageType::Event) => {
             if let Some(event) = Event::parse(&msg) {
+                match event {
+                    Event::ScreenChanged { guide_supported } => shared
+                        .guide_supported
+                        .store(to_flag(Some(guide_supported)), Ordering::Relaxed),
+                    Event::SiriStatus { enabled } => shared
+                        .siri_enabled
+                        .store(to_flag(Some(enabled)), Ordering::Relaxed),
+                    _ => {}
+                }
                 let _ = events.send(event);
             }
         }

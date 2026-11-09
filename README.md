@@ -140,6 +140,15 @@ you show a control.
   Apple Podcasts then skips to the next episode instead. Use
   `NowPlaying::playback_speeds` and send a speed only when it is not empty.
 
+## Not supported
+
+The iPhone remote can also do these over Companion. ratv does not do them:
+
+- Up Next in the Apple TV app: read the list, add and remove items, mark
+  items as watched.
+- Read the Top Shelf items of the app in focus.
+- Play a given movie, show or song.
+
 ## Features
 
 | Feature          | Default | Content                                                      |

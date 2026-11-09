@@ -64,9 +64,12 @@ impl Client {
     /// Holds Siri. Send the audio with [`Siri::send`] or `Siri::push_pcm`
     /// (feature `opus`), then release Siri with [`Siri::finish`].
     ///
-    /// Siri must be on in the device settings.
-    /// Fails with [`Error::SiriActive`] while another [`Siri`] exists.
+    /// Fails with [`Error::SiriDisabled`] if Siri is off in the device settings,
+    /// and with [`Error::SiriActive`] while another [`Siri`] exists.
     pub async fn start_siri(&self, options: &SiriOptions) -> Result<Siri, Error> {
+        if self.siri_enabled() == Some(false) {
+            return Err(Error::SiriDisabled);
+        }
         if self.siri_active().swap(true, Ordering::AcqRel) {
             return Err(Error::SiriActive);
         }
