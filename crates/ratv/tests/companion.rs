@@ -31,6 +31,8 @@ struct Log {
     siri: Vec<String>,
     /// `_pttEligible` of each Siri start and stop.
     siri_ptt: Vec<Option<i64>>,
+    /// Set before connecting: Siri is off in the device settings.
+    siri_off: bool,
 }
 
 /// Value of an integer key in an OPACK dictionary.
@@ -186,6 +188,30 @@ fn error_response(xid: u32, code: i64, message: &str) -> Vec<u8> {
     out
 }
 
+/// Archived Siri capability as in `_siriInfo`: status 1 is on, 2 is off.
+fn siri_capability(status: i64) -> Vec<u8> {
+    use ratv_codec::bplist::Value as P;
+    let dict = |entries: Vec<(&'static str, P<'static>)>| -> P<'static> {
+        P::Dict(entries.into_iter().map(|(k, v)| (k.into(), v)).collect())
+    };
+    dict(vec![
+        ("$top", dict(vec![("root", P::Uid(1))])),
+        (
+            "$objects",
+            P::Array(vec![
+                P::String("$null".into()),
+                dict(vec![("SVDAssistantEnabledCapabilityBacking", P::Uid(2))]),
+                dict(vec![(
+                    "primitivesMap_AssistantEnabledCapability::supportStatus",
+                    P::Uid(3),
+                )]),
+                dict(vec![("supportStatus", P::Int(status))]),
+            ]),
+        ),
+    ])
+    .encode()
+}
+
 fn empty(e: &mut Encoder<'_>) {
     e.dict(0, |_| {});
 }
@@ -249,7 +275,20 @@ async fn device_session(mut s: DuplexStream, controller: PairedController, log: 
                 });
                 Some(ev)
             }
-            "_systemInfo" | "_tiStop" | "_touchStart" => Some(response(xid, &id, empty)),
+            "_systemInfo" => {
+                let status = if log.lock().unwrap().siri_off { 2 } else { 1 };
+                let capability = siri_capability(status);
+                Some(response(xid, &id, |e| {
+                    e.dict(1, |e| {
+                        e.str("_siriInfo").dict(1, |e| {
+                            e.str("deviceCapabilitiesV2").array(1, |e| {
+                                e.data(&capability);
+                            });
+                        });
+                    });
+                }))
+            }
+            "_tiStop" | "_touchStart" => Some(response(xid, &id, empty)),
             "_hidT" => {
                 let touch = (
                     int("_cx").unwrap(),
@@ -304,6 +343,20 @@ async fn device_session(mut s: DuplexStream, controller: PairedController, log: 
                     e.str("state").int(3);
                 });
             })),
+            "FetchSupportedActionsEvent" => {
+                // Like a real device, the event comes before the response.
+                let mut ev = Vec::new();
+                Encoder::new(&mut ev).dict(4, |e| {
+                    e.str("_i").str("SupportedActions");
+                    e.str("_x").int(3);
+                    e.str("_t").int(MessageType::Event as i64);
+                    e.str("_c").dict(1, |e| {
+                        e.str("GuideSupportedKey").bool(true);
+                    });
+                });
+                send(&mut s, &mut conn, FrameType::E_OPACK, &ev).await;
+                Some(response(xid, &id, empty))
+            }
             "FetchUserAccountsEvent" => Some(response(xid, &id, |e| {
                 e.dict(2, |e| {
                     e.str("acc-1").str("Anna");
@@ -378,6 +431,23 @@ async fn device_session(mut s: DuplexStream, controller: PairedController, log: 
                 assert_eq!(xid, 2);
                 log.lock().unwrap().siri.push("endpoint reply".into());
                 None
+            }
+            // Test only: the device sends `SiriStatus` with Siri off.
+            "turnSiriOff" => {
+                let capability = siri_capability(2);
+                let mut ev = Vec::new();
+                Encoder::new(&mut ev).dict(4, |e| {
+                    e.str("_i").str("SiriStatus");
+                    e.str("_x").int(4);
+                    e.str("_t").int(MessageType::Event as i64);
+                    e.str("_c").dict(1, |e| {
+                        e.str("deviceCapabilitiesV2").array(1, |e| {
+                            e.data(&capability);
+                        });
+                    });
+                });
+                send(&mut s, &mut conn, FrameType::E_OPACK, &ev).await;
+                Some(response(xid, &id, empty))
             }
             "silent" => None,
             _ => panic!("unexpected request {id}"),
@@ -820,8 +890,12 @@ async fn swipe_lifted_when_canceled() {
 }
 
 async fn connect() -> (companion::Client, Arc<Mutex<Log>>) {
+    connect_with(Log::default()).await
+}
+
+async fn connect_with(log: Log) -> (companion::Client, Arc<Mutex<Log>>) {
     let (creds, controller) = pair().await;
-    let log = Arc::new(Mutex::new(Log::default()));
+    let log = Arc::new(Mutex::new(log));
     let (client_io, device_io) = tokio::io::duplex(8192);
     tokio::spawn(device_session(device_io, controller, log.clone()));
     let client = companion::Client::connect_stream(client_io, &creds, &options())
@@ -869,6 +943,52 @@ async fn siri() {
         ]
     );
     assert_eq!(log.siri_ptt, [None; 4]);
+}
+
+#[tokio::test]
+async fn state_read_when_connecting() {
+    let (client, _) = connect().await;
+    assert_eq!(client.siri_enabled(), Some(true));
+    assert_eq!(client.guide_supported(), Some(true));
+}
+
+#[tokio::test]
+async fn siri_off_fails_before_start() {
+    let (client, log) = connect_with(Log {
+        siri_off: true,
+        ..Log::default()
+    })
+    .await;
+    assert_eq!(client.siri_enabled(), Some(false));
+    assert!(matches!(
+        client.start_siri(&companion::SiriOptions::default()).await,
+        Err(Error::SiriDisabled)
+    ));
+    settle(&client).await;
+    assert_eq!(log.lock().unwrap().siri, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn siri_status_event_updates_state() {
+    struct TurnSiriOff;
+    impl ratv_companion::message::Outgoing for TurnSiriOff {
+        const ID: &str = "turnSiriOff";
+        fn content(&self, e: &mut Encoder<'_>) {
+            empty(e);
+        }
+    }
+    let (client, _) = connect().await;
+    let mut events = client.events();
+    client.request(&TurnSiriOff).await.unwrap();
+    assert_eq!(
+        events.recv().await.unwrap(),
+        Event::SiriStatus { enabled: false }
+    );
+    assert_eq!(client.siri_enabled(), Some(false));
+    assert!(matches!(
+        client.start_siri(&companion::SiriOptions::default()).await,
+        Err(Error::SiriDisabled)
+    ));
 }
 
 #[tokio::test]

@@ -806,7 +806,7 @@ impl AppleTv {
     /// Holds Siri. Send the audio, then call [`Siri::finish`].
     ///
     /// Uses Companion, as the iPhone remote does, else MRP. Siri must be on
-    /// in the device settings. To choose, use
+    /// in the device settings, see [`siri_enabled`](Self::siri_enabled). To choose, use
     /// [`companion::Client::start_siri`] or [`mrp::Client::start_siri`].
     pub async fn start_siri(&self) -> Result<Siri, Error> {
         match self.route(false, Some(()), Some(())) {
@@ -978,6 +978,20 @@ impl AppleTv {
             }
         );
         a.and(b)
+    }
+
+    /// True if Siri is on in the device settings.
+    /// `None` without Companion or if the device does not say.
+    #[must_use]
+    pub fn siri_enabled(&self) -> Option<bool> {
+        self.companion.as_ref()?.siri_enabled()
+    }
+
+    /// True if the Guide button does something on the current screen.
+    /// `None` without Companion or if the device did not say.
+    #[must_use]
+    pub fn guide_supported(&self) -> Option<bool> {
+        self.companion.as_ref()?.guide_supported()
     }
 
     /// True until one of the connected protocols closes.
