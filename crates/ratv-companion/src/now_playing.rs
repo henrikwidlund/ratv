@@ -128,15 +128,23 @@ impl NowPlaying {
             self.player = Some(v.to_owned());
             changed = true;
         }
-        // The device sends the same image again with every full update.
-        if let Some(v) = field(objects, root, "imageData").and_then(|v| bytes(objects, v))
-            && self.artwork.as_deref() != Some(v)
-        {
-            self.artwork = Some(Bytes::copy_from_slice(v));
-            changed = true;
+        // The device sends the image again with every full update, which is
+        // an update with metadata. A full update without an image means that
+        // the item has no image.
+        let metadata = field(objects, root, "metadata");
+        match field(objects, root, "imageData").and_then(|v| bytes(objects, v)) {
+            Some(v) if self.artwork.as_deref() != Some(v) => {
+                self.artwork = Some(Bytes::copy_from_slice(v));
+                changed = true;
+            }
+            None if metadata.is_some() && self.artwork.is_some() => {
+                self.artwork = None;
+                changed = true;
+            }
+            _ => {}
         }
         // Metadata is always sent whole.
-        if let Some(md) = field(objects, root, "metadata") {
+        if let Some(md) = metadata {
             let text = |key| field(objects, md, key).and_then(|v| string(objects, v));
             if self.title.as_deref() != text("title") {
                 self.title = text("title").map(str::to_owned);
@@ -322,6 +330,13 @@ mod tests {
         assert_eq!(np.position(200.0), Some(10.0));
         assert!(apply(&mut np, &info_event(Some(3), None, None, None)));
         assert_eq!(np.state, Some(PlaybackState::Stopped));
+        assert!(np.artwork.is_some());
+
+        // A full event without an image: the new item has no image.
+        let next = info_event(Some(1), Some(1.0), None, Some(("News", 0.0, 100.0)));
+        assert!(apply(&mut np, &next));
+        assert_eq!(np.title.as_deref(), Some("News"));
+        assert_eq!(np.artwork, None);
     }
 
     #[test]
