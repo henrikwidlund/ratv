@@ -565,7 +565,7 @@ async fn session() {
         .unwrap()
         .is::<proto::SendCommandResultMessage>()
     {}
-    let art = client.artwork(300.0, -1.0).await.unwrap().unwrap();
+    let art = client.artwork(300, 0).await.unwrap().unwrap();
     assert_eq!(&art.data[..], b"\x89PNG");
     assert_eq!(art.mime_type.as_deref(), Some("image/png"));
     assert_eq!(art.width, Some(300));

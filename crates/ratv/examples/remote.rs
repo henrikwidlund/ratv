@@ -108,10 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}\t{}", a.id, a.name);
             }
         }
-        (None, "like") => tv.like(true).await?,
-        (None, "unlike") => tv.like(false).await?,
-        (None, "dislike") => tv.dislike(true).await?,
-        (None, "undislike") => tv.dislike(false).await?,
+        (None, "like") => tv.set_liked(true).await?,
+        (None, "unlike") => tv.set_liked(false).await?,
+        (None, "dislike") => tv.set_disliked(true).await?,
+        (None, "undislike") => tv.set_disliked(false).await?,
         (None, "shuffle") => tv.cycle_shuffle().await?,
         (None, "repeat") => tv.cycle_repeat().await?,
         (None, "info") => info(&tv).await?,
@@ -223,7 +223,7 @@ async fn run_value(tv: &AppleTv, command: &str) -> Result<(), Box<dyn std::error
     } else if let Some(v) = value("speed=") {
         tv.set_playback_rate(v.parse()?).await?;
     } else if let Some(v) = value("rate=") {
-        tv.rate(v.parse()?).await?;
+        tv.set_rating(v.parse()?).await?;
     } else if let Some(v) = value("ff=") {
         scrub(tv, true, v.parse()?).await?;
     } else if let Some(v) = value("rw=") {
@@ -440,7 +440,7 @@ async fn save_artwork(tv: &AppleTv, path: &str) -> Result<(), Box<dyn std::error
     if let Ok(np) = tokio::time::timeout(Duration::from_secs(3), wait).await {
         println!("url: {}", opt(np?.artwork_url_sized(600, 600)));
     }
-    match tv.artwork(512.0, -1.0).await? {
+    match tv.artwork(512, 0).await? {
         Some(art) => {
             tokio::fs::write(path, &art.data).await?;
             println!(

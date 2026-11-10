@@ -146,13 +146,12 @@ impl NowPlaying {
         // Metadata is always sent whole.
         if let Some(md) = metadata {
             let text = |key| field(objects, md, key).and_then(|v| string(objects, v));
-            if self.title.as_deref() != text("title") {
-                self.title = text("title").map(str::to_owned);
-                changed = true;
-            }
-            if self.app.as_deref() != text("bundleID") {
-                self.app = text("bundleID").map(str::to_owned);
-                changed = true;
+            for (field, key) in [(&mut self.title, "title"), (&mut self.app, "bundleID")] {
+                let value = text(key);
+                if field.as_deref() != value {
+                    *field = value.map(str::to_owned);
+                    changed = true;
+                }
             }
             changed |= set(
                 &mut self.duration,

@@ -239,34 +239,38 @@ impl Client {
         let session = SessionStart { session_id: ours };
         // Sent in this order without waiting for each reply. Replies are matched by xid.
         let touch_area = TouchStart::default();
-        let (info, touch_start, session, tv_remote, text_input, interest, actions, playing) =
-            tokio::time::timeout(step, async {
-                tokio::join!(
-                    client.request(&info),
-                    client.request(&touch_area),
-                    client.request(&session),
-                    client.request(&TvRemoteSessionStart),
-                    // Makes the device send keyboard focus events.
-                    client.request(&TextInputStart),
-                    client.send_event(&Interest {
-                        register: &[
-                            event::MEDIA_CONTROL,
-                            event::SYSTEM_STATUS,
-                            event::TV_SYSTEM_STATUS,
-                            event::SIRI_ENDPOINT,
-                            event::SUPPORTED_ACTIONS,
-                            event::NOW_PLAYING_INFO,
-                        ],
-                        deregister: &[],
-                    }),
-                    // The device then sends the current state as an event.
-                    client.request(&FetchSupportedActions),
-                    // The device then sends what plays as an event.
-                    client.request(&FetchNowPlaying),
-                )
-            })
-            .await?;
-        let siri = message::siri_enabled(&Message::decode(&info?)?);
+        // Each request has its own limit, so an optional one that gets no
+        // answer does not fail the connect.
+        let (info, touch_start, session, tv_remote, text_input, interest, actions, playing) = tokio::join!(
+            within(step, client.request(&info)),
+            within(step, client.request(&touch_area)),
+            within(step, client.request(&session)),
+            within(step, client.request(&TvRemoteSessionStart)),
+            // Makes the device send keyboard focus events.
+            within(step, client.request(&TextInputStart)),
+            within(
+                step,
+                client.send_event(&Interest {
+                    register: &[
+                        event::MEDIA_CONTROL,
+                        event::SYSTEM_STATUS,
+                        event::TV_SYSTEM_STATUS,
+                        event::SIRI_ENDPOINT,
+                        event::SUPPORTED_ACTIONS,
+                        event::NOW_PLAYING_INFO,
+                    ],
+                    deregister: &[],
+                })
+            ),
+            // The device then sends the current state as an event.
+            within(step, client.request(&FetchSupportedActions)),
+            // The device then sends what plays as an event.
+            within(step, client.request(&FetchNowPlaying)),
+        );
+        // The Siri state is optional, so a reply that cannot be read only leaves it unknown.
+        let siri = Message::decode(&info?)
+            .ok()
+            .and_then(|m| message::siri_enabled(&m));
         tracing::debug!(?siri, "Siri enabled");
         // An `Event::SiriStatus` may have come first. It is newer.
         let flag = &client.inner.shared.siri_enabled;
@@ -727,6 +731,11 @@ struct Touching<'a> {
     client: &'a Client,
     at: (f64, f64),
     armed: bool,
+}
+
+/// Waits at most `limit` for `f`.
+async fn within<T>(limit: Duration, f: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
+    tokio::time::timeout(limit, f).await?
 }
 
 impl Drop for Touching<'_> {

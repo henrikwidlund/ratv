@@ -836,15 +836,17 @@ impl Client {
         }
     }
 
-    /// Requests the image of the current item in about this size.
-    /// A size of -1 keeps the aspect ratio. This is not the same as
-    /// [`NowPlaying::artwork_url_sized`], which uses 0. `None` if the item has no image.
+    /// Requests the image of the current item in about this size in pixels.
+    /// A size of 0 keeps the aspect ratio, as in [`NowPlaying::artwork_url_sized`].
+    /// `None` if the item has no image.
     ///
     /// Right after connect the device may not answer with an image yet.
     /// Wait until [`NowPlaying::artwork_id`] is set, and fetch again when it changes.
-    pub async fn artwork(&self, width: f64, height: f64) -> Result<Option<Artwork>, Error> {
+    pub async fn artwork(&self, width: u32, height: u32) -> Result<Option<Artwork>, Error> {
+        // The device keeps the aspect ratio for -1.
+        let size = |v: u32| if v == 0 { -1.0 } else { f64::from(v) };
         let env = self
-            .request(&messages::playback_queue_request(width, height))
+            .request(&messages::playback_queue_request(size(width), size(height)))
             .await?;
         Ok(ratv_mrp::artwork(&env)?)
     }
@@ -884,17 +886,17 @@ impl Client {
     }
 
     /// Rates the current item. The range is in [`NowPlaying::rating_range`].
-    pub async fn rate(&self, rating: f32) -> Result<(), Error> {
+    pub async fn set_rating(&self, rating: f32) -> Result<(), Error> {
         self.run_command(&messages::rate_track(rating)).await
     }
 
     /// Likes the current item, or removes the like. See [`NowPlaying::liked`].
-    pub async fn like(&self, liked: bool) -> Result<(), Error> {
+    pub async fn set_liked(&self, liked: bool) -> Result<(), Error> {
         self.run_command(&messages::like_track(liked)).await
     }
 
     /// Dislikes the current item, or removes the dislike. See [`NowPlaying::disliked`].
-    pub async fn dislike(&self, disliked: bool) -> Result<(), Error> {
+    pub async fn set_disliked(&self, disliked: bool) -> Result<(), Error> {
         self.run_command(&messages::dislike_track(disliked)).await
     }
 

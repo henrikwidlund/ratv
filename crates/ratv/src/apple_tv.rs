@@ -370,7 +370,8 @@ impl AppleTv {
     /// MRP data. With Companion, state and position change about 0.5 s
     /// sooner, and [`NowPlaying::artwork_data`] and
     /// [`NowPlaying::captions_enabled`] are set. Without MRP, only the
-    /// Companion data: title, app, state, position and artwork.
+    /// Companion data: title, state, position and artwork, and the app only
+    /// for the Apple TV app.
     #[must_use]
     pub fn now_playing(&self) -> Option<watch::Receiver<NowPlaying>> {
         self.now_playing
@@ -386,7 +387,7 @@ impl AppleTv {
     }
 
     /// Image of the current item. Needs MRP. See [`mrp::Client::artwork`].
-    pub async fn artwork(&self, width: f64, height: f64) -> Result<Option<Artwork>, Error> {
+    pub async fn artwork(&self, width: u32, height: u32) -> Result<Option<Artwork>, Error> {
         self.need_mrp()?.artwork(width, height).await
     }
 
@@ -484,13 +485,17 @@ impl AppleTv {
     }
 
     /// True if playing, false if paused or stopped, `None` if not known.
+    /// Uses the merged state, which changes sooner than the MRP state.
     fn playing(&self) -> Option<bool> {
-        self.with_now_playing(|np| match np.state? {
+        let state = match &self.now_playing {
+            Some((rx, _)) => rx.borrow().state,
+            None => self.with_now_playing(|np| np.state).flatten(),
+        };
+        match state? {
             PlaybackState::Playing => Some(true),
             PlaybackState::Paused | PlaybackState::Stopped => Some(false),
             _ => None,
-        })
-        .flatten()
+        }
     }
 
     /// Sends `command`, or the Companion `fallback` if the app does not list `check`.
@@ -833,7 +838,7 @@ impl AppleTv {
                 .await
                 .map(Siri::Companion),
             Some(Route::Mrp(m, ())) => m.start_siri().await.map(Siri::Mrp),
-            None => Err(Error::NoEndpoints),
+            None => Err(Error::NotConnected("Companion")),
         }
     }
 
@@ -868,18 +873,18 @@ impl AppleTv {
     }
 
     /// Rates the current item. Needs MRP. See [`NowPlaying::rating_range`].
-    pub async fn rate(&self, rating: f32) -> Result<(), Error> {
-        self.need_mrp()?.rate(rating).await
+    pub async fn set_rating(&self, rating: f32) -> Result<(), Error> {
+        self.need_mrp()?.set_rating(rating).await
     }
 
     /// Likes the current item, or removes the like. Needs MRP.
-    pub async fn like(&self, liked: bool) -> Result<(), Error> {
-        self.need_mrp()?.like(liked).await
+    pub async fn set_liked(&self, liked: bool) -> Result<(), Error> {
+        self.need_mrp()?.set_liked(liked).await
     }
 
     /// Dislikes the current item, or removes the dislike. Needs MRP.
-    pub async fn dislike(&self, disliked: bool) -> Result<(), Error> {
-        self.need_mrp()?.dislike(disliked).await
+    pub async fn set_disliked(&self, disliked: bool) -> Result<(), Error> {
+        self.need_mrp()?.set_disliked(disliked).await
     }
 
     /// Mutes or unmutes the device. Needs MRP. Fails with [`Error::VolumeNotAvailable`]

@@ -24,6 +24,7 @@ enum Source {
 #[derive(Debug, Default)]
 pub(crate) struct Merger {
     mrp_state: (Option<PlaybackState>, Option<f32>),
+    mrp_app: Option<String>,
     companion_state: (Option<companion::PlaybackState>, Option<f32>),
     mrp_position: (Option<f64>, Option<f64>),
     companion_position: (Option<f64>, Option<f64>),
@@ -62,6 +63,12 @@ impl Merger {
             }
             _ => {}
         }
+        // MRP shows playing at another rate as seeking.
+        if np.state == Some(PlaybackState::Playing)
+            && np.rate.is_some_and(|r| r != 0.0 && (r - 1.0).abs() >= 0.01)
+        {
+            np.state = Some(PlaybackState::Seeking);
+        }
         // A rate can change without a new position. The old position is then
         // wrong, so keep the position that was shown at the change.
         if old_position != (self.companion_position, self.mrp_position) {
@@ -96,6 +103,11 @@ impl Merger {
         let mrp_state = (mrp.state, mrp.rate);
         if mrp_state != self.mrp_state {
             self.mrp_state = mrp_state;
+            self.state_from = Source::Mrp;
+        }
+        // Another app is newer, also if its state is the same.
+        if mrp.app != self.mrp_app {
+            self.mrp_app.clone_from(&mrp.app);
             self.state_from = Source::Mrp;
         }
         let mrp_position = (mrp.elapsed, mrp.elapsed_timestamp);
@@ -193,25 +205,38 @@ pub(crate) fn spawn(
                 &comp.borrow(),
                 cocoa_time(SystemTime::now()),
             );
-            tx.send_if_modified(|old| {
-                let changed = *old != np;
-                *old = np;
-                changed
-            });
+            publish(&tx, np);
         }
         // Companion closed: MRP data only.
         while let Some(m) = &mut mrp
             && m.changed().await.is_ok()
         {
             let np = m.borrow().clone();
-            tx.send_if_modified(|old| {
-                let changed = *old != np;
-                *old = np;
-                changed
-            });
+            publish(&tx, np);
         }
     });
     (rx, MergeTask(task))
+}
+
+/// Sends `np` if it differs from the current value.
+fn publish(tx: &watch::Sender<NowPlaying>, mut np: NowPlaying) {
+    tx.send_if_modified(|old| {
+        // The image is usually the same buffer, so compare it by address
+        // first and leave it out of the full compare.
+        let (old_art, new_art) = (old.artwork_data.take(), np.artwork_data.take());
+        let same_art = match (&old_art, &new_art) {
+            (Some(a), Some(b)) => std::ptr::eq(&raw const a[..], &raw const b[..]) || a == b,
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        let changed = !same_art || *old != np;
+        np.artwork_data = new_art;
+        if changed {
+            *old = np;
+        } else {
+            old.artwork_data = old_art;
+        }
+        changed
+    });
 }
 
 #[cfg(test)]
@@ -360,6 +385,63 @@ mod tests {
             merge(&mut m, Some(&other_app), &companion::NowPlaying::default()),
             other_app
         );
+    }
+
+    #[test]
+    fn other_rate_is_seeking() {
+        let mut m = Merger::default();
+        let playing = mrp("Nocturne", PlaybackState::Playing, 1.0, 10.0);
+        merge(
+            &mut m,
+            Some(&playing),
+            &comp(Some("Nocturne"), C::Playing, 1.0, 10.0),
+        );
+        let fast = merge(
+            &mut m,
+            Some(&playing),
+            &comp(Some("Nocturne"), C::Playing, 2.0, 10.0),
+        );
+        assert_eq!(fast.state, Some(PlaybackState::Seeking));
+        assert_eq!(fast.rate, Some(2.0));
+    }
+
+    #[test]
+    fn new_app_after_home_is_shown() {
+        let mut m = Merger::default();
+        let mut home = NowPlaying::default();
+        home.app = Some("com.teliasonera.playplus.telia".into());
+        let stopped = comp(Some("Nocturne"), C::Stopped, 0.0, 10.0);
+        merge(&mut m, Some(&home), &companion::NowPlaying::default());
+        assert_eq!(merge(&mut m, Some(&home), &stopped).app, None);
+        // Another app with the same (empty) state.
+        let mut other = NowPlaying::default();
+        other.app = Some("com.apple.TVMusic".into());
+        assert_eq!(merge(&mut m, Some(&other), &stopped), other);
+    }
+
+    #[test]
+    fn publish_compares_the_image() {
+        let (tx, _rx) = watch::channel(NowPlaying::default());
+        let mut np = NowPlaying::default();
+        np.artwork_data = Some(bytes::Bytes::from_static(b"jpeg"));
+        publish(&tx, np.clone());
+        assert!(tx.borrow().artwork_data.is_some());
+        // Same buffer, and a copy with the same bytes: no change.
+        let mut rx = tx.subscribe();
+        publish(&tx, np.clone());
+        let mut copy = np.clone();
+        copy.artwork_data = Some(bytes::Bytes::copy_from_slice(b"jpeg"));
+        publish(&tx, copy);
+        assert!(!rx.has_changed().unwrap());
+        // Other bytes or no image: changed.
+        let mut other = np;
+        other.artwork_data = Some(bytes::Bytes::from_static(b"png"));
+        publish(&tx, other);
+        assert!(rx.has_changed().unwrap());
+        rx.mark_unchanged();
+        publish(&tx, NowPlaying::default());
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(tx.borrow().artwork_data, None);
     }
 
     #[test]

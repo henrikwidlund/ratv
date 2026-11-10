@@ -1,5 +1,6 @@
 //! End-to-end tests against a fake Apple TV over an in-memory stream.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,8 @@ struct Log {
     siri_ptt: Vec<Option<i64>>,
     /// Set before connecting: Siri is off in the device settings.
     siri_off: bool,
+    /// Does not answer `FetchCurrentNowPlayingInfoEvent`.
+    no_now_playing: bool,
 }
 
 /// Value of an integer key in an OPACK dictionary.
@@ -400,6 +403,7 @@ async fn device_session(mut s: DuplexStream, controller: PairedController, log: 
                 send(&mut s, &mut conn, FrameType::E_OPACK, &ev).await;
                 Some(response(xid, &id, empty))
             }
+            "FetchCurrentNowPlayingInfoEvent" if log.lock().unwrap().no_now_playing => None,
             "FetchCurrentNowPlayingInfoEvent" => {
                 let ev = now_playing_event("Nocturne", 1);
                 send(&mut s, &mut conn, FrameType::E_OPACK, &ev).await;
@@ -1007,6 +1011,39 @@ async fn now_playing_read_when_connecting() {
     assert_eq!(np.title.as_deref(), Some("Nocturne"));
     assert_eq!(np.state, Some(companion::PlaybackState::Playing));
     assert_eq!(np.artwork.as_deref(), Some(&b"jpeg"[..]));
+}
+
+/// An optional request that gets no answer does not start the connect again.
+#[tokio::test]
+async fn connect_without_optional_answer() {
+    let (creds, controller) = pair().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log = Arc::new(Mutex::new(Log {
+        no_now_playing: true,
+        ..Log::default()
+    }));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = accepted.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            count.fetch_add(1, Ordering::Relaxed);
+            let (mut client_io, device_io) = tokio::io::duplex(8192);
+            tokio::spawn(device_session(device_io, controller.clone(), log.clone()));
+            tokio::spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut tcp, &mut client_io).await;
+            });
+        }
+    });
+    let mut opts = options();
+    opts.stall_timeout = Some(Duration::from_millis(300));
+    let client = companion::Client::connect(addr, &creds, &opts)
+        .await
+        .unwrap();
+    assert!(client.is_connected());
+    assert_eq!(client.now_playing().borrow().title, None);
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]

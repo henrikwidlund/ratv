@@ -8,8 +8,10 @@ use ratv_companion::now_playing::NowPlaying;
 
 fn event(id: &str, key: &str, data: &[u8], list: bool) -> Vec<u8> {
     let mut out = Vec::new();
-    Encoder::new(&mut out).dict(2, |e| {
+    Encoder::new(&mut out).dict(3, |e| {
         e.str("_i").str(id);
+        // Event.
+        e.str("_t").int(1);
         e.str("_c").dict(1, |e| {
             e.str(key);
             if list {
