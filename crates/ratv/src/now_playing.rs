@@ -3,6 +3,7 @@
 //! MRP has the most data. Companion reports state changes about 0.5 s
 //! earlier, and sends the artwork and the subtitle state.
 
+use std::borrow::Cow;
 use std::time::SystemTime;
 
 use tokio::sync::watch;
@@ -36,57 +37,132 @@ pub(crate) struct Merger {
     held: Option<(f64, f64)>,
 }
 
+/// Fields that the merge sets on top of the MRP data. Small, so a
+/// Companion change does not copy the whole [`NowPlaying`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Fields {
+    state: Option<PlaybackState>,
+    rate: Option<f32>,
+    elapsed: Option<f64>,
+    elapsed_timestamp: Option<f64>,
+    artwork_data: Option<bytes::Bytes>,
+    captions_enabled: Option<bool>,
+    /// After Home, MRP may name an older app that plays nothing.
+    clear_app: bool,
+}
+
+impl Fields {
+    /// Sets the fields on `np`, which holds the MRP data of `base`.
+    /// Returns true if something changed.
+    fn apply(&self, base: &NowPlaying, np: &mut NowPlaying) -> bool {
+        let mut changed = false;
+        changed |= set(&mut np.state, self.state);
+        changed |= set(&mut np.rate, self.rate);
+        changed |= set(&mut np.elapsed, self.elapsed);
+        changed |= set(&mut np.elapsed_timestamp, self.elapsed_timestamp);
+        changed |= set(&mut np.captions_enabled, self.captions_enabled);
+        if !same_image(np.artwork_data.as_ref(), self.artwork_data.as_ref()) {
+            np.artwork_data.clone_from(&self.artwork_data);
+            changed = true;
+        }
+        let (app, app_name) = if self.clear_app {
+            (None, None)
+        } else {
+            (base.app.as_deref(), base.app_name.as_deref())
+        };
+        if np.app.as_deref() != app {
+            np.app = app.map(str::to_owned);
+            changed = true;
+        }
+        if np.app_name.as_deref() != app_name {
+            np.app_name = app_name.map(str::to_owned);
+            changed = true;
+        }
+        changed
+    }
+}
+
+fn set<T: PartialEq>(field: &mut T, value: T) -> bool {
+    if *field == value {
+        return false;
+    }
+    *field = value;
+    true
+}
+
+/// The image is usually the same buffer, so compare the address first.
+fn same_image(a: Option<&bytes::Bytes>, b: Option<&bytes::Bytes>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => std::ptr::eq(&raw const a[..], &raw const b[..]) || a == b,
+        (a, b) => a.is_none() && b.is_none(),
+    }
+}
+
 impl Merger {
     /// MRP data, with state and position from Companion when Companion
-    /// changed them last for the same item. Companion data only without MRP.
-    /// `now` is MRP time.
+    /// changed them last for the same item. `now` is MRP time.
+    #[cfg(test)]
     pub(crate) fn merge(
         &mut self,
         mrp: Option<&NowPlaying>,
         comp: &companion::NowPlaying,
         now: f64,
     ) -> NowPlaying {
+        let base = mrp.cloned().unwrap_or_else(|| from_companion(comp));
+        let mut np = base.clone();
+        self.fields(&base, comp, now).apply(&base, &mut np);
+        np
+    }
+
+    /// The fields to set on `base`, the MRP data, or the Companion data
+    /// without MRP. `now` is MRP time.
+    pub(crate) fn fields(
+        &mut self,
+        base: &NowPlaying,
+        comp: &companion::NowPlaying,
+        now: f64,
+    ) -> Fields {
         let old_position = (self.companion_position, self.mrp_position);
-        let mut np = self.combine(mrp, comp);
+        let mut f = self.combine(base, comp);
         // Companion sends the new state about 0.4 s before the new rate.
         // Some apps also send a paused item with rate 1 over MRP.
-        match np.state {
+        match f.state {
             Some(PlaybackState::Paused | PlaybackState::Stopped)
-                if np.rate.is_some_and(|r| r != 0.0) =>
+                if f.rate.is_some_and(|r| r != 0.0) =>
             {
-                np.rate = Some(0.0);
+                f.rate = Some(0.0);
             }
             Some(PlaybackState::Playing)
-                if self.state_from == Source::Companion && np.rate == Some(0.0) =>
+                if self.state_from == Source::Companion && f.rate == Some(0.0) =>
             {
-                np.rate = Some(1.0);
+                f.rate = Some(1.0);
             }
             _ => {}
         }
         // MRP shows playing at another rate as seeking.
-        if np.state == Some(PlaybackState::Playing)
-            && np.rate.is_some_and(|r| r != 0.0 && (r - 1.0).abs() >= 0.01)
+        if f.state == Some(PlaybackState::Playing)
+            && f.rate.is_some_and(|r| r != 0.0 && (r - 1.0).abs() >= 0.01)
         {
-            np.state = Some(PlaybackState::Seeking);
+            f.state = Some(PlaybackState::Seeking);
         }
         // A rate can change without a new position. The old position is then
         // wrong, so keep the position that was shown at the change.
         if old_position != (self.companion_position, self.mrp_position) {
             self.held = None;
-        } else if np.rate != self.last.2
+        } else if f.rate != self.last.2
             && let (Some(elapsed), Some(ts), Some(rate)) = self.last
         {
             self.held = Some((elapsed + (now - ts) * f64::from(rate), now));
         }
         if let Some((elapsed, ts)) = self.held {
-            np.elapsed = Some(elapsed);
-            np.elapsed_timestamp = Some(ts);
+            f.elapsed = Some(elapsed);
+            f.elapsed_timestamp = Some(ts);
         }
-        self.last = (np.elapsed, np.elapsed_timestamp, np.rate);
-        np
+        self.last = (f.elapsed, f.elapsed_timestamp, f.rate);
+        f
     }
 
-    fn combine(&mut self, mrp: Option<&NowPlaying>, comp: &companion::NowPlaying) -> NowPlaying {
+    fn combine(&mut self, mrp: &NowPlaying, comp: &companion::NowPlaying) -> Fields {
         let comp_state = (comp.state, comp.rate);
         if comp_state != self.companion_state {
             self.companion_state = comp_state;
@@ -97,9 +173,6 @@ impl Merger {
             self.companion_position = comp_position;
             self.position_from = Source::Companion;
         }
-        let Some(mrp) = mrp else {
-            return from_companion(comp);
-        };
         let mrp_state = (mrp.state, mrp.rate);
         if mrp_state != self.mrp_state {
             self.mrp_state = mrp_state;
@@ -116,31 +189,36 @@ impl Merger {
             self.position_from = Source::Mrp;
         }
 
-        let mut np = mrp.clone();
-        if comp.title.is_some() && comp.title == np.title {
-            np.artwork_data.clone_from(&comp.artwork);
-            np.captions_enabled = comp.captions_enabled;
+        let mut f = Fields {
+            state: mrp.state,
+            rate: mrp.rate,
+            elapsed: mrp.elapsed,
+            elapsed_timestamp: mrp.elapsed_timestamp,
+            artwork_data: mrp.artwork_data.clone(),
+            captions_enabled: mrp.captions_enabled,
+            clear_app: false,
+        };
+        if comp.title.is_some() && comp.title == mrp.title {
+            f.artwork_data.clone_from(&comp.artwork);
+            f.captions_enabled = comp.captions_enabled;
             if self.state_from == Source::Companion {
                 if let Some(state) = comp.state {
-                    np.state = state_of(state);
+                    f.state = state_of(state);
                 }
                 if comp.rate.is_some() {
-                    np.rate = comp.rate;
+                    f.rate = comp.rate;
                 }
             }
             if self.position_from == Source::Companion && comp.elapsed.is_some() {
-                np.elapsed = comp.elapsed;
-                np.elapsed_timestamp = comp.elapsed_timestamp;
+                f.elapsed = comp.elapsed;
+                f.elapsed_timestamp = comp.elapsed_timestamp;
             }
-        } else if self.state_from == Source::Companion
-            && comp.state == Some(companion::PlaybackState::Stopped)
-            && np.title.is_none()
-        {
-            // After Home, MRP may name an older app that plays nothing.
-            np.app = None;
-            np.app_name = None;
+        } else {
+            f.clear_app = self.state_from == Source::Companion
+                && comp.state == Some(companion::PlaybackState::Stopped)
+                && mrp.title.is_none();
         }
-        np
+        f
     }
 }
 
@@ -178,12 +256,10 @@ pub(crate) fn spawn(
     mut comp: watch::Receiver<companion::NowPlaying>,
 ) -> (watch::Receiver<NowPlaying>, MergeTask) {
     let mut merger = Merger::default();
-    let first = merger.merge(
-        mrp.as_ref().map(|m| m.borrow()).as_deref(),
-        &comp.borrow(),
-        cocoa_time(SystemTime::now()),
-    );
-    let (tx, rx) = watch::channel(first);
+    let (tx, mut rx) = watch::channel(NowPlaying::default());
+    update(&mut merger, &tx, mrp.as_ref(), &comp, true);
+    // The first value is not a change.
+    rx.mark_unchanged();
     let task = tokio::spawn(async move {
         loop {
             let mrp_changed = async {
@@ -192,20 +268,24 @@ pub(crate) fn spawn(
                     None => std::future::pending().await,
                 }
             };
-            tokio::select! {
-                ok = mrp_changed => if !ok {
-                    mrp = None;
+            // A new MRP value is copied; a Companion change only sets the
+            // merged fields in place.
+            let base_changed = tokio::select! {
+                ok = mrp_changed => {
+                    if !ok {
+                        mrp = None;
+                    }
+                    true
                 },
-                ok = comp.changed() => if ok.is_err() {
-                    break;
+                ok = comp.changed() => {
+                    if ok.is_err() {
+                        break;
+                    }
+                    // Without MRP, the base is the Companion data.
+                    mrp.is_none()
                 },
-            }
-            let np = merger.merge(
-                mrp.as_ref().map(|m| m.borrow()).as_deref(),
-                &comp.borrow(),
-                cocoa_time(SystemTime::now()),
-            );
-            publish(&tx, np);
+            };
+            update(&mut merger, &tx, mrp.as_ref(), &comp, base_changed);
         }
         // Companion closed: MRP data only.
         while let Some(m) = &mut mrp
@@ -218,17 +298,37 @@ pub(crate) fn spawn(
     (rx, MergeTask(task))
 }
 
+/// Merges the current values and sends the result if it changed.
+fn update(
+    merger: &mut Merger,
+    tx: &watch::Sender<NowPlaying>,
+    mrp: Option<&watch::Receiver<NowPlaying>>,
+    comp: &watch::Receiver<companion::NowPlaying>,
+    base_changed: bool,
+) {
+    let now = cocoa_time(SystemTime::now());
+    let comp = comp.borrow();
+    let mrp = mrp.map(watch::Receiver::borrow);
+    let base = mrp
+        .as_deref()
+        .map_or_else(|| Cow::Owned(from_companion(&comp)), Cow::Borrowed);
+    let base = &*base;
+    let fields = merger.fields(base, &comp, now);
+    if base_changed {
+        let mut np = base.clone();
+        fields.apply(base, &mut np);
+        publish(tx, np);
+    } else {
+        tx.send_if_modified(|np| fields.apply(base, np));
+    }
+}
+
 /// Sends `np` if it differs from the current value.
 fn publish(tx: &watch::Sender<NowPlaying>, mut np: NowPlaying) {
     tx.send_if_modified(|old| {
-        // The image is usually the same buffer, so compare it by address
-        // first and leave it out of the full compare.
+        // Leave the image out of the full compare.
         let (old_art, new_art) = (old.artwork_data.take(), np.artwork_data.take());
-        let same_art = match (&old_art, &new_art) {
-            (Some(a), Some(b)) => std::ptr::eq(&raw const a[..], &raw const b[..]) || a == b,
-            (a, b) => a.is_none() && b.is_none(),
-        };
-        let changed = !same_art || *old != np;
+        let changed = !same_image(old_art.as_ref(), new_art.as_ref()) || *old != np;
         np.artwork_data = new_art;
         if changed {
             *old = np;
@@ -463,6 +563,16 @@ mod tests {
         comp_tx.send_replace(comp(Some("Nocturne"), C::Paused, 0.0, 2.0));
         rx.changed().await.unwrap();
         assert_eq!(rx.borrow_and_update().state, Some(PlaybackState::Paused));
+        assert_eq!(rx.borrow().artist.as_deref(), Some("Artist"));
+        assert!(rx.borrow().artwork_data.is_some());
+        // Companion moves to another item: the MRP values come back.
+        comp_tx.send_replace(comp(Some("Other"), C::Paused, 0.0, 2.0));
+        rx.changed().await.unwrap();
+        let mut np = rx.borrow_and_update().clone();
+        // The position is held at the pause, then moves on.
+        assert_eq!(np.elapsed, Some(2.0));
+        (np.elapsed, np.elapsed_timestamp) = (Some(1.0), Some(100.0));
+        assert_eq!(np, mrp("Nocturne", PlaybackState::Playing, 1.0, 1.0));
         // Companion closes: MRP data only.
         drop(comp_tx);
         mrp_tx.send_replace(mrp("Song", PlaybackState::Playing, 1.0, 3.0));

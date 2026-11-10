@@ -71,7 +71,8 @@ impl VolumeState {
     }
 
     /// Sets the connected device and its output devices from its device info.
-    pub fn set_device(&mut self, info: &DeviceInfoMessage) {
+    /// Returns true if the output devices changed.
+    pub fn set_device(&mut self, info: &DeviceInfoMessage) -> bool {
         self.uid = output_device_uid(info).map(str::to_owned);
         // The device itself plays audio only when it leads the group and is no proxy.
         // Its output UID is `device_uid`, the same as AirPlay `psi`, not `unique_identifier`.
@@ -102,20 +103,24 @@ impl VolumeState {
                 })
             })
             .collect();
+        self.volume.outputs != old
     }
 
     /// Updates the state from a message. Returns true if the volume changed.
     pub fn apply(&mut self, env: &Envelope) -> Result<bool, Error> {
-        let old = self.volume.clone();
+        // Most messages are not about volume, so only the small fields are
+        // copied. Changes to the output devices are tracked in `outputs`.
+        let old = self.levels();
+        let mut outputs = false;
         if env.is::<DeviceInfoMessage>() {
-            self.set_device(&env.payload()?);
+            outputs = self.set_device(&env.payload()?);
         } else if env.is::<VolumeDidChangeMessage>() {
             let msg: VolumeDidChangeMessage = env.payload()?;
             if self.is_ours(msg.output_device_uid.as_deref()) {
                 self.volume.level = msg.volume.or(self.volume.level);
             }
             if let Some(o) = self.output(msg.output_device_uid.as_deref()) {
-                o.volume = msg.volume.or(o.volume);
+                outputs = update(&mut o.volume, msg.volume);
             }
         } else if env.is::<VolumeMutedDidChangeMessage>() {
             let msg: VolumeMutedDidChangeMessage = env.payload()?;
@@ -123,7 +128,7 @@ impl VolumeState {
                 self.volume.muted = msg.is_muted.or(self.volume.muted);
             }
             if let Some(o) = self.output(msg.output_device_uid.as_deref()) {
-                o.muted = msg.is_muted.or(o.muted);
+                outputs = update(&mut o.muted, msg.is_muted);
             }
         } else if env.is::<VolumeControlAvailabilityMessage>() {
             self.set_capabilities(&env.payload()?);
@@ -136,7 +141,7 @@ impl VolumeState {
             }
         } else if env.is::<UpdateOutputDeviceMessage>() {
             let msg: UpdateOutputDeviceMessage = env.payload()?;
-            self.update_output_devices(&msg);
+            outputs = self.update_output_devices(&msg);
         } else if env.is::<GetVolumeControlCapabilitiesResultMessage>() {
             let msg: GetVolumeControlCapabilitiesResultMessage = env.payload()?;
             if let Some(caps) = msg.capabilities {
@@ -148,42 +153,53 @@ impl VolumeState {
         } else if env.is::<GetVolumeMutedResultMessage>() {
             let msg: GetVolumeMutedResultMessage = env.payload()?;
             self.volume.muted = msg.is_muted.or(self.volume.muted);
+        } else {
+            return Ok(false);
         }
         // The device reports level 0 when it has no volume control.
         if self.volume.available == Some(false) {
             self.volume.level = None;
             self.volume.muted = None;
         }
-        Ok(self.volume != old)
+        Ok(outputs || self.levels() != old)
     }
 
-    /// Takes volumes from the output device list.
-    fn update_output_devices(&mut self, msg: &UpdateOutputDeviceMessage) {
+    /// The fields of [`Volume`] other than the output devices.
+    const fn levels(&self) -> (Option<f32>, Option<bool>, Option<bool>, Option<i32>) {
+        let v = &self.volume;
+        (v.level, v.muted, v.available, v.capabilities)
+    }
+
+    /// Takes volumes from the output device list. Returns true if an output
+    /// device changed.
+    fn update_output_devices(&mut self, msg: &UpdateOutputDeviceMessage) -> bool {
         let devices = if msg.cluster_aware_output_devices.is_empty() {
             &msg.output_devices
         } else {
             &msg.cluster_aware_output_devices
         };
+        let mut changed = false;
         for d in devices {
             if let Some(o) = self.output(d.unique_identifier.as_deref()) {
-                o.volume = d.volume.or(o.volume);
-                o.muted = d.volume_muted.or(o.muted);
+                changed |= update(&mut o.volume, d.volume);
+                changed |= update(&mut o.muted, d.volume_muted);
             }
         }
         let Some(ours) = self.uid.as_deref() else {
-            return;
+            return changed;
         };
         let Some(d) = devices
             .iter()
             .find(|d: &&AvOutputDeviceDescriptor| d.unique_identifier.as_deref() == Some(ours))
         else {
-            return;
+            return changed;
         };
         let v = &mut self.volume;
         v.level = d.volume.or(v.level);
         v.muted = d.volume_muted.or(v.muted);
         v.available = d.is_volume_control_available.or(v.available);
         v.capabilities = d.volume_capabilities.or(v.capabilities);
+        changed
     }
 
     fn set_capabilities(&mut self, msg: &VolumeControlAvailabilityMessage) {
@@ -204,6 +220,14 @@ impl VolumeState {
             _ => true,
         }
     }
+}
+
+/// Sets `field` to `value` if `value` is set. Returns true if it changed.
+fn update<T: PartialEq + Copy>(field: &mut Option<T>, value: Option<T>) -> bool {
+    let new = value.or(*field);
+    let changed = *field != new;
+    *field = new;
+    changed
 }
 
 #[cfg(test)]
@@ -347,6 +371,9 @@ mod tests {
         assert!(s.apply(&env(&msg)).unwrap());
         assert_eq!(s.volume().level, None);
         assert_eq!(s.volume().outputs[1].volume, Some(0.6));
+        // The same values again change nothing.
+        assert!(!s.apply(&env(&msg)).unwrap());
+        assert!(!s.apply(&env(&info)).unwrap());
 
         // A second speaker joins; the first keeps its volume.
         let mut info = info;
