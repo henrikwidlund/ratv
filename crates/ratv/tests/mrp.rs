@@ -884,6 +884,7 @@ async fn apple_tv_siri_without_companion_uses_mrp() {
         .unwrap();
     let mut siri = tv.start_siri().await.unwrap();
     assert!(matches!(siri, Siri::Mrp(_)));
+    assert!(!siri.ended());
     siri.send(&b"one"[..]).await.unwrap();
     siri.finish().await.unwrap();
     tv.close().await.unwrap();

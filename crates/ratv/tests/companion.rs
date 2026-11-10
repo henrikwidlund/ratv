@@ -1195,6 +1195,7 @@ async fn apple_tv_siri_uses_companion() {
     assert_eq!(np.artwork_data.as_deref(), Some(&b"jpeg"[..]));
     let mut siri = tv.start_siri().await.unwrap();
     assert!(matches!(siri, Siri::Companion(_)));
+    assert!(!siri.ended());
     siri.send(vec![1, 2, 3]).await.unwrap();
     siri.finish().await.unwrap();
     assert_eq!(log.lock().unwrap().siri, ["start", "3", "stop"]);

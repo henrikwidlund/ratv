@@ -200,7 +200,7 @@ RUST_LOG=ratv=debug cargo run --example remote -- tv.credentials play
 ```sh
 cargo run --example scan                                                 # list devices
 cargo run --example companion -- 192.168.1.20:49153 pair tv.credentials  # pair, save credentials
-cargo run --example remote -- tv.credentials play                        # send a command to the first device
+cargo run --example remote -- tv.credentials play                        # send a command to the first Apple TV
 cargo run --example remote -- tv.credentials watch                       # print now playing changes
 ```
 

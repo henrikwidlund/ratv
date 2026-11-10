@@ -201,11 +201,13 @@ impl Drop for Siri {
             tracing::debug!(parent: &self.client.inner.span, "Siri released on drop");
             let _ = self.client.queue(&Button::Siri.event(false), None, None);
         }
-        self.client
-            .inner
-            .shared
-            .siri_active
-            .store(false, Ordering::Release);
+        let shared = &self.client.inner.shared;
+        // Cleared first, so the next Siri never logs the time of this one.
+        *shared
+            .siri_begin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        shared.siri_active.store(false, Ordering::Release);
     }
 }
 
