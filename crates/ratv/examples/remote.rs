@@ -348,8 +348,7 @@ async fn scrub_companion(tv: &AppleTv, forward: bool, seconds: f64) -> Result<()
 fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     c.next()
-        .map(|f| f.to_uppercase().chain(c).collect())
-        .unwrap_or_default()
+        .map_or_default(|f| f.to_uppercase().chain(c).collect())
 }
 
 /// Prints audio and subtitle languages with their tags.

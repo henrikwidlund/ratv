@@ -579,8 +579,7 @@ impl NowPlayingState {
         {
             c.default_commands = msg
                 .supported_commands
-                .map(|s| s.supported_commands)
-                .unwrap_or_default();
+                .map_or_default(|s| s.supported_commands);
         }
     }
 
@@ -691,9 +690,8 @@ impl NowPlayingState {
             .skip(player.location + 1)
             .map(queue_item)
             .collect();
-        np.supported_rates = find(Command::ChangePlaybackRate)
-            .map(|c| c.supported_rates.clone())
-            .unwrap_or_default();
+        np.supported_rates =
+            find(Command::ChangePlaybackRate).map_or_default(|c| c.supported_rates.clone());
         let interval = |cmd| find(cmd).and_then(|c| c.preferred_intervals.first().copied());
         np.skip_forward_interval = interval(Command::SkipForward);
         np.skip_backward_interval = interval(Command::SkipBackward);

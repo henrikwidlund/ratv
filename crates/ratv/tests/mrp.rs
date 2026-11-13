@@ -69,7 +69,7 @@ async fn read_msg(s: &mut TcpStream, ch: &mut Channel) -> Option<Message> {
 }
 
 async fn reply(s: &mut TcpStream, ch: &mut Channel, req: &Message, body: &[u8]) {
-    let cseq = req.cseq().map(|c| c.to_string()).unwrap_or_default();
+    let cseq = req.cseq().map_or_default(|c| c.to_string());
     ch.send_response(req.protocol(), 200, "OK", &[("CSeq", &cseq)], body);
     s.write_all(&ch.take_transmit()).await.unwrap();
 }
