@@ -28,7 +28,7 @@ Linux, macOS and Windows on x64 and arm64, including ARM Linux boards
 (`aarch64-unknown-linux-gnu`).
 No C dependencies.
 
-Minimum Rust version: 1.88.
+Minimum Rust version: 1.99.
 
 Tested on an Apple TV 4K (AppleTV6,2) with tvOS 26.6.1.
 
