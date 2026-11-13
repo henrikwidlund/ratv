@@ -705,7 +705,15 @@ async fn closed_without_feedback_answer() {
         matches!(reason.as_deref(), Some(Error::NoAnswer("feedback"))),
         "{reason:?}"
     );
-    assert!(device.log.lock().unwrap().feedback >= 4);
+    // The device can count the last requests after the client has closed.
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while device.log.lock().unwrap().feedback < 4 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("device saw fewer than 4 feedback requests");
 }
 
 #[tokio::test]
