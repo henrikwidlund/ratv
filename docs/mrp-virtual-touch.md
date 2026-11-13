@@ -14,6 +14,11 @@ This file keeps the old code so it can be tested on newer tvOS versions.
   Tested (device id, scale): `(1, 1.0)` (bunatv), `(1, 1000.0)`, `(0, 1.0)`.
 - bunatv lists touch as working only over Companion. pyatv has no MRP touch.
 
+## Results on Apple TV 4K (AppleTV18,1), tvOS 27.2
+
+Same as tvOS 26.6.1: `error_code: Some(1)` for all descriptors above, and touch events
+without registration do nothing.
+
 ## How to test again
 
 1. Add the code below back.
