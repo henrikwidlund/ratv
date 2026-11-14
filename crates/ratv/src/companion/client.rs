@@ -852,6 +852,9 @@ fn dispatch(
                     _ => {}
                 }
                 let _ = events.send(event);
+            } else {
+                // Debug, not trace: unknown events help to find tvOS changes.
+                tracing::debug!(id = ?msg.id(), "ignoring device event");
             }
         }
         Some(MessageType::Response) | None => {
@@ -866,7 +869,7 @@ fn dispatch(
             if let Some(reply) = reply {
                 let _ = reply.send(msg.error().map_or(Ok(payload), Err));
             } else {
-                tracing::trace!(xid, "response without request");
+                tracing::debug!(xid, "response without request");
             }
         }
         Some(MessageType::Request) => {
@@ -880,7 +883,8 @@ fn dispatch(
                 shared.wake.notify_one();
                 let _ = events.send(event);
             } else {
-                tracing::trace!(id = ?msg.id(), "ignoring device request");
+                // Not answered. Debug, not trace: the device may wait for an answer.
+                tracing::debug!(id = ?msg.id(), xid = ?msg.xid(), "ignoring device request");
             }
         }
     }
