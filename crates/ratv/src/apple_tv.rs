@@ -567,14 +567,14 @@ impl AppleTv {
 
     /// Reads what the device plays, if MRP is open.
     fn with_now_playing<R>(&self, f: impl FnOnce(&NowPlaying) -> R) -> Option<R> {
-        let m = self.mrp.as_ref().filter(|m| m.is_connected())?;
+        let m = self.open_mrp()?;
         Some(f(&m.now_playing().borrow()))
     }
 
     /// Right after connect, waits until the app's command list arrives, at most
     /// until [`STATE_WAIT`] after connect. Apps may ignore commands sent before it.
     async fn wait_for_state(&self) {
-        let Some(m) = self.mrp.as_ref().filter(|m| m.is_connected()) else {
+        let Some(m) = self.open_mrp() else {
             return;
         };
         let Some(left) = STATE_WAIT.checked_sub(self.connected_at.elapsed()) else {
@@ -620,7 +620,7 @@ impl AppleTv {
                 if support == Support::Unknown
                     && is_unsupported(&result)
                     && let Some(f) = fallback
-                    && let Some(c) = self.companion.as_ref().filter(|c| c.is_connected())
+                    && let Some(c) = self.open_companion()
                 {
                     return c.media(f).await;
                 }
@@ -1003,7 +1003,7 @@ impl AppleTv {
     /// Fails if MRP reports that the device cannot change the volume. Right after
     /// connect, waits for the volume state like [`wait_for_state`](Self::wait_for_state).
     async fn check_volume(&self) -> Result<(), Error> {
-        let Some(m) = self.mrp.as_ref().filter(|m| m.is_connected()) else {
+        let Some(m) = self.open_mrp() else {
             return Ok(());
         };
         let mut volume = m.volume();
