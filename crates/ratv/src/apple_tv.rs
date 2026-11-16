@@ -295,15 +295,44 @@ impl AppleTv {
     /// and returns a new handle with them and the open protocols of `self`.
     ///
     /// The open protocols stay connected. `self` and its clones do not get
-    /// the new protocols, so replace them with the returned handle. Also get
-    /// [`now_playing`](Self::now_playing) and [`closed`](Self::closed) again
-    /// from it. A closed protocol that does not connect again is not in the
-    /// new handle.
+    /// the new protocols, so replace them with the returned handle:
+    ///
+    /// - Do not [`close`](Self::close) `self`. It shares the open protocols
+    ///   with the new handle, so they would close too.
+    /// - Wait on [`closed`](Self::closed) of the new handle, so that a close
+    ///   of an added protocol is seen.
+    /// - Get [`now_playing`](Self::now_playing) and [`volume`](Self::volume)
+    ///   again from the new handle. Receivers from `self` do not get data from
+    ///   the added protocols. They stay open while their sender lives: an MRP
+    ///   receiver until MRP closes, a merged one until all clones of `self`
+    ///   are dropped.
+    ///
+    /// A closed protocol that does not connect again is not in the new handle.
     ///
     /// Returns `None` if all protocols are open. Fails with the first error
     /// if no missing protocol connects. On success,
     /// [`connect_error`](Self::connect_error) has the errors of the protocols
     /// that are still missing.
+    ///
+    /// ```no_run
+    /// # async fn run(mut tv: ratv::AppleTv, endpoints: ratv::Endpoints, credentials: ratv::Credentials) -> Result<(), ratv::Error> {
+    /// use ratv::{ClientOptions, Protocol};
+    ///
+    /// if !tv.is_open(Protocol::Companion) || !tv.is_open(Protocol::Mrp) {
+    ///     let options = ClientOptions::default();
+    ///     if let Some(new) = tv.connect_missing(&endpoints, &credentials, &options).await? {
+    ///         // Not `tv.close()`: the old handle shares the open protocol.
+    ///         tv = new;
+    ///         // Get these again, and stop the tasks that use the old ones.
+    ///         let now_playing = tv.now_playing();
+    ///         let volume = tv.volume();
+    ///         let closed = tv.closed();
+    /// #       drop((now_playing, volume, closed));
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn connect_missing(
         &self,
         endpoints: &Endpoints,
