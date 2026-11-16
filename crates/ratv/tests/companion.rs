@@ -1202,6 +1202,7 @@ async fn apple_tv_siri_uses_companion() {
 }
 
 /// Accepts TCP connections and runs a device session on each.
+#[cfg(feature = "mrp")]
 async fn listen(controller: PairedController, log: Arc<Mutex<Log>>) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

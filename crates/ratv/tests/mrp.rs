@@ -1083,11 +1083,14 @@ async fn apple_tv_connects_missing_protocol() {
         companion: Some(companion),
         airplay: Some(format!("127.0.0.1:{}", first.port).parse().unwrap()),
     };
-    let opts = options();
+    let mut opts = options();
+    // Windows tries a refused connect again for about 2 s.
+    opts.timeout = Duration::from_secs(10);
     let tv = AppleTv::connect(&endpoints, &credentials(), &opts)
         .await
         .unwrap();
-    assert!(tv.connect_error(Protocol::Companion).unwrap().is_refused());
+    let err = tv.connect_error(Protocol::Companion).unwrap();
+    assert!(err.is_refused(), "{err:?}");
     assert!(tv.connect_error(Protocol::Mrp).is_none());
     assert!(!tv.is_open(Protocol::Companion));
     assert!(tv.is_open(Protocol::Mrp));
@@ -1097,7 +1100,7 @@ async fn apple_tv_connects_missing_protocol() {
         .connect_missing(&endpoints, &credentials(), &opts)
         .await
         .unwrap_err();
-    assert!(err.is_refused());
+    assert!(err.is_refused(), "{err:?}");
     assert!(tv.mrp().unwrap().is_connected());
 
     // No endpoint for the missing protocol.
