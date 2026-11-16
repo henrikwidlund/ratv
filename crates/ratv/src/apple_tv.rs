@@ -1,7 +1,8 @@
 //! One handle for a device: Companion and MRP together.
 //!
 //! [`AppleTv::connect`] opens both protocols in parallel and keeps the ones
-//! that connect. Each method uses the protocol that supports it:
+//! that connect. [`AppleTv::connect_missing`] adds the others later. Each
+//! method uses the protocol that supports it:
 //!
 //! | Feature | Protocol |
 //! |---------|----------|
@@ -59,6 +60,16 @@ impl From<&crate::discovery::Device> for Endpoints {
             airplay: d.socket_addr(ServiceKind::AirPlay),
         }
     }
+}
+
+/// A protocol of [`AppleTv`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Protocol {
+    /// Companion, at [`Endpoints::companion`].
+    Companion,
+    /// MRP, at [`Endpoints::airplay`].
+    Mrp,
 }
 
 /// Starts pairing. The device shows a PIN when this returns.
@@ -256,56 +267,150 @@ pub struct AppleTv {
     scrubs: Arc<Scrubs>,
     /// Merged MRP and Companion now playing, while Companion is connected.
     now_playing: Option<(watch::Receiver<NowPlaying>, Arc<now_playing::MergeTask>)>,
+    /// Connect errors of the protocols that are not connected.
+    companion_error: Option<Arc<Error>>,
+    mrp_error: Option<Arc<Error>>,
 }
 
 impl AppleTv {
     /// Connects to all given endpoints in parallel.
     ///
     /// Succeeds if at least one protocol connects. Fails with the first
-    /// error if none does.
+    /// error if none does. See [`connect_error`](Self::connect_error) for the
+    /// protocol that failed.
     pub async fn connect(
         endpoints: &Endpoints,
         credentials: &Credentials,
         options: &ClientOptions,
     ) -> Result<Self, Error> {
-        let companion = async {
-            match endpoints.companion {
-                Some(addr) => Some(companion::Client::connect(addr, credentials, options).await),
-                None => None,
-            }
+        let (companion, mrp) = connect_clients(endpoints, credentials, options, true, true).await;
+        let companion = split("Companion", companion);
+        let mrp = split("MRP", mrp);
+        let tv = Self::assemble(companion, mrp, Instant::now(), Arc::default())?;
+        tv.log_connect();
+        Ok(tv)
+    }
+
+    /// Connects the protocols that are not open (see [`is_open`](Self::is_open)),
+    /// and returns a new handle with them and the open protocols of `self`.
+    ///
+    /// The open protocols stay connected. `self` and its clones do not get
+    /// the new protocols, so replace them with the returned handle. Also get
+    /// [`now_playing`](Self::now_playing) and [`closed`](Self::closed) again
+    /// from it. A closed protocol that does not connect again is not in the
+    /// new handle.
+    ///
+    /// Returns `None` if all protocols are open. Fails with the first error
+    /// if no missing protocol connects. On success,
+    /// [`connect_error`](Self::connect_error) has the errors of the protocols
+    /// that are still missing.
+    pub async fn connect_missing(
+        &self,
+        endpoints: &Endpoints,
+        credentials: &Credentials,
+        options: &ClientOptions,
+    ) -> Result<Option<Self>, Error> {
+        let (companion, mrp) = (self.open_companion(), self.open_mrp());
+        if companion.is_some() && mrp.is_some() {
+            return Ok(None);
+        }
+        let (new_companion, new_mrp) = connect_clients(
+            endpoints,
+            credentials,
+            options,
+            companion.is_none(),
+            mrp.is_none(),
+        )
+        .await;
+        let (new_companion, companion_error) = split("Companion", new_companion);
+        let (new_mrp, mrp_error) = split("MRP", new_mrp);
+        if new_companion.is_none() && new_mrp.is_none() {
+            return Err(first_error(companion_error, mrp_error));
+        }
+        // A new MRP connection has no scrub state yet, and playback calls
+        // wait for its command list.
+        let (connected_at, scrubs) = if new_mrp.is_some() {
+            (Instant::now(), Arc::default())
+        } else {
+            (self.connected_at, self.scrubs.clone())
         };
-        let mrp = async {
-            match endpoints.airplay {
-                Some(addr) => Some(mrp::Client::connect(addr, credentials, options).await),
-                None => None,
-            }
-        };
-        let (companion, mrp) = tokio::join!(companion, mrp);
-        let mut first_error = None;
-        let companion = keep("Companion", companion, &mut first_error);
-        let mrp = keep("MRP", mrp, &mut first_error);
+        let tv = Self::assemble(
+            (
+                new_companion.or_else(|| companion.cloned()),
+                companion_error,
+            ),
+            (new_mrp.or_else(|| mrp.cloned()), mrp_error),
+            connected_at,
+            scrubs,
+        )?;
+        tv.log_connect();
+        Ok(Some(tv))
+    }
+
+    /// Builds the handle from the clients and connect errors. Fails if no
+    /// protocol is connected.
+    fn assemble(
+        (companion, companion_error): (Option<companion::Client>, Option<Arc<Error>>),
+        (mrp, mrp_error): (Option<mrp::Client>, Option<Arc<Error>>),
+        connected_at: Instant,
+        scrubs: Arc<Scrubs>,
+    ) -> Result<Self, Error> {
+        if companion.is_none() && mrp.is_none() {
+            return Err(first_error(companion_error, mrp_error));
+        }
         let now_playing = companion.as_ref().map(|c| {
             let (rx, task) =
                 now_playing::spawn(mrp.as_ref().map(mrp::Client::now_playing), c.now_playing());
             (rx, Arc::new(task))
         });
-        let tv = Self {
+        Ok(Self {
             companion,
             mrp,
-            connected_at: Instant::now(),
-            scrubs: Arc::default(),
+            connected_at,
+            scrubs,
             now_playing,
-        };
-        if tv.companion.is_none() && tv.mrp.is_none() {
-            return Err(first_error.unwrap_or(Error::NoEndpoints));
-        }
-        let (companion, mrp) = (tv.companion.is_some(), tv.mrp.is_some());
-        if let Some(err) = first_error {
+            companion_error,
+            mrp_error,
+        })
+    }
+
+    fn log_connect(&self) {
+        let (companion, mrp) = (self.companion.is_some(), self.mrp.is_some());
+        if let Some(err) = self.companion_error.as_ref().or(self.mrp_error.as_ref()) {
             tracing::warn!(%err, companion, mrp, "one protocol failed to connect");
         } else {
             tracing::debug!(companion, mrp, "connected");
         }
-        Ok(tv)
+    }
+
+    /// True if `protocol` is connected and has not closed.
+    #[must_use]
+    pub fn is_open(&self, protocol: Protocol) -> bool {
+        match protocol {
+            Protocol::Companion => self.open_companion().is_some(),
+            Protocol::Mrp => self.open_mrp().is_some(),
+        }
+    }
+
+    fn open_companion(&self) -> Option<&companion::Client> {
+        self.companion.as_ref().filter(|c| c.is_connected())
+    }
+
+    fn open_mrp(&self) -> Option<&mrp::Client> {
+        self.mrp.as_ref().filter(|m| m.is_connected())
+    }
+
+    /// Why `protocol` did not connect in [`connect`](Self::connect) or
+    /// [`connect_missing`](Self::connect_missing).
+    ///
+    /// `None` if it connected or had no endpoint. Use [`Error::is_refused`]
+    /// to see if the port may have changed.
+    #[must_use]
+    pub fn connect_error(&self, protocol: Protocol) -> Option<&Error> {
+        match protocol {
+            Protocol::Companion => self.companion_error.as_deref(),
+            Protocol::Mrp => self.mrp_error.as_deref(),
+        }
     }
 
     /// Companion client, if connected.
@@ -1030,6 +1135,7 @@ impl AppleTv {
     /// that closed it, or `None` after [`close`](Self::close).
     ///
     /// The other protocol stays connected. To get all protocols back, call
+    /// [`connect_missing`](Self::connect_missing), or call
     /// [`close`](Self::close) or drop all clones, then connect again.
     pub async fn closed(&self) -> Option<Arc<Error>> {
         let companion = async {
@@ -1051,19 +1157,49 @@ impl AppleTv {
     }
 }
 
-/// Returns the client, or logs the error and keeps the first one.
-fn keep<T>(
-    name: &str,
-    result: Option<Result<T, Error>>,
-    first_error: &mut Option<Error>,
-) -> Option<T> {
-    match result? {
-        Ok(client) => Some(client),
-        Err(err) => {
-            tracing::debug!(%err, protocol = name, "connection failed");
-            first_error.get_or_insert(err);
-            None
+/// Connects the protocols that are wanted and have an endpoint, in parallel.
+async fn connect_clients(
+    endpoints: &Endpoints,
+    credentials: &Credentials,
+    options: &ClientOptions,
+    want_companion: bool,
+    want_mrp: bool,
+) -> (
+    Option<Result<companion::Client, Error>>,
+    Option<Result<mrp::Client, Error>>,
+) {
+    let companion = async {
+        match endpoints.companion.filter(|_| want_companion) {
+            Some(addr) => Some(companion::Client::connect(addr, credentials, options).await),
+            None => None,
         }
+    };
+    let mrp = async {
+        match endpoints.airplay.filter(|_| want_mrp) {
+            Some(addr) => Some(mrp::Client::connect(addr, credentials, options).await),
+            None => None,
+        }
+    };
+    tokio::join!(companion, mrp)
+}
+
+/// The Companion error, else the MRP error, else [`Error::NoEndpoints`].
+fn first_error(companion: Option<Arc<Error>>, mrp: Option<Arc<Error>>) -> Error {
+    companion
+        .or(mrp)
+        .and_then(Arc::into_inner)
+        .unwrap_or(Error::NoEndpoints)
+}
+
+/// Splits a connect result into the client and the error, and logs the error.
+fn split<T>(name: &str, result: Option<Result<T, Error>>) -> (Option<T>, Option<Arc<Error>>) {
+    match result {
+        Some(Ok(client)) => (Some(client), None),
+        Some(Err(err)) => {
+            tracing::debug!(%err, protocol = name, "connection failed");
+            (None, Some(Arc::new(err)))
+        }
+        None => (None, None),
     }
 }
 

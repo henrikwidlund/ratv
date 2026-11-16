@@ -1068,6 +1068,70 @@ async fn stalled_connect_starts_again() {
     assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
 }
 
+/// A closed MRP connects again without the refused Companion, and the
+/// refused error is kept.
+#[cfg(feature = "companion")]
+#[tokio::test]
+async fn apple_tv_connects_missing_protocol() {
+    use ratv::{AppleTv, Endpoints, Key, Protocol};
+
+    let refused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let companion = refused.local_addr().unwrap();
+    drop(refused);
+    let first = start_device().await;
+    let mut endpoints = Endpoints {
+        companion: Some(companion),
+        airplay: Some(format!("127.0.0.1:{}", first.port).parse().unwrap()),
+    };
+    let opts = options();
+    let tv = AppleTv::connect(&endpoints, &credentials(), &opts)
+        .await
+        .unwrap();
+    assert!(tv.connect_error(Protocol::Companion).unwrap().is_refused());
+    assert!(tv.connect_error(Protocol::Mrp).is_none());
+    assert!(!tv.is_open(Protocol::Companion));
+    assert!(tv.is_open(Protocol::Mrp));
+
+    // Companion is still refused: fails, and MRP stays connected.
+    let err = tv
+        .connect_missing(&endpoints, &credentials(), &opts)
+        .await
+        .unwrap_err();
+    assert!(err.is_refused());
+    assert!(tv.mrp().unwrap().is_connected());
+
+    // No endpoint for the missing protocol.
+    let no_companion = Endpoints {
+        companion: None,
+        ..endpoints
+    };
+    let err = tv
+        .connect_missing(&no_companion, &credentials(), &opts)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NoEndpoints));
+
+    // MRP closes, so both are missing. Only MRP connects again, on a new port.
+    tv.mrp().unwrap().close().await.unwrap();
+    assert!(!tv.is_open(Protocol::Mrp));
+    let second = start_device().await;
+    endpoints.airplay = Some(format!("127.0.0.1:{}", second.port).parse().unwrap());
+    let new = tv
+        .connect_missing(&endpoints, &credentials(), &opts)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(new.is_connected());
+    assert!(new.is_open(Protocol::Mrp));
+    assert!(!tv.is_connected());
+    assert!(new.connect_error(Protocol::Companion).unwrap().is_refused());
+    assert!(new.connect_error(Protocol::Mrp).is_none());
+    new.press(Key::Select).await.unwrap();
+    new.close().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(second.log.lock().unwrap().buttons[0], (1, 0x89, true));
+}
+
 /// Companion is refused, so `AppleTv` uses only MRP.
 #[cfg(feature = "companion")]
 #[tokio::test]

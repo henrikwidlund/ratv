@@ -59,7 +59,7 @@ mod tcp;
 mod touch;
 
 #[cfg(all(feature = "companion", feature = "mrp"))]
-pub use apple_tv::{AppleTv, Endpoints, Key, PinPrompt, pair};
+pub use apple_tv::{AppleTv, Endpoints, Key, PinPrompt, Protocol, pair};
 pub use error::Error;
 #[cfg(any(feature = "companion", feature = "mrp"))]
 pub use options::{ClientOptions, PairOptions};

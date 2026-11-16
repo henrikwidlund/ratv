@@ -1200,3 +1200,54 @@ async fn apple_tv_siri_uses_companion() {
     siri.finish().await.unwrap();
     assert_eq!(log.lock().unwrap().siri, ["start", "3", "stop"]);
 }
+
+/// Accepts TCP connections and runs a device session on each.
+async fn listen(controller: PairedController, log: Arc<Mutex<Log>>) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            let (mut client_io, device_io) = tokio::io::duplex(8192);
+            tokio::spawn(device_session(device_io, controller.clone(), log.clone()));
+            tokio::spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut tcp, &mut client_io).await;
+            });
+        }
+    });
+    addr
+}
+
+/// A closed Companion connects again, and the new handle has the merged
+/// now playing again.
+#[cfg(feature = "mrp")]
+#[tokio::test]
+async fn apple_tv_connects_missing_companion() {
+    use ratv::{AppleTv, Endpoints, Protocol};
+
+    let (creds, controller) = pair().await;
+    let log = Arc::new(Mutex::new(Log::default()));
+    let endpoints = Endpoints {
+        companion: Some(listen(controller, log).await),
+        airplay: None,
+    };
+    let tv = AppleTv::connect(&endpoints, &creds, &options())
+        .await
+        .unwrap();
+    assert!(tv.is_open(Protocol::Companion));
+    assert!(!tv.is_open(Protocol::Mrp));
+    assert!(tv.connect_error(Protocol::Mrp).is_none());
+
+    tv.companion().unwrap().close().await.unwrap();
+    assert!(!tv.is_open(Protocol::Companion));
+    let new = tv
+        .connect_missing(&endpoints, &creds, &options())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(new.is_open(Protocol::Companion));
+    assert!(!tv.is_open(Protocol::Companion));
+    let np = new.now_playing().unwrap().borrow().clone();
+    assert_eq!(np.title.as_deref(), Some("Nocturne"));
+    new.turn_on().await.unwrap();
+    new.close().await.unwrap();
+}

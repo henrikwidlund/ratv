@@ -127,6 +127,14 @@ impl Error {
         }
     }
 
+    /// True if the device refused the TCP connection. The service may listen
+    /// on another port now, so scan again to find it. Other connect errors,
+    /// for example [`Error::Timeout`], can mean that the device is still starting.
+    #[must_use]
+    pub fn is_refused(&self) -> bool {
+        matches!(self, Self::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused)
+    }
+
     /// True if the device rejected the credentials, or the PIN while pairing.
     /// After a failed connect, pair again to fix it.
     #[must_use]
@@ -167,6 +175,14 @@ mod tests {
         );
         assert!(!Error::Hap(ratv_hap::Error::Decrypt).is_auth());
         assert!(!Error::Timeout.is_auth());
+    }
+
+    #[test]
+    fn is_refused() {
+        let io = |kind| Error::Io(std::io::Error::from(kind));
+        assert!(io(std::io::ErrorKind::ConnectionRefused).is_refused());
+        assert!(!io(std::io::ErrorKind::TimedOut).is_refused());
+        assert!(!Error::Timeout.is_refused());
     }
 
     #[test]
