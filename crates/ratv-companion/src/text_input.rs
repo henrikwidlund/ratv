@@ -65,7 +65,7 @@ pub struct TextInputCommand<'a> {
 }
 
 impl Outgoing for TextInputCommand<'_> {
-    const ID: &'static str = "_tiC";
+    const ID: &str = "_tiC";
     const TYPE: MessageType = MessageType::Event;
 
     fn content(&self, e: &mut Encoder<'_>) {

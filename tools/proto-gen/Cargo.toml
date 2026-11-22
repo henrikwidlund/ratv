@@ -8,3 +8,6 @@ publish = false
 [dependencies]
 prost-build = "0.14"
 protox = "0.10"
+
+[lints]
+workspace = true

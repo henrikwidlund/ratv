@@ -116,16 +116,16 @@ async fn run(
                 {
                     break;
                 }
-                if unicast {
-                    for (done, target) in answered.iter_mut().zip(&options.targets) {
-                        *done |= target.ip() == from.ip();
-                    }
-                    if !collector.is_complete() {
-                        // Ask for missing records now instead of after the resend interval.
-                        next_send = Instant::now();
-                    } else if answered.iter().all(|&a| a) {
-                        break;
-                    }
+                if unicast
+                    && unicast_answer(
+                        &mut answered,
+                        &options.targets,
+                        from.ip(),
+                        collector.is_complete(),
+                        &mut next_send,
+                    )
+                {
+                    break;
                 }
             }
             Ok(Err(err)) => tracing::debug!(%err, "mDNS receive failed"),
@@ -139,6 +139,27 @@ async fn run(
         "scan done"
     );
     Ok(devices)
+}
+
+/// Marks the targets at `from` as answered. Returns true when all records
+/// are complete and all targets answered. If records are missing, sets
+/// `next_send` to now to ask for them at once.
+fn unicast_answer(
+    answered: &mut [bool],
+    targets: &[SocketAddr],
+    from: IpAddr,
+    complete: bool,
+    next_send: &mut Instant,
+) -> bool {
+    for (done, target) in answered.iter_mut().zip(targets) {
+        *done |= target.ip() == from;
+    }
+    if !complete {
+        // Ask for missing records now instead of after the resend interval.
+        *next_send = Instant::now();
+        return false;
+    }
+    answered.iter().all(|&a| a)
 }
 
 #[cfg(test)]

@@ -225,37 +225,11 @@ async fn run_value(tv: &AppleTv, command: &str) -> Result<(), Box<dyn std::error
         tv.set_repeat(RepeatMode::from_str_name(&capitalize(v)).ok_or("bad mode")?)
             .await?;
     } else if let Some(v) = value("play_item=") {
-        let np = details(tv, |n| !n.up_next.is_empty()).await?;
-        let index: usize = v.parse()?;
-        println!("before: {:?}", np.title);
-        let next = np.up_next.get(index).ok_or("no such item")?;
-        println!("expect: {:?}", next.title);
-        tv.play_queue_item(index).await?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        println!("after:  {:?}", details(tv, |_| true).await?.title);
-    } else if let Some((kind, v)) = value("audio=")
-        .map(|v| ("a", v))
-        .or_else(|| value("subtitles=").map(|v| ("s", v)))
-    {
-        let np = details(tv, |n| !n.audio_languages.is_empty()).await?;
-        let list = if kind == "a" {
-            &np.audio_languages
-        } else {
-            &np.subtitle_languages
-        };
-        let option = list
-            .iter()
-            .find(|o| o.language_tag() == v)
-            .ok_or("no such language")?;
-        print_languages_now(tv, "before").await?;
-        println!(
-            "enable: {} ({})",
-            option.display_name(),
-            option.language_tag()
-        );
-        tv.enable_language(option).await?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        print_languages_now(tv, "after").await?;
+        play_item(tv, v.parse()?).await?;
+    } else if let Some(v) = value("audio=") {
+        enable_language(tv, false, v).await?;
+    } else if let Some(v) = value("subtitles=") {
+        enable_language(tv, true, v).await?;
     } else if let Some(v) = value("outputs=") {
         set_outputs(tv, v).await?;
     } else if let Some(v) = value("swipe=") {
@@ -298,6 +272,46 @@ async fn run_value(tv: &AppleTv, command: &str) -> Result<(), Box<dyn std::error
     } else {
         return Err(format!("unknown command {command}").into());
     }
+    Ok(())
+}
+
+/// Plays up next item `index` and prints the title before and after.
+async fn play_item(tv: &AppleTv, index: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let np = details(tv, |n| !n.up_next.is_empty()).await?;
+    println!("before: {:?}", np.title);
+    let next = np.up_next.get(index).ok_or("no such item")?;
+    println!("expect: {:?}", next.title);
+    tv.play_queue_item(index).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("after:  {:?}", details(tv, |_| true).await?.title);
+    Ok(())
+}
+
+/// Enables the audio or subtitle language with tag `tag`.
+async fn enable_language(
+    tv: &AppleTv,
+    subtitles: bool,
+    tag: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let np = details(tv, |n| !n.audio_languages.is_empty()).await?;
+    let list = if subtitles {
+        &np.subtitle_languages
+    } else {
+        &np.audio_languages
+    };
+    let option = list
+        .iter()
+        .find(|o| o.language_tag() == tag)
+        .ok_or("no such language")?;
+    print_languages_now(tv, "before").await?;
+    println!(
+        "enable: {} ({})",
+        option.display_name(),
+        option.language_tag()
+    );
+    tv.enable_language(option).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    print_languages_now(tv, "after").await?;
     Ok(())
 }
 

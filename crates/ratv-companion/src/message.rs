@@ -27,7 +27,7 @@ pub enum MessageType {
 /// A message that can be sent to the device.
 pub trait Outgoing {
     /// Message identifier (`_i`).
-    const ID: &'static str;
+    const ID: &str;
     /// Message type.
     const TYPE: MessageType = MessageType::Request;
     /// Writes the `_c` value.
@@ -164,7 +164,7 @@ pub struct SystemInfo<'a> {
 }
 
 impl Outgoing for SystemInfo<'_> {
-    const ID: &'static str = "_systemInfo";
+    const ID: &str = "_systemInfo";
 
     fn content(&self, e: &mut Encoder<'_>) {
         e.dict(10, |e| {
@@ -400,7 +400,7 @@ pub enum LaunchApp<'a> {
 }
 
 impl Outgoing for LaunchApp<'_> {
-    const ID: &'static str = "_launchApp";
+    const ID: &str = "_launchApp";
 
     fn content(&self, e: &mut Encoder<'_>) {
         let (k, v) = match *self {
@@ -462,7 +462,7 @@ impl Outgoing for FetchAccounts {
 pub struct SwitchAccount<'a>(pub &'a str);
 
 impl Outgoing for SwitchAccount<'_> {
-    const ID: &'static str = "SwitchUserAccountEvent";
+    const ID: &str = "SwitchUserAccountEvent";
 
     fn content(&self, e: &mut Encoder<'_>) {
         e.dict(1, |e| {
@@ -628,7 +628,7 @@ pub struct Interest<'a> {
 }
 
 impl Outgoing for Interest<'_> {
-    const ID: &'static str = "_interest";
+    const ID: &str = "_interest";
     const TYPE: MessageType = MessageType::Event;
 
     fn content(&self, e: &mut Encoder<'_>) {
@@ -868,7 +868,7 @@ impl Outgoing for SiriAudio<'_> {
 pub struct SiriEndpointReply;
 
 impl Outgoing for SiriEndpointReply {
-    const ID: &'static str = event::SIRI_ENDPOINT;
+    const ID: &str = event::SIRI_ENDPOINT;
     const TYPE: MessageType = MessageType::Response;
 
     fn content(&self, e: &mut Encoder<'_>) {
