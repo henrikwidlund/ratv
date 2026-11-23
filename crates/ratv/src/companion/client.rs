@@ -22,21 +22,22 @@ use tracing::{Instrument, Span};
 
 use super::io::{Step, flush, pairing_step};
 use crate::ClientOptions;
-use crate::link::{CloseGuard, Link, LinkTx};
+use crate::link::{Batches, CloseGuard, Link, LinkTx, Queued};
 use crate::{Error, log, rng, tcp, touch};
 
 const EVENT_CAPACITY: usize = 32;
-/// Requests in a row that time out while nothing is received. Then the
-/// connection is treated as dead.
-const MAX_SILENT_TIMEOUTS: u32 = 2;
-/// Encoded messages that are not sent yet.
+/// Encoded messages that are not sent yet. Checked before each push, so the
+/// outbox can be larger than this by one message. Releases and the `_siriEndpoint`
+/// reply skip it.
 const MAX_OUTBOX: usize = 1 << 20;
 
 /// Connected Companion session.
 ///
 /// Requests can be sent from several tasks at the same time. Clones share the
 /// session. A background task owns the socket; it stops when the last clone is
-/// dropped or the device disconnects.
+/// dropped, after [`close`](Self::close), when the device disconnects, or after
+/// silent timeouts ([`ClientOptions::max_silent_timeouts`]). A [`Siri`](super::Siri) holds a
+/// clone, so dropping the other clones does not stop the connection.
 #[derive(Debug, Clone)]
 pub struct Client {
     inner: Arc<Inner>,
@@ -46,12 +47,16 @@ pub struct Client {
 struct Inner {
     shared: Arc<Shared>,
     link: Link,
-    events: broadcast::Sender<Event>,
+    /// Owned by the task, so receivers close when it ends.
+    events: broadcast::WeakSender<Event>,
     now_playing: watch::Receiver<NowPlaying>,
     xid: AtomicU32,
     timeout: Duration,
-    /// Requests in a row that timed out while nothing was received.
+    /// Requests, one after the other, that timed out while nothing was
+    /// received.
     silent_timeouts: AtomicU32,
+    /// Silent timeouts after which the connection is treated as dead. 0 means never.
+    max_silent_timeouts: u32,
     session_id: AtomicU64,
     /// Start of the touch session, for touch timestamps.
     touch_base: Instant,
@@ -78,6 +83,9 @@ struct Shared {
     guide_supported: AtomicU8,
     /// Siri on in the device settings, see [`to_flag`].
     siri_enabled: AtomicU8,
+    /// The device answered the now playing fetch or sent now playing, so an
+    /// empty value means that nothing plays.
+    now_playing_known: AtomicBool,
 }
 
 /// Stores an `Option<bool>` in an atomic: 0 unknown, 1 false, 2 true.
@@ -101,6 +109,8 @@ const fn from_flag(v: u8) -> Option<bool> {
 struct Outbox {
     /// OPACK payloads to send, each after its length as `u32` little endian.
     buf: Vec<u8>,
+    /// Counts how often the task took the buffer, and tracks removed messages.
+    batches: Batches,
     /// Requests that wait for a response, by xid.
     pending: Vec<(u32, oneshot::Sender<Reply>)>,
     /// Set by `close`.
@@ -113,9 +123,9 @@ struct Outbox {
 type Reply = Result<Bytes, ratv_companion::Error>;
 
 impl Outbox {
-    /// Encodes `msg` with its length in front.
-    fn push<M: Outgoing>(&mut self, msg: &M, xid: u32) -> Result<(), Error> {
-        if self.buf.len() > MAX_OUTBOX {
+    /// Encodes `msg` with its length in front. A `release` skips the size limit.
+    fn push<M: Outgoing>(&mut self, msg: &M, xid: u32, release: bool) -> Result<Queued, Error> {
+        if !release && self.buf.len() > MAX_OUTBOX {
             return Err(Error::QueueFull);
         }
         let start = self.buf.len();
@@ -128,7 +138,16 @@ impl Outbox {
         }
         let len = u32::try_from(len).unwrap_or(u32::MAX);
         self.buf[start..start + 4].copy_from_slice(&len.to_le_bytes());
-        Ok(())
+        Ok(self.batches.queued(start, self.buf.len()))
+    }
+
+    /// Removes a message if the task has not taken it. True if removed.
+    fn remove(&mut self, queued: Queued) -> bool {
+        let len = self.batches.remove(queued, &mut self.buf);
+        if let Some(len) = len {
+            self.buf.truncate(len);
+        }
+        len.is_some()
     }
 }
 
@@ -162,7 +181,8 @@ impl Client {
         .await
     }
 
-    /// Same as [`Client::connect`] on an existing stream.
+    /// Same as [`Client::connect`] on an existing stream. `stall_timeout` is
+    /// not used, because the stream cannot be opened again.
     pub async fn connect_stream<S>(
         stream: S,
         credentials: &Credentials,
@@ -172,9 +192,15 @@ impl Client {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let span = log::session("companion", None);
-        Self::start(stream, credentials, options, options.timeout, span.clone())
-            .instrument(span)
-            .await
+        Self::start(
+            stream,
+            credentials,
+            options,
+            options.connect_step(),
+            span.clone(),
+        )
+        .instrument(span)
+        .await
     }
 
     /// `step` is the time to wait for each connect step.
@@ -211,11 +237,12 @@ impl Client {
             inner: Arc::new(Inner {
                 shared,
                 link,
-                events,
+                events: events.downgrade(),
                 now_playing,
                 xid: AtomicU32::new(rng::u32() >> 16),
                 timeout: options.timeout,
                 silent_timeouts: AtomicU32::new(0),
+                max_silent_timeouts: options.max_silent_timeouts,
                 session_id: AtomicU64::new(0),
                 touch_base: Instant::now(),
                 siri_active: AtomicBool::new(false),
@@ -242,12 +269,12 @@ impl Client {
         // Each request has its own limit, so an optional one that gets no
         // answer does not fail the connect.
         let (info, touch_start, session, tv_remote, text_input, interest, actions, playing) = tokio::join!(
-            within(step, client.request(&info)),
-            within(step, client.request(&touch_area)),
-            within(step, client.request(&session)),
-            within(step, client.request(&TvRemoteSessionStart)),
+            within(step, client.request_with(&info, None)),
+            within(step, client.request_with(&touch_area, None)),
+            within(step, client.request_with(&session, None)),
+            within(step, client.request_with(&TvRemoteSessionStart, None)),
             // Makes the device send keyboard focus events.
-            within(step, client.request(&TextInputStart)),
+            within(step, client.request_with(&TextInputStart, None)),
             within(
                 step,
                 client.send_event(&Interest {
@@ -263,9 +290,9 @@ impl Client {
                 })
             ),
             // The device then sends the current state as an event.
-            within(step, client.request(&FetchSupportedActions)),
+            within(step, client.request_with(&FetchSupportedActions, None)),
             // The device then sends what plays as an event.
-            within(step, client.request(&FetchNowPlaying)),
+            within(step, client.request_with(&FetchNowPlaying, None)),
         );
         // The Siri state is optional, so a reply that cannot be read only leaves it unknown.
         let siri = Message::decode(&info?)
@@ -280,6 +307,8 @@ impl Client {
             message::combined_session_id(device, ours),
             Ordering::Relaxed,
         );
+        // If the device sent the now playing event, it came before this reply.
+        (client.inner.shared.now_playing_known).fetch_or(playing.is_ok(), Ordering::Release);
         // Older tvOS versions may not support these.
         for (id, result) in [
             ("_touchStart", touch_start),
@@ -303,20 +332,87 @@ impl Client {
 
     /// Sends a request and returns the raw response payload.
     /// Decode it with [`Message::decode`]. Device errors are returned as `Err`.
+    ///
+    /// Fails with [`Error::Closed`] if the connection was closed before the
+    /// request was sent, with [`Error::QueueFull`] if the outbox is full, and
+    /// with [`Error::SendTimeout`] if the request was still in the outbox
+    /// after the time limit. All three mean that it was not sent, see
+    /// [`Error::is_not_sent`].
+    /// A request that is too large ([`Error::is_too_large`]) is not sent
+    /// either.
+    /// Fails with [`Error::NoAnswer`] if the request left the outbox but got
+    /// no answer in time; it may still be in the write, or it may have been
+    /// sent. Fails with [`Error::Disconnected`] if the connection closed after
+    /// the request left the outbox; then it may have been sent.
     pub async fn request<M: Outgoing + Sync>(&self, msg: &M) -> Result<Bytes, Error> {
+        self.request_with(msg, Some(self.inner.timeout)).await
+    }
+
+    /// Like [`request`](Self::request), with `limit` instead of the timeout.
+    /// `None` waits until the reply or the end of the connection.
+    async fn request_with<M: Outgoing + Sync>(
+        &self,
+        msg: &M,
+        limit: Option<Duration>,
+    ) -> Result<Bytes, Error> {
+        self.send_request(msg, limit, false, true).await
+    }
+
+    /// Like [`request`](Self::request) for a button or Siri release, which
+    /// skips the outbox size limit.
+    pub(super) async fn release_request<M: Outgoing + Sync>(
+        &self,
+        msg: &M,
+    ) -> Result<Bytes, Error> {
+        self.send_request(msg, Some(self.inner.timeout), true, true)
+            .await
+    }
+
+    /// Sends a request and waits at most `limit` for the response. `None`
+    /// waits without a limit. A `release` skips the outbox size limit. With
+    /// `count`, a timeout counts toward
+    /// [`ClientOptions::max_silent_timeouts`].
+    async fn send_request<M: Outgoing + Sync>(
+        &self,
+        msg: &M,
+        limit: Option<Duration>,
+        release: bool,
+        count: bool,
+    ) -> Result<Bytes, Error> {
         let xid = self.next_xid();
         tracing::trace!(parent: &self.inner.span, id = M::ID, xid, "request");
         let start = Instant::now();
         let (reply, rx) = oneshot::channel();
         let reads = self.inner.shared.reads.load(Ordering::Relaxed);
-        self.queue(msg, xid, Some(reply))?;
-        let Ok(reply) = tokio::time::timeout(self.inner.timeout, rx).await else {
-            tracing::debug!(parent: &self.inner.span, id = M::ID, xid, "request timed out");
-            self.timed_out(reads);
-            return Err(Error::NoAnswer(M::ID));
+        let queued = self.queue(msg, xid, Some(reply), release)?;
+        let reply = match limit {
+            Some(limit) => {
+                let Ok(reply) = tokio::time::timeout(limit, rx).await else {
+                    let removed = self.inner.shared.outbox().remove(queued);
+                    tracing::debug!(parent: &self.inner.span, id = M::ID, xid, removed, "request timed out");
+                    if removed {
+                        // Never sent, so it does not show that the device stopped answering.
+                        return Err(Error::SendTimeout(M::ID));
+                    }
+                    if count {
+                        self.timed_out(reads);
+                    }
+                    return Err(Error::NoAnswer(M::ID));
+                };
+                self.inner.silent_timeouts.store(0, Ordering::Relaxed);
+                reply
+            }
+            None => rx.await,
         };
-        self.inner.silent_timeouts.store(0, Ordering::Relaxed);
-        let reply = reply.map_err(|_| Error::Disconnected)?;
+        let Ok(reply) = reply else {
+            // The connection closed. A message that is still queued was not sent.
+            let removed = self.inner.shared.outbox().remove(queued);
+            return Err(if removed {
+                Error::Closed
+            } else {
+                Error::Disconnected
+            });
+        };
         let elapsed = start.elapsed();
         match reply {
             Ok(bytes) => {
@@ -330,36 +426,41 @@ impl Client {
         }
     }
 
-    /// Ends the connection after requests in a row time out while the
-    /// device sends nothing. TCP keepalive does not run while sent data
-    /// waits for acknowledgement, so this finds a device that is gone.
+    /// Ends the connection after requests, one after the other, time out
+    /// while the device sends nothing. TCP keepalive does not run while sent
+    /// data waits for acknowledgement, so this finds a device that is gone.
     fn timed_out(&self, reads_before: u64) {
         if self.inner.shared.reads.load(Ordering::Relaxed) != reads_before {
             self.inner.silent_timeouts.store(0, Ordering::Relaxed);
             return;
         }
+        let max = self.inner.max_silent_timeouts;
+        if max == 0 {
+            return;
+        }
         let n = self.inner.silent_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
-        if n >= MAX_SILENT_TIMEOUTS {
+        if n >= max {
             tracing::debug!(parent: &self.inner.span, "device sends nothing");
             self.inner.shared.outbox().stalled = true;
             self.inner.shared.wake.notify_one();
         }
     }
 
-    /// Sends an event (no response).
+    /// Sends an event (no response). `Ok` only means that the event was
+    /// queued. Fails with [`Error::Closed`], [`Error::QueueFull`] or a too
+    /// large event ([`Error::is_too_large`]); then it was not sent.
     // Async, so waiting for queue space can be added without an API change.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn send_event<M: Outgoing + Sync>(&self, msg: &M) -> Result<(), Error> {
-        let xid = self.next_xid();
-        tracing::trace!(parent: &self.inner.span, id = M::ID, xid, "event");
-        self.queue(msg, xid, None)
+        self.queue_event(msg, false)
     }
 
-    /// Sends a request without waiting for the response.
-    pub(super) fn request_no_wait<M: Outgoing>(&self, msg: &M) -> Result<(), Error> {
+    /// Queues a message without waiting for a response.
+    /// A `release` skips the outbox size limit.
+    pub(super) fn queue_event<M: Outgoing>(&self, msg: &M, release: bool) -> Result<(), Error> {
         let xid = self.next_xid();
-        tracing::trace!(parent: &self.inner.span, id = M::ID, xid, "request without wait");
-        self.queue(msg, xid, None)
+        tracing::trace!(parent: &self.inner.span, id = M::ID, xid, release, "event");
+        self.queue(msg, xid, None, release).map(drop)
     }
 
     /// Flag that is true while a [`Siri`](super::Siri) exists.
@@ -372,54 +473,68 @@ impl Client {
     }
 
     /// Encodes `msg` into the outbox and wakes the background task.
+    /// A `release` skips the outbox size limit.
     fn queue<M: Outgoing>(
         &self,
         msg: &M,
         xid: u32,
         reply: Option<oneshot::Sender<Reply>>,
-    ) -> Result<(), Error> {
-        {
+        release: bool,
+    ) -> Result<Queued, Error> {
+        let queued = {
             let mut out = self.inner.shared.outbox();
             // Checked while locked: the task clears `pending` after the link closes.
             if !self.inner.link.is_open() {
-                return Err(Error::Disconnected);
+                return Err(Error::Closed);
             }
-            out.push(msg, xid)?;
+            let queued = out.push(msg, xid, release)?;
             if let Some(reply) = reply {
                 out.pending.retain(|(_, tx)| !tx.is_closed());
                 out.pending.push((xid, reply));
             }
-        }
+            queued
+        };
         self.inner.shared.wake.notify_one();
-        Ok(())
+        Ok(queued)
     }
 
     /// Receives device events (media controls, power state, keyboard focus).
     ///
     /// A receiver that reads too slowly misses old events and gets `RecvError::Lagged`.
+    /// The receiver closes when the connection closes.
     #[must_use]
     pub fn events(&self) -> broadcast::Receiver<Event> {
-        self.inner.events.subscribe()
+        crate::subscribe(&self.inner.events)
     }
 
     /// True if Siri is on in the device settings.
     /// Read when connecting and updated with [`Event::SiriStatus`].
-    /// `None` if the device does not say.
+    /// `None` if the device does not say. Keeps the last value after the
+    /// connection closes.
     #[must_use]
     pub fn siri_enabled(&self) -> Option<bool> {
         from_flag(self.inner.shared.siri_enabled.load(Ordering::Relaxed))
     }
 
     /// What the device plays. Faster than MRP, but has less data, and may not
-    /// hold an item that was paused before connecting.
+    /// hold an item that was paused before connecting. After the connection
+    /// closes, the receiver keeps the last value and closes.
     #[must_use]
     pub fn now_playing(&self) -> watch::Receiver<NowPlaying> {
         self.inner.now_playing.clone()
     }
 
+    /// True if [`now_playing`](Self::now_playing) holds data from the device.
+    /// An empty value then means that nothing plays.
+    #[cfg(feature = "mrp")]
+    pub(crate) fn now_playing_known(&self) -> bool {
+        self.inner.shared.now_playing_known.load(Ordering::Acquire)
+    }
+
     /// True if the Guide button does something on the current screen.
     /// Read when connecting and updated with [`Event::ScreenChanged`].
-    /// `None` if the device did not say.
+    /// `None` if the device did not say. Keeps the last value after the
+    /// connection closes.
     #[must_use]
     pub fn guide_supported(&self) -> Option<bool> {
         from_flag(self.inner.shared.guide_supported.load(Ordering::Relaxed))
@@ -438,7 +553,11 @@ impl Client {
     }
 
     /// Waits until the connection closes. Returns the error that closed it,
-    /// or `None` after [`close`](Self::close).
+    /// or `None` after [`close`](Self::close). After `close`, a write error
+    /// or [`Error::NoAnswer`] can still be returned when the device did not
+    /// read, or [`Error::Disconnected`] when the device closed the
+    /// connection first. Returns at once when the connection is already
+    /// closed.
     pub async fn closed(&self) -> Option<Arc<Error>> {
         self.inner.link.closed().await
     }
@@ -452,24 +571,25 @@ impl Client {
     pub async fn press(&self, command: HidCommand) -> Result<(), Error> {
         // The device starts the screensaver without answering, so do not wait for replies.
         if command == HidCommand::Screensaver {
-            for state in [ButtonState::Down, ButtonState::Up] {
-                self.send_event(&Hid { command, state }).await?;
-            }
-            return Ok(());
+            let state = ButtonState::Down;
+            self.send_event(&Hid { command, state }).await?;
+            let state = ButtonState::Up;
+            return self.queue_event(&Hid { command, state }, true);
         }
         let mut held = Held {
             client: self,
             command,
             armed: true,
         };
-        self.button(command, ButtonState::Down).await?;
-        held.armed = false;
-        self.button(command, ButtonState::Up).await
+        held.down().await?;
+        held.release().await
     }
 
     /// Clicks a button two times fast. [`HidCommand::Home`] opens the app switcher.
     ///
     /// All events are sent before waiting for answers, so the device sees a double click.
+    /// When it fails, some of the 4 messages can still be sent, also with an
+    /// error where [`Error::is_not_sent`] is true.
     pub async fn double_tap(&self, command: HidCommand) -> Result<(), Error> {
         let mut held = Held {
             client: self,
@@ -495,27 +615,51 @@ impl Client {
             command,
             armed: true,
         };
-        self.button(command, ButtonState::Down).await?;
+        held.down().await?;
         tokio::time::sleep(duration).await;
-        held.armed = false;
-        self.button(command, ButtonState::Up).await
+        held.release().await
     }
 
-    /// Sends a media control command.
+    /// Sends a media control command. A `SkipBy` value that is not finite
+    /// or a `SetVolume` value of NaN gives [`Error::InvalidArgument`]. A
+    /// `SetVolume` value is limited to 0.0 to 1.0, as in
+    /// [`set_volume`](Self::set_volume).
     pub async fn media(&self, command: MediaControl) -> Result<(), Error> {
+        let command = match command {
+            MediaControl::SkipBy(seconds) => {
+                MediaControl::SkipBy(crate::finite(seconds, "seconds")?)
+            }
+            MediaControl::SetVolume(volume) => {
+                if volume.is_nan() {
+                    return Err(Error::InvalidArgument("volume"));
+                }
+                // `+ 0.0` turns -0.0 into 0.0.
+                MediaControl::SetVolume(volume.clamp(0.0, 1.0) + 0.0)
+            }
+            other => other,
+        };
         self.request(&command).await.map(drop)
     }
 
-    /// Returns the volume from 0.0 to 1.0.
+    /// Returns the volume from 0.0 to 1.0. A device value outside that range
+    /// is limited to it. Fails with [`Error::Companion`] if the reply has no
+    /// volume, or a volume that is not finite or too large for f32.
     pub async fn volume(&self) -> Result<f32, Error> {
         let reply = self.request(&MediaControl::GetVolume).await?;
         let volume = message::volume_response(&Message::decode(&reply)?)?;
         // Volume is 0.0 to 1.0, so f32 is exact enough.
         #[allow(clippy::cast_possible_truncation)]
-        Ok(volume as f32)
+        let volume = volume as f32;
+        // A finite f64 can be too large for f32.
+        if !volume.is_finite() {
+            return Err(ratv_companion::Error::InvalidField("_vol").into());
+        }
+        // `+ 0.0` turns -0.0 into 0.0.
+        Ok(volume.clamp(0.0, 1.0) + 0.0)
     }
 
-    /// Sets the volume from 0.0 to 1.0.
+    /// Sets the volume from 0.0 to 1.0. NaN gives [`Error::InvalidArgument`];
+    /// other values are limited to 0.0 to 1.0.
     pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
         let volume = crate::volume_level(volume)?;
         self.media(MediaControl::SetVolume(f64::from(volume))).await
@@ -561,17 +705,20 @@ impl Client {
         Ok(self.text_session().await?.map(|s| s.text))
     }
 
-    /// Replaces the text of the focused text field.
+    /// Replaces the text of the focused text field. Fails with
+    /// [`Error::NoTextField`] if no text field has focus.
     pub async fn set_text(&self, text: &str) -> Result<(), Error> {
         self.edit_text(text, true).await
     }
 
-    /// Adds text at the cursor of the focused text field.
+    /// Adds text at the cursor of the focused text field. Fails with
+    /// [`Error::NoTextField`] if no text field has focus.
     pub async fn append_text(&self, text: &str) -> Result<(), Error> {
         self.edit_text(text, false).await
     }
 
-    /// Removes all text of the focused text field.
+    /// Removes all text of the focused text field. Fails with
+    /// [`Error::NoTextField`] if no text field has focus.
     pub async fn clear_text(&self) -> Result<(), Error> {
         self.edit_text("", true).await
     }
@@ -607,7 +754,7 @@ impl Client {
     }
 
     /// Sends a touch event. `x` and `y` range from 0.0 to 1.0.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn touch(&self, x: f64, y: f64, phase: TouchPhase) -> Result<(), Error> {
         self.send_event(&self.touch_event(x, y, phase)).await
     }
@@ -629,7 +776,7 @@ impl Client {
 
     /// Swipes from `from` to `to` in about `duration`. Coordinates range from 0.0 to 1.0.
     /// The finger is lifted also if the returned future is dropped.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn swipe(
         &self,
         from: (f64, f64),
@@ -638,35 +785,48 @@ impl Client {
     ) -> Result<(), Error> {
         let mut down = Touching {
             client: self,
-            at: to,
+            at: from,
             armed: true,
         };
-        touch::swipe(from, to, duration, |x, y, phase| {
+        let mut pressed = false;
+        let result = touch::swipe(from, to, duration, |x, y, phase| {
             let phase = match phase {
                 touch::Phase::Begin => TouchPhase::Press,
                 touch::Phase::Move => TouchPhase::Hold,
                 touch::Phase::End => TouchPhase::Release,
             };
-            self.touch(x, y, phase)
+            let msg = self.touch_event(x, y, phase);
+            let result = self.queue_event(&msg, phase == TouchPhase::Release);
+            if result.is_ok() {
+                pressed = true;
+                // Lift where the finger is, not at the end of the swipe.
+                down.at = (x, y);
+            }
+            async move { result }
         })
-        .await?;
-        down.armed = false;
-        Ok(())
+        .await;
+        // No lift without a press.
+        down.armed = result.is_err() && pressed;
+        result
     }
 
     /// Taps at `x`, `y` without a click. Coordinates range from 0.0 to 1.0.
     /// The finger is lifted also if the returned future is dropped.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn tap(&self, x: f64, y: f64) -> Result<(), Error> {
         let mut down = Touching {
             client: self,
             at: (x, y),
             armed: true,
         };
-        self.touch(x, y, TouchPhase::Press).await?;
+        if let Err(err) = self.touch(x, y, TouchPhase::Press).await {
+            // No lift without a press.
+            down.armed = !err.is_not_sent();
+            return Err(err);
+        }
         tokio::time::sleep(touch::TAP_HOLD).await;
         down.armed = false;
-        self.touch(x, y, TouchPhase::Release).await
+        self.queue_event(&self.touch_event(x, y, TouchPhase::Release), true)
     }
 
     /// Wakes the device.
@@ -679,31 +839,55 @@ impl Client {
         self.press(HidCommand::Sleep).await
     }
 
-    /// Stops the session and closes the connection of all clones.
+    /// Stops the session and closes the connection of all clones. Returns
+    /// `Ok` at once when the connection is already closed.
     ///
     /// A device error for the stop request is ignored: the device ends the
-    /// session itself when the app changes or it goes to sleep.
+    /// session itself when the app changes or it goes to sleep. A stop
+    /// request that was not sent or not answered, or a connection that closes
+    /// while the stop request waits, is also ignored, because the connection
+    /// closes anyway. Its timeout does not count toward
+    /// [`ClientOptions::max_silent_timeouts`].
+    ///
+    /// When the device does not read, this can take about the timeout plus
+    /// one or two 10 s write limits. Calls on other clones while this runs
+    /// can return `Ok` but not be sent.
     pub async fn close(&self) -> Result<(), Error> {
         if !self.inner.link.is_open() {
             return Ok(());
         }
+        let stop = SessionStop {
+            session_id: self.session_id(),
+        };
+        // Closes also when this future is dropped while the stop request waits.
+        let close = CloseOnDrop(&self.inner.shared);
         let result = match self
-            .request(&SessionStop {
-                session_id: self.session_id(),
-            })
+            .send_request(&stop, Some(self.inner.timeout), false, false)
             .await
         {
-            Ok(_) => Ok(()),
+            // Closed while waiting, or the device does not answer.
+            Ok(_) | Err(Error::Disconnected | Error::NoAnswer(_)) => Ok(()),
+            // Closed since the check above, or the device does not read.
+            Err(err) if err.is_not_sent() => Ok(()),
             Err(Error::Companion(err @ ratv_companion::Error::Device { .. })) => {
                 tracing::debug!(parent: &self.inner.span, %err, "session already stopped by device");
                 Ok(())
             }
             Err(err) => Err(err),
         };
-        self.inner.shared.outbox().close = true;
-        self.inner.shared.wake.notify_one();
+        drop(close);
         self.inner.link.closed().await;
         result
+    }
+}
+
+/// Tells the task to close the connection when dropped.
+struct CloseOnDrop<'a>(&'a Shared);
+
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.outbox().close = true;
+        self.0.wake.notify_one();
     }
 }
 
@@ -714,6 +898,30 @@ struct Held<'a> {
     armed: bool,
 }
 
+impl Held<'_> {
+    /// Sends the press. If it was not sent, no release is sent either.
+    async fn down(&mut self) -> Result<(), Error> {
+        let result = self.client.button(self.command, ButtonState::Down).await;
+        if result.as_ref().is_err_and(Error::is_not_sent) {
+            self.armed = false;
+        }
+        result
+    }
+
+    /// Sends the release. If it was not sent in time, the drop queues it again
+    /// without waiting for the reply, so it is not removed from the outbox.
+    async fn release(&mut self) -> Result<(), Error> {
+        self.armed = false;
+        let up = Hid {
+            command: self.command,
+            state: ButtonState::Up,
+        };
+        let result = self.client.release_request(&up).await;
+        self.armed = matches!(result, Err(Error::SendTimeout(_)));
+        result.map(drop)
+    }
+}
+
 impl Drop for Held<'_> {
     fn drop(&mut self) {
         if self.armed {
@@ -721,7 +929,7 @@ impl Drop for Held<'_> {
                 command: self.command,
                 state: ButtonState::Up,
             };
-            let _ = self.client.queue(&up, self.client.next_xid(), None);
+            let _ = self.client.queue_event(&up, true);
         }
     }
 }
@@ -729,6 +937,7 @@ impl Drop for Held<'_> {
 /// Lifts the finger at `at` when dropped while armed.
 struct Touching<'a> {
     client: &'a Client,
+    /// The last point sent.
     at: (f64, f64),
     armed: bool,
 }
@@ -743,7 +952,7 @@ impl Drop for Touching<'_> {
         if self.armed {
             let (x, y) = self.at;
             let up = self.client.touch_event(x, y, TouchPhase::Release);
-            let _ = self.client.queue(&up, self.client.next_xid(), None);
+            let _ = self.client.queue_event(&up, true);
         }
     }
 }
@@ -758,7 +967,7 @@ async fn run<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Waiting requests fail right away.
+    // Waiting requests fail at once.
     let mut guard = CloseGuard::new(link, || shared.outbox().pending.clear());
     // Swapped with the outbox buffer, so both keep their capacity.
     let mut batch = Vec::new();
@@ -769,9 +978,11 @@ async fn run<S>(
                     let (close, stalled) = {
                         let mut out = shared.outbox();
                         std::mem::swap(&mut out.buf, &mut batch);
+                        out.batches.take();
                         (out.close, out.stalled)
                     };
-                    if stalled {
+                    // After `close`, the rest is sent and the close is clean.
+                    if stalled && !close {
                         return Err(Error::NoAnswer("requests"));
                     }
                     let mut rest = batch.as_slice();
@@ -810,6 +1021,8 @@ async fn run<S>(
         }
     };
     drop(guard);
+    // Receivers see the close also when the shutdown waits.
+    drop((now_playing, events));
     let _ = stream.shutdown().await;
 }
 
@@ -839,6 +1052,8 @@ fn dispatch(
     match msg.kind() {
         Some(MessageType::Event) if msg.id() == Some(event::NOW_PLAYING_INFO) => {
             now_playing.send_if_modified(|np| np.apply(&msg));
+            // After the send: who sees the flag also sees the value.
+            shared.now_playing_known.store(true, Ordering::Release);
         }
         Some(MessageType::Event) => {
             if let Some(event) = Event::parse(&msg) {
@@ -874,9 +1089,10 @@ fn dispatch(
         }
         Some(MessageType::Request) => {
             if let Some(event @ Event::SiriEndpoint) = Event::parse(&msg) {
-                // The iPhone replies with an empty response.
+                // The iPhone replies with an empty response. Skips the outbox
+                // limit, as a release does.
                 if let Some(xid) = msg.xid()
-                    && let Err(err) = shared.outbox().push(&SiriEndpointReply, xid)
+                    && let Err(err) = shared.outbox().push(&SiriEndpointReply, xid, true)
                 {
                     tracing::debug!(%err, "_siriEndpoint reply failed");
                 }

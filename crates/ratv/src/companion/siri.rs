@@ -30,7 +30,8 @@ pub struct SiriOptions {
 /// After the device stops recording, see [`ended`](Self::ended),
 /// more audio is not sent.
 /// Siri is released when this is dropped, but call [`finish`](Self::finish)
-/// to send the rest of the audio and to know that the release was sent.
+/// to send the rest of the audio and to know whether the release failed.
+/// It holds a [`Client`] clone, so dropping the other clones does not stop the connection.
 #[must_use = "Siri stays active until `finish` is called or this is dropped"]
 pub struct Siri {
     client: Client,
@@ -65,8 +66,14 @@ impl Client {
     /// (feature `opus`), then release Siri with [`Siri::finish`].
     ///
     /// Fails with [`Error::SiriDisabled`] if Siri is off in the device settings,
-    /// and with [`Error::SiriActive`] while another [`Siri`] exists.
+    /// and with [`Error::SiriActive`] while another [`Siri`] exists. On a
+    /// closed connection, this call fails with [`Error::Closed`]. Sending
+    /// fails with it too, unless the device stopped recording before.
     pub async fn start_siri(&self, options: &SiriOptions) -> Result<Siri, Error> {
+        // The last value of a closed connection would give `SiriDisabled`.
+        if !self.is_connected() {
+            return Err(Error::Closed);
+        }
         if self.siri_enabled() == Some(false) {
             return Err(Error::SiriDisabled);
         }
@@ -75,7 +82,7 @@ impl Client {
         }
         let begin = Instant::now();
         // Releases Siri and the flag if the start fails or the future is dropped.
-        let siri = Siri {
+        let mut siri = Siri {
             client: self.clone(),
             ptt_flags: options.ptt_flags,
             data: Vec::new(),
@@ -91,10 +98,16 @@ impl Client {
             events: self.events(),
             ended: false,
         };
-        self.request(&SiriStart {
-            ptt_flags: options.ptt_flags,
-        })
-        .await?;
+        let start = self
+            .request(&SiriStart {
+                ptt_flags: options.ptt_flags,
+            })
+            .await;
+        if let Err(err) = start {
+            // If the start was not sent, no release is sent either.
+            siri.held = !err.is_not_sent();
+            return Err(err);
+        }
         tracing::debug!(parent: self.span(), elapsed = ?begin.elapsed(), ptt_flags = options.ptt_flags, "Siri started");
         Ok(siri)
     }
@@ -102,21 +115,41 @@ impl Client {
 
 impl Siri {
     /// Sends one Opus packet of 20 ms, 16 kHz, mono.
-    /// Send one packet every 20 ms.
+    /// Send one packet every 20 ms. A packet over 65535 bytes gives
+    /// [`Error::InvalidArgument`]. On a closed connection, fails with
+    /// [`Error::Closed`], unless the device stopped recording before (see
+    /// [`ended`](Self::ended)).
+    /// On [`Error::QueueFull`] the packet is kept and sent with the next
+    /// call; do not send it again.
     pub async fn send(&mut self, packet: &[u8]) -> Result<(), Error> {
+        let size = packet_size(packet)?;
         if self.ended() {
             return Ok(());
         }
-        self.keep(packet)?;
+        // Without this check, this returns `Ok` until enough packets for one
+        // event are kept.
+        if !self.client.is_connected() {
+            return Err(Error::Closed);
+        }
+        self.data.extend_from_slice(packet);
+        self.sizes.push(size);
         self.send_events(false).await
     }
 
     /// Sends signed 16-bit, 16 kHz, mono PCM in chunks of any size.
-    /// Do not mix with [`send`](Self::send).
+    /// Do not mix with [`send`](Self::send). On a closed connection, fails
+    /// with [`Error::Closed`], unless the device stopped recording before.
+    /// On [`Error::QueueFull`] the audio is kept and sent with the next call;
+    /// do not push it again.
     #[cfg(feature = "opus")]
     pub async fn push_pcm(&mut self, pcm: &[i16]) -> Result<(), Error> {
         if self.ended() {
             return Ok(());
+        }
+        // Without this check, this returns `Ok` until enough packets for one
+        // event are kept.
+        if !self.client.is_connected() {
+            return Err(Error::Closed);
         }
         let mut result = Ok(());
         let encoder = self.encoder.get_or_insert_with(Box::default);
@@ -132,7 +165,10 @@ impl Siri {
 
     /// Sends the rest of the audio and releases Siri. The device then answers.
     ///
-    /// Fails with [`Error::SiriNoAudio`] if no audio was given.
+    /// Fails with [`Error::SiriNoAudio`] if no audio was sent, for example
+    /// because none was given, and with [`Error::Closed`] on a closed
+    /// connection. If the release gets [`Error::SendTimeout`], it is still
+    /// sent later.
     pub async fn finish(mut self) -> Result<(), Error> {
         #[cfg(feature = "opus")]
         if let Some(encoder) = &mut self.encoder {
@@ -147,13 +183,12 @@ impl Siri {
         }
         self.send_events(true).await?;
         self.held = false;
-        let result = self
-            .client
-            .request(&SiriStop {
-                ptt_flags: self.ptt_flags,
-            })
-            .await
-            .map(drop);
+        let stop = SiriStop {
+            ptt_flags: self.ptt_flags,
+        };
+        let result = self.client.release_request(&stop).await.map(drop);
+        // Not sent in time: the drop sends it without a timeout.
+        self.held = matches!(result, Err(Error::SendTimeout(_)));
         tracing::debug!(
             parent: self.client.span(),
             elapsed = ?self.begin.elapsed(),
@@ -182,10 +217,6 @@ impl Siri {
             }
         }
         self.ended
-    }
-
-    fn keep(&mut self, packet: &[u8]) -> Result<(), Error> {
-        keep(&mut self.data, &mut self.sizes, packet)
     }
 
     /// Sends full events, and with `all` also the last part.
@@ -220,9 +251,10 @@ impl Siri {
             // `n` is at most 5.
             #[allow(clippy::cast_possible_truncation)]
             let count = n as u32;
-            self.next = Some(at + PACKET * count);
             let data = &self.data[self.sent_bytes..self.sent_bytes + len];
             self.client.send_event(&SiriAudio { data, sizes }).await?;
+            // Only after a send, so a failed send does not delay the next one.
+            self.next = Some(at + PACKET * count);
             if self.packets == 0 {
                 tracing::debug!(parent: self.client.span(), elapsed = ?self.begin.elapsed(), "Siri first audio");
             }
@@ -234,9 +266,15 @@ impl Siri {
     }
 }
 
+/// Size of one packet, which must fit in a `u16`.
+fn packet_size(packet: &[u8]) -> Result<u16, Error> {
+    u16::try_from(packet.len()).map_err(|_| Error::InvalidArgument("packet size"))
+}
+
 /// Adds a packet to the ones that are not sent yet.
+#[cfg(feature = "opus")]
 fn keep(data: &mut Vec<u8>, sizes: &mut Vec<u16>, packet: &[u8]) -> Result<(), Error> {
-    let size = u16::try_from(packet.len()).map_err(|_| Error::InvalidArgument("packet size"))?;
+    let size = packet_size(packet)?;
     data.extend_from_slice(packet);
     sizes.push(size);
     Ok(())
@@ -246,9 +284,10 @@ impl Drop for Siri {
     fn drop(&mut self) {
         if self.held {
             tracing::debug!(parent: self.client.span(), "Siri released on drop");
-            let _ = self.client.request_no_wait(&SiriStop {
+            let stop = SiriStop {
                 ptt_flags: self.ptt_flags,
-            });
+            };
+            let _ = self.client.queue_event(&stop, true);
         }
         self.client.siri_active().store(false, Ordering::Release);
     }

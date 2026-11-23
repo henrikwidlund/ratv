@@ -23,7 +23,8 @@ pub type PlaybackState = proto::playback_state::Enum;
 
 /// Language tag of automatic subtitles.
 const AUTO_LANGUAGE: &str = "__AUTO__";
-/// Highest rate in [`NowPlaying::playback_speeds`]. Higher rates are scan speeds.
+/// Highest rate in [`NowPlaying::playback_speeds`]. Higher rates are scan speeds,
+/// and so is 2.0 if the app lists no normal speed other than 1.0.
 const MAX_PLAYBACK_SPEED: f32 = 2.0;
 
 impl LanguageOption {
@@ -52,7 +53,10 @@ pub struct Chapter {
     pub title: Option<String>,
     /// Start in seconds.
     pub start: Option<f64>,
-    /// Length in seconds. Computed from the next start if the app does not send it.
+    /// Length in seconds, never below 0. If the app does not send it, or
+    /// sends a value that is not finite or below 0, computed from the next
+    /// start, or for the last chapter from the item length when it is above
+    /// 0. `None` if that end is earlier than the start.
     pub duration: Option<f64>,
 }
 
@@ -66,7 +70,7 @@ pub struct QueueItem {
     pub title: Option<String>,
     /// Artist.
     pub artist: Option<String>,
-    /// Length in seconds.
+    /// Length in seconds. Can be below 0 if the app sends it.
     pub duration: Option<f64>,
 }
 
@@ -87,7 +91,9 @@ pub struct NowPlaying {
     pub app: Option<String>,
     /// Display name of the app.
     pub app_name: Option<String>,
-    /// Playback state. `None` when nothing is loaded.
+    /// Playback state. `None` when nothing is loaded, and for a paused player
+    /// whose item is not known yet. `Seeking` while playing
+    /// at a scan speed, see [`is_playback_speed`](Self::is_playback_speed).
     pub state: Option<PlaybackState>,
     /// Title.
     pub title: Option<String>,
@@ -163,13 +169,14 @@ pub struct NowPlaying {
     pub up_next: Vec<QueueItem>,
     /// Content id of the item.
     pub content_identifier: Option<String>,
-    /// Length in seconds.
+    /// Length in seconds. Can be below 0 if the app sends it.
     pub duration: Option<f64>,
     /// Position in seconds at `elapsed_timestamp`.
     pub elapsed: Option<f64>,
     /// MRP time of `elapsed`, see [`cocoa_time`].
     pub elapsed_timestamp: Option<f64>,
-    /// Playback rate, 1.0 is normal speed.
+    /// Playback rate, 1.0 is normal speed. 0 when paused or stopped, if a
+    /// rate is known.
     pub rate: Option<f32>,
     /// Shuffle mode.
     pub shuffle: Option<proto::shuffle_mode::Enum>,
@@ -201,16 +208,21 @@ pub struct NowPlaying {
 
 impl NowPlaying {
     /// Position in seconds at `now` (MRP time, see [`cocoa_time`]).
-    /// Devices sometimes send NaN; such values are treated as missing.
+    /// Values that are not finite are treated as missing, and so is a result
+    /// that is not finite. Never below 0 or above a duration greater than 0.
     #[must_use]
     pub fn position(&self, now: f64) -> Option<f64> {
         let elapsed = self.elapsed.filter(|e| e.is_finite())?;
         let ts = self.elapsed_timestamp.filter(|t| t.is_finite());
         let rate = self.rate.filter(|r| r.is_finite());
-        let (Some(ts), Some(rate)) = (ts, rate) else {
-            return Some(elapsed);
+        let pos = match (ts, rate) {
+            (Some(ts), Some(rate)) => elapsed + (now - ts) * f64::from(rate),
+            _ => elapsed,
         };
-        let pos = (elapsed + (now - ts) * f64::from(rate)).max(0.0);
+        if !pos.is_finite() {
+            return None;
+        }
+        let pos = pos.max(0.0);
         Some(
             self.duration
                 .filter(|d| *d > 0.0)
@@ -271,18 +283,21 @@ impl NowPlaying {
 
     /// Rates for [`Command::ChangePlaybackRate`] that play at a normal speed:
     /// above 0 and up to 2.0, with 1.0, sorted. [`supported_rates`](Self::supported_rates)
-    /// can also have scan speeds. Empty if the app supports only 1.0.
+    /// can also have scan speeds. Rates within 0.01 count as one rate. Empty
+    /// if the app lists no normal speed other than 1.0. If empty,
+    /// [`is_playback_speed`](Self::is_playback_speed) counts rates above 0 and
+    /// below 2.0 as normal speeds.
     #[must_use]
     pub fn playback_speeds(&self) -> Vec<f32> {
         let mut speeds: Vec<f32> = self
             .supported_rates
             .iter()
             .copied()
-            .filter(|r| *r > 0.0 && *r <= MAX_PLAYBACK_SPEED)
+            .filter(|&r| r > 0.0 && r <= MAX_PLAYBACK_SPEED && !same_rate(r, 1.0))
             .chain([1.0])
             .collect();
         speeds.sort_by(f32::total_cmp);
-        speeds.dedup();
+        speeds.dedup_by(|a, b| same_rate(*a, *b));
         if speeds.len() == 1 {
             speeds.clear();
         }
@@ -294,6 +309,97 @@ impl NowPlaying {
     pub fn supports(&self, command: Command) -> bool {
         self.commands.contains(&command)
     }
+
+    /// True if `rate` plays at a normal speed: 1.0, or a rate in
+    /// [`playback_speeds`](Self::playback_speeds). If the app lists no such
+    /// speeds, rates above 0 and below 2.0 count as normal speeds.
+    /// Other rates are scan speeds, for example fast forward and rewind.
+    /// Returns false for 0, which is paused. Rates are compared with 1.0 and
+    /// with listed speeds within 0.01. NaN counts as a normal speed, because
+    /// the rate is then not known.
+    #[must_use]
+    pub fn is_playback_speed(&self, rate: f32) -> bool {
+        is_playback_speed(rate, &self.supported_rates)
+    }
+}
+
+/// See [`NowPlaying::is_playback_speed`].
+fn is_playback_speed(rate: f32, supported_rates: &[f32]) -> bool {
+    if rate.is_nan() || same_rate(rate, 1.0) {
+        return true;
+    }
+    if rate <= 0.0 {
+        return false;
+    }
+    let mut speeds = supported_rates
+        .iter()
+        .copied()
+        .filter(|&r| r > 0.0 && r <= MAX_PLAYBACK_SPEED && !same_rate(r, 1.0))
+        .peekable();
+    if speeds.peek().is_none() {
+        // Scan speeds usually start at 2.0.
+        return rate > 0.0 && rate < MAX_PLAYBACK_SPEED;
+    }
+    speeds.any(|r| same_rate(r, rate))
+}
+
+/// The rate to show for `state`: 0 when paused or stopped. Some apps send a
+/// paused item with rate 1.
+const fn rate_for(state: Option<PlaybackState>, rate: Option<f32>) -> Option<f32> {
+    match state {
+        Some(PlaybackState::Paused | PlaybackState::Stopped) if rate.is_some() => Some(0.0),
+        _ => rate,
+    }
+}
+
+/// Duration, elapsed time and its timestamp. A value that is not finite is
+/// skipped, so the metadata value is used instead, or `None`. The timestamp
+/// comes from the same source as the elapsed time.
+fn times(
+    info: Option<&NowPlayingInfo>,
+    meta: Option<&ContentItemMetadata>,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let duration = finite(info.and_then(|i| i.duration)).or_else(|| finite(meta?.duration));
+    let (elapsed, ts) = finite(info.and_then(|i| i.elapsed_time)).map_or_else(
+        || {
+            (
+                finite(meta.and_then(|m| m.elapsed_time)),
+                finite(meta.and_then(|m| m.elapsed_time_timestamp)),
+            )
+        },
+        |e| (Some(e), finite(info.and_then(|i| i.timestamp))),
+    );
+    (duration, elapsed, ts)
+}
+
+/// `None` if `v` is not finite. NaN is never equal to itself, so it would
+/// count as a change on each update.
+fn finite(v: Option<f64>) -> Option<f64> {
+    v.filter(|v| v.is_finite())
+}
+
+/// Drops values that are not finite from the fields that [`times`] and
+/// [`Player::rate`] do not cover, and chapter durations that overflow when
+/// computed. Chapter starts are filtered in `copy_item`.
+fn drop_non_finite(np: &mut NowPlaying) {
+    np.release_date = finite(np.release_date);
+    np.supported_rates.retain(|r| r.is_finite());
+    np.skip_forward_interval = finite(np.skip_forward_interval);
+    np.skip_backward_interval = finite(np.skip_backward_interval);
+    np.rating_range = np
+        .rating_range
+        .filter(|(min, max)| min.is_finite() && max.is_finite());
+    for c in &mut np.chapters {
+        c.duration = finite(c.duration);
+    }
+    for q in &mut np.up_next {
+        q.duration = finite(q.duration);
+    }
+}
+
+/// True if the rates differ by less than 0.01.
+fn same_rate(a: f32, b: f32) -> bool {
+    (a - b).abs() < 0.01
 }
 
 #[derive(Debug)]
@@ -424,24 +530,27 @@ impl Player {
         }
     }
 
-    fn playback_state(&self) -> Option<PlaybackState> {
+    /// `supported_rates` as in [`NowPlaying::supported_rates`].
+    fn playback_state(&self, supported_rates: &[f32]) -> Option<PlaybackState> {
         let state = PlaybackState::try_from(self.state?).ok()?;
         match state {
             PlaybackState::Paused if self.metadata().is_none() => None,
             PlaybackState::Playing => match self.rate() {
                 Some(0.0) => Some(PlaybackState::Paused),
-                Some(r) if (r - 1.0).abs() >= 0.01 => Some(PlaybackState::Seeking),
+                Some(r) if !is_playback_speed(r, supported_rates) => Some(PlaybackState::Seeking),
                 _ => Some(state),
             },
             _ => Some(state),
         }
     }
 
+    /// A rate that is not finite is skipped, so the metadata rate is used
+    /// instead, or `None`. NaN is never equal to itself, so it would count as
+    /// a change on each update.
     fn rate(&self) -> Option<f32> {
-        self.info
-            .as_ref()
-            .and_then(|i| i.playback_rate)
-            .or_else(|| self.metadata()?.playback_rate)
+        let finite = |r: Option<f32>| r.filter(|r| r.is_finite());
+        finite(self.info.as_ref().and_then(|i| i.playback_rate))
+            .or_else(|| finite(self.metadata()?.playback_rate))
     }
 }
 
@@ -600,6 +709,22 @@ impl NowPlayingState {
             .as_deref()
     }
 
+    /// Bundle id and player id of the active player if it has a playback
+    /// state but no current item.
+    ///
+    /// A new connection gets no item for a paused player in the background.
+    /// This can also happen later, when the active player loses its item.
+    /// Request it with [`playback_queue_item`](crate::messages::playback_queue_item)
+    /// once for each player that this returns. The reply has no player path
+    /// and updates the active player.
+    #[must_use]
+    pub fn player_without_item(&self) -> Option<(&str, &str)> {
+        let client = self.active_client()?;
+        let player = client.active()?;
+        (player.state.is_some() && player.item().is_none())
+            .then_some((client.bundle_id.as_str(), player.id.as_str()))
+    }
+
     /// Snapshot of the active player.
     #[must_use]
     pub fn now_playing(&self) -> NowPlaying {
@@ -619,7 +744,6 @@ impl NowPlayingState {
         let meta = player.metadata();
         let s = |m: Option<&String>, i: Option<&String>| text(m).or_else(|| text(i));
 
-        np.state = player.playback_state();
         np.title = s(
             meta.and_then(|m| m.title.as_ref()),
             info.and_then(|i| i.title.as_ref()),
@@ -653,16 +777,7 @@ impl NowPlayingState {
                 .or_else(|| np.content_identifier.clone())
                 .or_else(|| player.item()?.identifier.clone());
         }
-        np.duration = info.and_then(|i| i.duration).or_else(|| meta?.duration);
-        (np.elapsed, np.elapsed_timestamp) = info.and_then(|i| i.elapsed_time).map_or_else(
-            || {
-                (
-                    meta.and_then(|m| m.elapsed_time),
-                    meta.and_then(|m| m.elapsed_time_timestamp),
-                )
-            },
-            |e| (Some(e), info.and_then(|i| i.timestamp)),
-        );
+        (np.duration, np.elapsed, np.elapsed_timestamp) = times(info, meta);
         np.rate = player.rate();
         np.shuffle = mode(&player.commands, Command::ChangeShuffleMode, |c| {
             c.shuffle_mode
@@ -692,6 +807,11 @@ impl NowPlayingState {
             .collect();
         np.supported_rates =
             find(Command::ChangePlaybackRate).map_or_default(|c| c.supported_rates.clone());
+        np.state = player.playback_state(&np.supported_rates);
+        // Uses the raw state, because `playback_state` is `None` for a paused
+        // player without metadata.
+        let raw_state = player.state.and_then(|s| PlaybackState::try_from(s).ok());
+        np.rate = rate_for(raw_state, np.rate);
         let interval = |cmd| find(cmd).and_then(|c| c.preferred_intervals.first().copied());
         np.skip_forward_interval = interval(Command::SkipForward);
         np.skip_backward_interval = interval(Command::SkipBackward);
@@ -699,6 +819,7 @@ impl NowPlayingState {
         np.disliked = find(Command::DislikeTrack).and_then(|c| c.active);
         np.rating_range =
             find(Command::RateTrack).and_then(|c| Some((c.minimum_rating?, c.maximum_rating?)));
+        drop_non_finite(&mut np);
         np
     }
 
@@ -796,18 +917,23 @@ fn copy_item(item: &ContentItem, np: &mut NowPlaying) {
             let m = s.metadata.as_ref();
             Chapter {
                 title: text(m.and_then(|m| m.title.as_ref())),
-                start: m.and_then(|m| m.start_time),
-                duration: m.and_then(|m| m.duration),
+                start: finite(m.and_then(|m| m.start_time)),
+                duration: finite(m.and_then(|m| m.duration)).filter(|d| *d >= 0.0),
             }
         })
         .collect();
     // Apps send only the start of each chapter.
-    let end = item.metadata.as_ref().and_then(|m| m.duration);
+    let end = finite(item.metadata.as_ref().and_then(|m| m.duration)).filter(|d| *d > 0.0);
     let starts: Vec<_> = np.chapters.iter().map(|c| c.start).collect();
     for (i, chapter) in np.chapters.iter_mut().enumerate() {
         if chapter.duration.is_none() {
             let next = starts.get(i + 1).copied().unwrap_or(end);
-            chapter.duration = chapter.start.zip(next).map(|(s, e)| e - s);
+            // Not for starts out of order.
+            chapter.duration = chapter
+                .start
+                .zip(next)
+                .map(|(s, e)| e - s)
+                .filter(|d| *d >= 0.0);
         }
     }
 }
@@ -993,6 +1119,15 @@ mod tests {
         assert_eq!(np.playback_speeds(), [] as [f32; 0]);
         np.supported_rates = vec![1.0];
         assert_eq!(np.playback_speeds(), [] as [f32; 0]);
+        // Close to 1.0 counts as 1.0, as in `is_playback_speed`.
+        np.supported_rates = vec![1.0001, 0.999];
+        assert_eq!(np.playback_speeds(), [] as [f32; 0]);
+        // Rates within 0.01 count as one speed.
+        np.supported_rates = vec![1.25, 1.255];
+        assert_eq!(np.playback_speeds(), [1.0, 1.25]);
+        // A listed speed close to 0 does not make 0 a speed.
+        np.supported_rates = vec![0.005];
+        assert!(!np.is_playback_speed(0.0));
         np.supported_rates = vec![-2.0, 2.0, 0.5, 96.0, 1.5, 0.0, 1.25];
         assert_eq!(np.playback_speeds(), [0.5, 1.0, 1.25, 1.5, 2.0]);
     }
@@ -1028,6 +1163,34 @@ mod tests {
                 ..Default::default()
             }),
         })
+    }
+
+    #[test]
+    fn chapter_duration_not_negative() {
+        let chapter = |start| {
+            let mut c = item("c", "Chapter");
+            let m = c.metadata.as_mut().unwrap();
+            m.start_time = Some(start);
+            m.duration = None;
+            c
+        };
+        let mut current = item("a", "Live");
+        // Duration 0, as for a live stream, and starts out of order.
+        current.metadata.as_mut().unwrap().duration = Some(0.0);
+        current.sections = vec![chapter(50.0), chapter(10.0)];
+        let mut np = NowPlaying::default();
+        copy_item(&current, &mut np);
+        let durations: Vec<_> = np.chapters.iter().map(|c| c.duration).collect();
+        assert_eq!(durations, [None, None]);
+        // The last chapter needs an item length above 0.
+        current.sections = vec![chapter(0.0)];
+        copy_item(&current, &mut np);
+        assert_eq!(np.chapters[0].duration, None);
+        // A sent duration below 0 is computed instead.
+        current.metadata.as_mut().unwrap().duration = Some(100.0);
+        current.sections[0].metadata.as_mut().unwrap().duration = Some(-5.0);
+        copy_item(&current, &mut np);
+        assert_eq!(np.chapters[0].duration, Some(100.0));
     }
 
     fn item(id: &str, title: &str) -> ContentItem {
@@ -1157,9 +1320,32 @@ mod tests {
         assert_eq!(nan_ts.position(5000.0), np.elapsed);
         let nan_elapsed = NowPlaying {
             elapsed: Some(f64::NAN),
-            ..np
+            ..np.clone()
         };
         assert_eq!(nan_elapsed.position(5000.0), None);
+        // Without a timestamp, the elapsed time is limited too.
+        for (elapsed, position) in [(500.0, 200.0), (-3.0, 0.0)] {
+            let fixed = NowPlaying {
+                elapsed: Some(elapsed),
+                elapsed_timestamp: None,
+                ..np.clone()
+            };
+            assert_eq!(fixed.position(5000.0), Some(position));
+        }
+        // Finite input that overflows: `None`, also with a duration.
+        let overflow = NowPlaying {
+            elapsed_timestamp: Some(-1.7e308),
+            rate: Some(2.0),
+            ..np.clone()
+        };
+        assert_eq!(overflow.position(5000.0), None);
+        // Also when it overflows below 0.
+        let backward = NowPlaying {
+            rate: Some(-2.0),
+            ..overflow
+        };
+        assert_eq!(backward.position(5000.0), None);
+        assert_eq!(np.position(f64::NAN), None);
     }
 
     #[test]
@@ -1266,6 +1452,8 @@ mod tests {
             c
         };
         current.sections = vec![chapter("c1", 0.0), chapter("c2", 50.0)];
+        // A duration that is not finite is computed from the next start.
+        current.sections[0].metadata.as_mut().unwrap().duration = Some(f64::NAN);
         msg.playback_queue.as_mut().unwrap().content_items =
             vec![current, item("b", "Next"), item("c", "Last")];
         assert!(s.apply(&env(&msg)).unwrap());
@@ -1347,10 +1535,178 @@ mod tests {
         assert_eq!(s.now_playing().state, Some(PlaybackState::Paused));
         assert_eq!(s.now_playing().position(2000.0), Some(10.0));
 
+        // Paused with rate 1: the rate is 0, so the position stays.
+        msg.playback_state = Some(PlaybackState::Paused as i32);
+        msg.now_playing_info.as_mut().unwrap().playback_rate = Some(1.0);
+        s.apply(&env(&msg)).unwrap();
+        assert_eq!(s.now_playing().state, Some(PlaybackState::Paused));
+        assert_eq!(s.now_playing().rate, Some(0.0));
+        assert_eq!(s.now_playing().position(2000.0), Some(10.0));
+        msg.playback_state = Some(PlaybackState::Playing as i32);
+
         msg.playback_state_timestamp = Some(101.0);
         msg.now_playing_info.as_mut().unwrap().playback_rate = Some(2.0);
         s.apply(&env(&msg)).unwrap();
         assert_eq!(s.now_playing().state, Some(PlaybackState::Seeking));
+
+        // Without a list of speeds, 1.5 is a normal speed.
+        msg.now_playing_info.as_mut().unwrap().playback_rate = Some(1.5);
+        s.apply(&env(&msg)).unwrap();
+        assert_eq!(s.now_playing().state, Some(PlaybackState::Playing));
+
+        // With a list, 2.0 is a normal speed too.
+        let infos = &mut msg.supported_commands.as_mut().unwrap().supported_commands;
+        infos.push(CommandInfo {
+            command: Some(Command::ChangePlaybackRate as i32),
+            supported_rates: vec![0.5, 1.0, 2.0],
+            ..Default::default()
+        });
+        msg.now_playing_info.as_mut().unwrap().playback_rate = Some(2.0);
+        s.apply(&env(&msg)).unwrap();
+        assert_eq!(s.now_playing().state, Some(PlaybackState::Playing));
+
+        // A rate or position that is not finite is not known.
+        let info = msg.now_playing_info.as_mut().unwrap();
+        info.playback_rate = Some(f32::NAN);
+        info.elapsed_time = Some(f64::NAN);
+        info.timestamp = Some(f64::INFINITY);
+        s.apply(&env(&msg)).unwrap();
+        assert_eq!(s.now_playing().rate, None);
+        assert_eq!(s.now_playing().elapsed, None);
+        assert_eq!(s.now_playing().elapsed_timestamp, None);
+        assert_eq!(s.now_playing().state, Some(PlaybackState::Playing));
+        // A metadata value is used instead, if there is one.
+        let item = &mut msg.playback_queue.as_mut().unwrap().content_items[0];
+        let meta = item.metadata.as_mut().unwrap();
+        meta.playback_rate = Some(1.0);
+        meta.elapsed_time = Some(5.0);
+        meta.elapsed_time_timestamp = Some(1000.0);
+        s.apply(&env(&msg)).unwrap();
+        assert_eq!(s.now_playing().rate, Some(1.0));
+        assert_eq!(s.now_playing().elapsed, Some(5.0));
+        assert_eq!(s.now_playing().elapsed_timestamp, Some(1000.0));
+    }
+
+    #[test]
+    fn non_finite_values_dropped() {
+        let info = NowPlayingInfo {
+            duration: Some(f64::NAN),
+            elapsed_time: Some(f64::NAN),
+            timestamp: Some(1.0),
+            ..Default::default()
+        };
+        let meta = ContentItemMetadata {
+            duration: Some(200.0),
+            elapsed_time: Some(10.0),
+            elapsed_time_timestamp: Some(f64::INFINITY),
+            ..Default::default()
+        };
+        // With NaN in the info, the metadata value is used.
+        assert_eq!(
+            times(Some(&info), Some(&meta)),
+            (Some(200.0), Some(10.0), None)
+        );
+        assert_eq!(times(Some(&info), None), (None, None, None));
+
+        let mut np = NowPlaying {
+            release_date: Some(f64::NAN),
+            supported_rates: vec![f32::NAN, 1.5],
+            skip_forward_interval: Some(f64::INFINITY),
+            skip_backward_interval: Some(10.0),
+            rating_range: Some((0.0, f32::NAN)),
+            // A computed duration that overflowed.
+            chapters: vec![Chapter {
+                start: Some(5.0),
+                duration: Some(f64::INFINITY),
+                ..Default::default()
+            }],
+            up_next: vec![QueueItem {
+                duration: Some(f64::NAN),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        drop_non_finite(&mut np);
+        assert_eq!(np.release_date, None);
+        assert_eq!(np.supported_rates, [1.5]);
+        assert_eq!(np.skip_forward_interval, None);
+        assert_eq!(np.skip_backward_interval, Some(10.0));
+        assert_eq!(np.rating_range, None);
+        assert_eq!(
+            (np.chapters[0].start, np.chapters[0].duration),
+            (Some(5.0), None)
+        );
+        assert_eq!(np.up_next[0].duration, None);
+        // Equal to itself, so a new message with the same data is no change.
+        assert_eq!(np, np.clone());
+    }
+
+    #[test]
+    fn playback_speed() {
+        let fallback: &[f32] = &[];
+        for (rate, normal) in [
+            (1.0, true),
+            (1.005, true),
+            (0.5, true),
+            (1.5, true),
+            (1.995, true),
+            (2.0, false),
+            (8.0, false),
+            (-2.0, false),
+            (-1.0, false),
+            (f32::NAN, true),
+        ] {
+            assert_eq!(is_playback_speed(rate, fallback), normal, "{rate}");
+        }
+        // Only 1.0 and scan speeds listed: as without a list.
+        assert!(is_playback_speed(1.5, &[1.0, 8.0, -2.0]));
+        let listed = &[0.5, 1.0, 1.25, 2.0, 8.0];
+        for (rate, normal) in [
+            (1.0, true),
+            (0.5, true),
+            (1.25, true),
+            (2.0, true),
+            (1.5, false),
+            (8.0, false),
+            (-2.0, false),
+        ] {
+            assert_eq!(is_playback_speed(rate, listed), normal, "{rate}");
+        }
+        let np = NowPlaying {
+            supported_rates: listed.to_vec(),
+            ..NowPlaying::default()
+        };
+        assert!(np.is_playback_speed(2.0));
+        assert!(!np.is_playback_speed(1.5));
+    }
+
+    #[test]
+    fn player_without_item() {
+        let mut s = NowPlayingState::new();
+        assert_eq!(s.player_without_item(), None);
+        set_client(&mut s, "app");
+        // No player yet.
+        assert_eq!(s.player_without_item(), None);
+        let paused = SetStateMessage {
+            player_path: path("app", None),
+            playback_state: Some(PlaybackState::Paused as i32),
+            ..Default::default()
+        };
+        s.apply(&env(&paused)).unwrap();
+        assert_eq!(s.player_without_item(), Some(("app", DEFAULT_PLAYER)));
+        assert_eq!(s.now_playing().state, None);
+
+        // The reply to `playback_queue_item` has no player path.
+        let reply = SetStateMessage {
+            playback_queue: playing().playback_queue,
+            ..Default::default()
+        };
+        s.apply(&env(&reply)).unwrap();
+        assert_eq!(s.player_without_item(), None);
+        let np = s.now_playing();
+        assert_eq!(np.state, Some(PlaybackState::Paused));
+        assert_eq!(np.title.as_deref(), Some("Song"));
+        assert_eq!(s.item_id(), Some("a"));
     }
 
     #[test]
@@ -1375,10 +1731,18 @@ mod tests {
         let msg = SetStateMessage {
             player_path: path("app", None),
             playback_state: Some(PlaybackState::Paused as i32),
+            now_playing_info: Some(NowPlayingInfo {
+                playback_rate: Some(1.0),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         s.apply(&env(&msg)).unwrap();
         assert_eq!(s.now_playing().state, None);
+        // Paused, so the rate is 0 also without a state.
+        assert_eq!(s.now_playing().rate, Some(0.0));
+        assert_eq!(rate_for(Some(PlaybackState::Stopped), Some(1.0)), Some(0.0));
+        assert_eq!(rate_for(Some(PlaybackState::Playing), Some(1.5)), Some(1.5));
     }
 
     #[test]

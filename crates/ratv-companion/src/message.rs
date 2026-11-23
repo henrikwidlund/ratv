@@ -312,7 +312,8 @@ pub enum MediaControl {
     PreviousTrack,
     /// Response has the volume in `_vol`, see [`volume_response`].
     GetVolume,
-    /// Volume from 0.0 to 1.0.
+    /// Volume from 0.0 to 1.0. Sent as is: not limited, and NaN and -0.0 are
+    /// not changed.
     SetVolume(f64),
     /// Skip by seconds; negative skips backwards.
     SkipBy(f64),
@@ -360,10 +361,13 @@ impl Outgoing for MediaControl {
     }
 }
 
-/// Reads the volume (0.0 to 1.0) from a [`MediaControl::GetVolume`] response.
+/// Reads the volume from a [`MediaControl::GetVolume`] response. The device
+/// sends 0.0 to 1.0; the value is not limited here. A value that is not
+/// finite is an error.
 pub fn volume_response(msg: &Message<'_>) -> Result<f64, Error> {
     msg.field("_vol")
         .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
         .ok_or(Error::InvalidField("_vol"))
 }
 
@@ -1125,6 +1129,30 @@ mod tests {
             }
         );
         assert_eq!(apps_response(&roundtrip(&TouchStop)).unwrap(), []);
+    }
+
+    #[test]
+    fn volume_must_be_finite() {
+        let reply = |v: f64| {
+            let mut out = Vec::new();
+            Encoder::new(&mut out).dict(3, |e| {
+                e.str("_i").str("_mcc");
+                e.str("_t").int(3);
+                e.str("_c").dict(1, |e| {
+                    e.str("_vol").float(v);
+                });
+            });
+            out
+        };
+        let ok = reply(0.5);
+        assert_eq!(
+            volume_response(&Message::decode(&ok).unwrap()).unwrap(),
+            0.5
+        );
+        for v in [f64::NAN, f64::INFINITY] {
+            let bad = reply(v);
+            assert!(volume_response(&Message::decode(&bad).unwrap()).is_err());
+        }
     }
 
     #[test]

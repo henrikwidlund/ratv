@@ -7,6 +7,8 @@
 //! cargo run --example voice_probe -- <credentials file> <ip> voice.caf
 //! ```
 //!
+//! A link-local IPv6 address needs the interface index, for example `fe80::1%4`.
+//!
 //! A `.caf` file must hold 16 kHz mono Opus with 20 ms packets, as `afconvert` writes it.
 //! A `.wav` file must hold 16-bit, 16 kHz, mono PCM.
 //! Options, comma separated: `nosiri` (do not hold Siri), `mrpsiri` (hold Siri with an
@@ -17,13 +19,15 @@
 mod caf;
 #[path = "common/credentials.rs"]
 mod credentials;
+#[path = "common/host.rs"]
+mod host;
 #[path = "common/wav.rs"]
 mod wav;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use ratv::discovery::{MDNS_PORT, ScanOptions, scan};
+use ratv::discovery::{ScanOptions, scan};
 use ratv::{AppleTv, ClientOptions, Endpoints, Key};
 use ratv_codec::bplist::Value;
 use ratv_mrp::Envelope;
@@ -130,10 +134,17 @@ fn print(env: &Envelope) {
     }
 }
 
-async fn connect(credentials: &str, ip: IpAddr) -> Result<AppleTv, Box<dyn std::error::Error>> {
+async fn connect(
+    credentials: &str,
+    addr: SocketAddr,
+) -> Result<AppleTv, Box<dyn std::error::Error>> {
     let credentials = credentials::load(credentials)?;
     let mut options = ScanOptions::default();
-    options.targets = vec![SocketAddr::new(ip, MDNS_PORT)];
+    // An IPv6 target needs an IPv6 socket.
+    if addr.is_ipv6() {
+        options.bind = (std::net::Ipv6Addr::UNSPECIFIED, 0).into();
+    }
+    options.targets = vec![addr];
     let devices = scan(&options).await?;
     let device = devices.first().ok_or("device not found")?;
     let tv = AppleTv::connect(
@@ -212,7 +223,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bytes: usize = packets.iter().map(|p| p.len()).sum();
     println!("{} blocks of 20 ms, {bytes} bytes", packets.len());
 
-    let tv = connect(credentials, ip.parse()?).await?;
+    let addr =
+        host::mdns_addr(ip).ok_or_else(|| format!("not an IP or IPv6%interface-index: {ip}"))?;
+    let tv = connect(credentials, addr).await?;
     let mrp = tv.mrp().ok_or("MRP is not connected")?;
     let mut messages = mrp.messages();
     let printer = tokio::spawn(async move {

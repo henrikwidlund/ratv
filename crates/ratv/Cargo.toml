@@ -13,7 +13,7 @@ categories = ["network-programming", "api-bindings"]
 [features]
 default = ["companion", "discovery", "mrp"]
 companion = ["dep:bytes", "dep:getrandom", "dep:rand_core", "dep:ratv-companion", "dep:socket2"]
-discovery = ["dep:ratv-discovery"]
+discovery = ["dep:ratv-discovery", "dep:socket2"]
 mrp = [
     "dep:bytes",
     "dep:getrandom",
@@ -38,7 +38,7 @@ ratv-airplay = { workspace = true, optional = true }
 ratv-mrp = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 thiserror.workspace = true
-tokio = { version = "1", default-features = false, features = ["net", "io-util", "sync", "time", "rt", "macros"] }
+tokio = { version = "1.44", default-features = false, features = ["net", "io-util", "sync", "time", "rt", "macros"] }
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
 rand_core = { workspace = true, optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std"] }

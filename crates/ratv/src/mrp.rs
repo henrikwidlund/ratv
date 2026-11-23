@@ -51,16 +51,17 @@ use ratv_hap::pair_setup::{self, ClientIdentity, NeedPin};
 use tokio::net::TcpStream;
 
 use crate::airplay::{self, Connections, Identity, READ_CHUNK};
-use crate::link::{CloseGuard, Link, LinkTx};
+use crate::link::{Batches, CloseGuard, Link, LinkTx, Queued};
 pub use crate::{ClientOptions, PairOptions};
 use crate::{Credentials, Error, log, rng, tcp};
 
-/// Encoded messages that are not sent yet.
+/// Encoded messages that are not sent yet. Checked before each push, so the
+/// outbox can be larger than this by one message. Button and Siri releases skip it.
 const MAX_OUTBOX: usize = 1 << 20;
 const MESSAGE_CAPACITY: usize = 64;
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
-/// The device answers each feedback request. Without an answer for this long,
-/// the connection is dead.
+/// The device answers each feedback request. When the first request sent
+/// after the last control data is this old, the connection is dead.
 const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Voice packets kept until the device records: 30 s.
 const MAX_PENDING: usize = 1500;
@@ -68,7 +69,8 @@ const MAX_PENDING: usize = 1500;
 ///
 /// Audio is kept until the device starts recording, then sent.
 /// Siri is released when this is dropped, but call [`finish`](Self::finish)
-/// to send the rest of the audio and to know that the release was sent.
+/// to send the rest of the audio and to know whether the release failed.
+/// It holds a [`Client`] clone, so dropping the other clones does not stop the connection.
 #[must_use = "Siri stays active until `finish` is called or this is dropped"]
 pub struct Siri {
     client: Client,
@@ -96,16 +98,31 @@ pub struct Siri {
 
 impl Siri {
     /// Sends one Opus packet of 20 ms, 16 kHz, mono.
-    /// Send one packet every 20 ms.
+    /// Send one packet every 20 ms. A packet over 65535 bytes gives
+    /// [`Error::InvalidArgument`], as over Companion. On a closed
+    /// connection, fails with [`Error::Closed`]. After 30 s of audio kept
+    /// while the device does not record, fails with
+    /// [`Error::SiriNotRecording`].
+    /// On [`Error::QueueFull`] the packet is kept and sent with the next
+    /// call; do not send it again.
     pub async fn send(&mut self, packet: impl Into<Bytes>) -> Result<(), Error> {
-        self.pending.push_back(packet.into());
+        let packet = packet.into();
+        if packet.len() > usize::from(u16::MAX) {
+            return Err(Error::InvalidArgument("packet size"));
+        }
+        self.check_open()?;
+        self.pending.push_back(packet);
         self.send_pending().await
     }
 
     /// Sends signed 16-bit, 16 kHz, mono PCM in chunks of any size.
-    /// Do not mix with [`send`](Self::send).
+    /// Do not mix with [`send`](Self::send). Fails with [`Error::Closed`] and
+    /// [`Error::SiriNotRecording`] as [`send`](Self::send) does.
+    /// On [`Error::QueueFull`] the audio is kept and sent with the next call;
+    /// do not push it again.
     #[cfg(feature = "opus")]
     pub async fn push_pcm(&mut self, pcm: &[i16]) -> Result<(), Error> {
+        self.check_open()?;
         let pending = &mut self.pending;
         self.encoder
             .get_or_insert_with(Box::default)
@@ -116,7 +133,10 @@ impl Siri {
     /// Sends the rest of the audio and releases Siri. The device then answers.
     ///
     /// Waits for the device to record if it has not started yet.
-    /// Fails with [`Error::SiriNoAudio`] if no audio was given.
+    /// Fails with [`Error::SiriNoAudio`] if no audio was sent, for example
+    /// because none was given, with [`Error::SiriNotRecording`] if the device
+    /// does not record within the timeout, and with [`Error::Closed`] on a
+    /// closed connection.
     pub async fn finish(mut self) -> Result<(), Error> {
         #[cfg(feature = "opus")]
         if let Some(encoder) = &mut self.encoder {
@@ -124,7 +144,7 @@ impl Siri {
             encoder.flush(|p| pending.push_back(Bytes::copy_from_slice(p)))?;
         }
         if self.pending.is_empty() && self.sample == 0 {
-            let result = self.client.button(Button::Siri, false).await;
+            let result = self.client.release(Button::Siri).await;
             self.held = false;
             tracing::debug!(parent: &self.client.inner.span, elapsed = ?self.begin.elapsed(), "Siri released without audio");
             return result.and(Err(Error::SiriNoAudio));
@@ -135,7 +155,8 @@ impl Siri {
             match tokio::time::timeout(client.inner.timeout, wait).await {
                 // `send_pending` sees the change.
                 Ok(Ok(_)) => {}
-                Ok(Err(_)) => return Err(Error::Disconnected),
+                // The rest of the audio and the release were not sent.
+                Ok(Err(_)) => return Err(Error::Closed),
                 Err(_) => {
                     tracing::debug!(parent: &client.inner.span, elapsed = ?self.begin.elapsed(), "Siri did not start recording");
                     return Err(Error::SiriNotRecording);
@@ -143,7 +164,7 @@ impl Siri {
             }
         }
         self.send_pending().await?;
-        let result = self.client.button(Button::Siri, false).await;
+        let result = self.client.release(Button::Siri).await;
         self.held = false;
         tracing::debug!(
             parent: &self.client.inner.span,
@@ -165,6 +186,15 @@ impl Siri {
             tracing::debug!(parent: &self.client.inner.span, elapsed = ?self.begin.elapsed(), kept = self.pending.len(), "Siri recording");
         }
         self.started
+    }
+
+    /// Fails with `Closed` on a closed connection. Nothing is kept then.
+    fn check_open(&mut self) -> Result<(), Error> {
+        if self.client.is_connected() {
+            return Ok(());
+        }
+        self.pending.clear();
+        Err(Error::Closed)
     }
 
     /// Sends the kept packets if the device records.
@@ -199,7 +229,9 @@ impl Drop for Siri {
     fn drop(&mut self) {
         if self.held {
             tracing::debug!(parent: &self.client.inner.span, "Siri released on drop");
-            let _ = self.client.queue(&Button::Siri.event(false), None, None);
+            let _ = self
+                .client
+                .queue(&Button::Siri.event(false), None, None, true);
         }
         let shared = &self.client.inner.shared;
         // Cleared first, so the next Siri never logs the time of this one.
@@ -288,11 +320,11 @@ async fn pair_inner(
     span: Span,
 ) -> Result<PinPrompt, Error> {
     let stream = tcp::connect(addr, options.timeout).await?;
-    let local = stream.local_addr()?.ip().to_string();
+    let local = stream.local_addr()?.ip();
     let mut link = PairLink {
         stream,
         channel: Channel::new(),
-        session: Session::new(&local, rng::u32(), rng::u64(), rng::u32()),
+        session: Session::new(local, rng::u32(), rng::u64(), rng::u32()),
         timeout: options.timeout,
     };
     let name = Some(options.name.as_str());
@@ -376,7 +408,9 @@ impl PairLink {
 ///
 /// A background task owns the three AirPlay connections. Clones share the
 /// session. Dropping the last clone stops it; [`Client::close`] also ends the
-/// session on the device.
+/// session on the device. The task also stops when the device disconnects or
+/// does not answer feedback requests. A [`Siri`] holds a clone, so
+/// dropping the other clones does not stop the connection.
 #[derive(Debug, Clone)]
 pub struct Client {
     inner: Arc<Inner>,
@@ -386,7 +420,8 @@ pub struct Client {
 struct Inner {
     shared: Arc<Shared>,
     link: Link,
-    messages: broadcast::Sender<Envelope>,
+    /// Owned by the task, so receivers close when it ends.
+    messages: broadcast::WeakSender<Envelope>,
     now_playing: watch::Receiver<NowPlaying>,
     volume: watch::Receiver<Volume>,
     /// Number of times the device started recording voice input.
@@ -423,10 +458,23 @@ struct Shared {
 struct Outbox {
     /// Encoded messages to send.
     buf: BytesMut,
+    /// Counts how often the task took the buffer, and tracks removed messages.
+    batches: Batches,
     /// Requests that wait for a response, by identifier.
     pending: Vec<(u32, oneshot::Sender<Envelope>)>,
     /// Set by `close`.
     close: Option<oneshot::Sender<()>>,
+}
+
+impl Outbox {
+    /// Removes a message if the task has not taken it. True if removed.
+    fn remove(&mut self, queued: Queued) -> bool {
+        let len = self.batches.remove(queued, &mut self.buf);
+        if let Some(len) = len {
+            self.buf.truncate(len);
+        }
+        len.is_some()
+    }
 }
 
 impl Shared {
@@ -568,7 +616,7 @@ impl Client {
         let inner = Inner {
             shared,
             link,
-            messages,
+            messages: messages.downgrade(),
             now_playing,
             volume,
             recording,
@@ -591,13 +639,15 @@ impl Client {
         &self.inner.device
     }
 
-    /// What the device plays. Updated by the background task.
+    /// What the device plays. Updated by the background task. After the
+    /// connection closes, the receiver keeps the last value and closes.
     #[must_use]
     pub fn now_playing(&self) -> watch::Receiver<NowPlaying> {
         self.inner.now_playing.clone()
     }
 
-    /// Volume and mute state. Updated by the background task.
+    /// Volume and mute state. Updated by the background task. After the
+    /// connection closes, the receiver keeps the last value and closes.
     #[must_use]
     pub fn volume(&self) -> watch::Receiver<Volume> {
         self.inner.volume.clone()
@@ -608,9 +658,10 @@ impl Client {
     /// A receiver that reads too slowly misses old messages and gets
     /// `RecvError::Lagged`. For state, use [`now_playing`](Self::now_playing)
     /// and [`volume`](Self::volume): they always have the latest value.
+    /// The receiver closes when the connection closes.
     #[must_use]
     pub fn messages(&self) -> broadcast::Receiver<Envelope> {
-        self.inner.messages.subscribe()
+        crate::subscribe(&self.inner.messages)
     }
 
     /// True until the connection closes.
@@ -620,19 +671,25 @@ impl Client {
     }
 
     /// Waits until the connection closes. Returns the error that closed it,
-    /// or `None` after [`close`](Self::close).
+    /// or `None` after [`close`](Self::close). After `close`, a write error
+    /// or [`Error::NoAnswer`] can still be returned when the device did not
+    /// read, or [`Error::Disconnected`] when the device closed the
+    /// connection first. Returns at once when the connection is already
+    /// closed.
     pub async fn closed(&self) -> Option<Arc<Error>> {
         self.inner.link.closed().await
     }
 
     /// Encodes `msg` into the outbox and wakes the background task.
-    /// Registers `reply` for the response to `id`.
+    /// Registers `reply` for the response to `id`. A `release` skips the
+    /// outbox size limit.
     fn queue<P: Payload>(
         &self,
         msg: &P,
         id: Option<u32>,
         reply: Option<oneshot::Sender<Envelope>>,
-    ) -> Result<(), Error> {
+        release: bool,
+    ) -> Result<Queued, Error> {
         let mut buf = [0; 10];
         let id_text = id.map(|n| id_str(n, &mut buf));
         // Voice packets are logged by `Siri`.
@@ -641,13 +698,14 @@ impl Client {
         {
             tracing::debug!(parent: &self.inner.span, kind = P::TYPE, name = type_name(P::TYPE), ?elapsed, fields = %PayloadFields(msg), "sent during Siri");
         }
-        {
+        let queued = {
             let mut out = self.inner.shared.outbox();
             // Checked while locked: the task clears `pending` after the link closes.
             if !self.inner.link.is_open() {
-                return Err(Error::Disconnected);
+                return Err(Error::Closed);
             }
-            if out.buf.len() > MAX_OUTBOX {
+            let start = out.buf.len();
+            if !release && start > MAX_OUTBOX {
                 return Err(Error::QueueFull);
             }
             encode(msg, id_text, &mut out.buf);
@@ -655,26 +713,50 @@ impl Client {
                 out.pending.retain(|(_, tx)| !tx.is_closed());
                 out.pending.push((id, reply));
             }
-        }
+            out.batches.queued(start, out.buf.len())
+        };
         self.inner.shared.wake.notify_one();
-        Ok(())
+        Ok(queued)
     }
 
     /// Sends a message and waits for the response with the same identifier.
     /// Device errors are returned as `Err`.
+    ///
+    /// Fails with [`Error::Closed`] if the connection was closed before the
+    /// request was sent, with [`Error::QueueFull`] if the outbox is full, and
+    /// with [`Error::SendTimeout`] if the request was still in the outbox
+    /// after the time limit.
+    /// All three mean that it was not sent, see [`Error::is_not_sent`].
+    /// Fails with [`Error::NoAnswer`] if the request left the outbox but got
+    /// no answer in time; it may still be in the write, or it may have been
+    /// sent. Fails with [`Error::Disconnected`] if the connection closed after
+    /// the request left the outbox; then it may have been sent.
     pub async fn request<P: Payload>(&self, msg: &P) -> Result<Envelope, Error> {
         let n = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         tracing::trace!(parent: &self.inner.span, kind = P::TYPE, id = n, "request");
         let start = std::time::Instant::now();
         let (tx, rx) = oneshot::channel();
-        self.queue(msg, Some(n), Some(tx))?;
+        let queued = self.queue(msg, Some(n), Some(tx), false)?;
         let Ok(env) = tokio::time::timeout(self.inner.timeout, rx).await else {
-            tracing::debug!(parent: &self.inner.span, kind = P::TYPE, id = n, "request timed out");
+            let removed = self.inner.shared.outbox().remove(queued);
+            tracing::debug!(parent: &self.inner.span, kind = P::TYPE, id = n, removed, "request timed out");
             let name = proto::protocol_message::Type::try_from(P::TYPE)
                 .map_or("MRP request", |t| t.as_str_name());
-            return Err(Error::NoAnswer(name));
+            return Err(if removed {
+                Error::SendTimeout(name)
+            } else {
+                Error::NoAnswer(name)
+            });
         };
-        let env = env.map_err(|_| Error::Disconnected)?;
+        let Ok(env) = env else {
+            // The connection closed. A message that is still queued was not sent.
+            let removed = self.inner.shared.outbox().remove(queued);
+            return Err(if removed {
+                Error::Closed
+            } else {
+                Error::Disconnected
+            });
+        };
         let elapsed = start.elapsed();
         if let Some(err) = env.error() {
             tracing::debug!(parent: &self.inner.span, kind = P::TYPE, id = n, ?elapsed, %err, "request failed");
@@ -684,12 +766,24 @@ impl Client {
         Ok(env)
     }
 
-    /// Sends a message without waiting for a response.
+    /// Sends a message without waiting for a response. `Ok` only means that
+    /// the message was queued. Fails with [`Error::Closed`] or
+    /// [`Error::QueueFull`]; then it was not sent.
     // Async, so waiting for queue space can be added without an API change.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn send<P: Payload>(&self, msg: &P) -> Result<(), Error> {
         tracing::trace!(parent: &self.inner.span, kind = P::TYPE, "send");
-        self.queue(msg, None, None)
+        self.queue(msg, None, None, false).map(drop)
+    }
+
+    /// Sends a button up event. Skips the outbox size limit, so a held
+    /// button is released also when the outbox is full.
+    // Async like `send`.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    async fn release(&self, button: Button) -> Result<(), Error> {
+        let msg = button.event(false);
+        tracing::trace!(parent: &self.inner.span, kind = proto::SendButtonEventMessage::TYPE, "release");
+        self.queue(&msg, None, None, true).map(drop)
     }
 
     /// Holds Siri. Send the audio with [`Siri::send`] or `Siri::push_pcm`
@@ -698,11 +792,16 @@ impl Client {
     /// Returns right after the press. Audio is kept until the device records,
     /// because audio sent before is lost. Sending fails with
     /// [`Error::SiriNotRecording`] after 30 s of kept audio, and
-    /// [`Siri::finish`] fails with it after the timeout.
+    /// [`Siri::finish`] fails with it after the timeout. On a closed
+    /// connection, this call and sending fail with [`Error::Closed`].
     /// The device does not record when Siri is off in its settings.
     /// Registers a voice input device on first use.
     /// Fails with [`Error::SiriActive`] while another [`Siri`] exists.
     pub async fn start_siri(&self) -> Result<Siri, Error> {
+        // A `Siri` kept over a close would give `SiriActive`.
+        if !self.is_connected() {
+            return Err(Error::Closed);
+        }
         if self.inner.shared.siri_active.swap(true, Ordering::AcqRel) {
             return Err(Error::SiriActive);
         }
@@ -760,20 +859,29 @@ impl Client {
     }
 
     /// Sends a button down or up event.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn button(&self, button: Button, down: bool) -> Result<(), Error> {
         self.send(&button.event(down)).await
     }
 
     /// Presses and releases a button.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn press(&self, button: Button) -> Result<(), Error> {
-        self.button(button, true).await?;
-        self.button(button, false).await
+        // Releases the button if the future is dropped. `send` does not wait
+        // today, but may wait in a later version.
+        let mut held = Held {
+            client: self,
+            button,
+            armed: true,
+        };
+        held.down().await?;
+        held.release().await
     }
 
     /// Presses and releases a button two times fast.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
+    /// When it fails, the first click can still be sent, also with an error
+    /// where [`Error::is_not_sent`] is true.
     pub async fn double_tap(&self, button: Button) -> Result<(), Error> {
         self.press(button).await?;
         self.press(button).await
@@ -781,17 +889,16 @@ impl Client {
 
     /// Holds a button for `duration`. The button is released also if the
     /// returned future is dropped.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn hold(&self, button: Button, duration: Duration) -> Result<(), Error> {
         let mut held = Held {
             client: self,
             button,
             armed: true,
         };
-        self.button(button, true).await?;
+        held.down().await?;
         tokio::time::sleep(duration).await;
-        held.armed = false;
-        self.button(button, false).await
+        held.release().await
     }
 
     /// Sends a playback command, for example [`Command::Play`].
@@ -799,16 +906,21 @@ impl Client {
         self.run_command(&messages::command(command)).await
     }
 
-    /// Seeks to `position` seconds.
+    /// Seeks to `position` seconds. A position that is not finite gives
+    /// [`Error::InvalidArgument`].
     pub async fn seek(&self, position: f64) -> Result<(), Error> {
+        let position = crate::finite(position, "position")?;
         self.run_command(&messages::seek(position)).await
     }
 
-    /// Skips `seconds` forward, or backward if negative.
+    /// Skips `seconds` forward, or backward if negative. A value that is not
+    /// finite as `f32` gives [`Error::InvalidArgument`].
     pub async fn skip(&self, seconds: f64) -> Result<(), Error> {
         // The protocol field is a float.
         #[allow(clippy::cast_possible_truncation)]
-        self.run_command(&messages::skip(seconds as f32)).await
+        let seconds = seconds as f32;
+        crate::finite(f64::from(seconds), "seconds")?;
+        self.run_command(&messages::skip(seconds)).await
     }
 
     /// Sets the shuffle mode.
@@ -854,8 +966,10 @@ impl Client {
     }
 
     /// Sets the volume of the device, 0.0 to 1.0. Fails with
-    /// [`Error::VolumeNotAvailable`] if [`Volume::available`] is false.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// [`Error::VolumeNotAvailable`] if [`Volume::available`] is false. NaN
+    /// gives [`Error::InvalidArgument`]; other values are limited to 0.0 to
+    /// 1.0. On a closed connection, fails with [`Error::Closed`].
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
         let volume = crate::volume_level(volume)?;
         self.check_volume()?;
@@ -865,6 +979,10 @@ impl Client {
 
     /// Fails if the device cannot change the volume, see [`Volume::available`].
     fn check_volume(&self) -> Result<(), Error> {
+        // The last value of a closed connection would give `VolumeNotAvailable`.
+        if !self.is_connected() {
+            return Err(Error::Closed);
+        }
         if self.inner.volume.borrow().available == Some(false) {
             return Err(Error::VolumeNotAvailable);
         }
@@ -872,8 +990,9 @@ impl Client {
     }
 
     /// Mutes or unmutes the device. Fails with [`Error::VolumeNotAvailable`]
-    /// if [`Volume::available`] is false.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// if [`Volume::available`] is false, and with [`Error::Closed`] on a
+    /// closed connection.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn set_muted(&self, muted: bool) -> Result<(), Error> {
         self.check_volume()?;
         self.send(&messages::set_volume_muted(muted, self.output_uid()?))
@@ -883,12 +1002,16 @@ impl Client {
     /// Sets the playback rate, 1.0 is normal speed.
     /// Rates the app accepts are in [`NowPlaying::supported_rates`], normal speeds in
     /// [`NowPlaying::playback_speeds`].
+    /// A rate that is not finite gives [`Error::InvalidArgument`].
     pub async fn set_playback_rate(&self, rate: f32) -> Result<(), Error> {
+        crate::finite(f64::from(rate), "rate")?;
         self.run_command(&messages::playback_rate(rate)).await
     }
 
     /// Rates the current item. The range is in [`NowPlaying::rating_range`].
+    /// A rating that is not finite gives [`Error::InvalidArgument`].
     pub async fn set_rating(&self, rating: f32) -> Result<(), Error> {
+        crate::finite(f64::from(rating), "rating")?;
         self.run_command(&messages::rate_track(rating)).await
     }
 
@@ -933,7 +1056,8 @@ impl Client {
     }
 
     /// Sets the volume, 0.0 to 1.0, of one output device. UIDs are in [`Volume::outputs`].
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// NaN gives [`Error::InvalidArgument`]; other values are limited to 0.0 to 1.0.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn set_output_volume(&self, uid: &str, volume: f32) -> Result<(), Error> {
         let volume = crate::volume_level(volume)?;
         self.send(&messages::set_volume(volume, uid)).await
@@ -941,19 +1065,19 @@ impl Client {
 
     /// Adds AirPlay output devices, for example `HomePods`, to the group.
     /// The new list arrives in [`Volume::outputs`].
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn add_outputs(&self, uids: &[&str]) -> Result<(), Error> {
         self.send(&messages::add_output_devices(uids)).await
     }
 
     /// Removes AirPlay output devices from the group.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn remove_outputs(&self, uids: &[&str]) -> Result<(), Error> {
         self.send(&messages::remove_output_devices(uids)).await
     }
 
     /// Replaces the output devices of the group.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn set_outputs(&self, uids: &[&str]) -> Result<(), Error> {
         self.send(&messages::set_output_devices(uids)).await
     }
@@ -965,7 +1089,12 @@ impl Client {
             .ok_or(Error::Protocol("device has no output device UID"))
     }
 
-    /// Ends the session and closes the connections of all clones.
+    /// Ends the session and closes the connections of all clones. Returns
+    /// `Ok` at once when the connection is already closed.
+    ///
+    /// When the device does not read, this can take about one or two 10 s
+    /// write limits plus 1 s for TEARDOWN. Calls on other clones while this
+    /// runs can return `Ok` but not be sent.
     pub async fn close(&self) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
         {
@@ -990,10 +1119,30 @@ struct Held<'a> {
     armed: bool,
 }
 
+impl Held<'_> {
+    /// Sends the press. If it was not sent, no release is sent either.
+    async fn down(&mut self) -> Result<(), Error> {
+        let result = self.client.button(self.button, true).await;
+        if result.as_ref().is_err_and(Error::is_not_sent) {
+            self.armed = false;
+        }
+        result
+    }
+
+    /// Sends the release and disarms the guard.
+    async fn release(&mut self) -> Result<(), Error> {
+        let result = self.client.release(self.button).await;
+        self.armed = false;
+        result
+    }
+}
+
 impl Drop for Held<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.client.queue(&self.button.event(false), None, None);
+            let _ = self
+                .client
+                .queue(&self.button.event(false), None, None, true);
         }
     }
 }
@@ -1049,6 +1198,8 @@ struct State {
     recording_tx: watch::Sender<u32>,
     /// Item that details were requested for.
     item_id: Option<String>,
+    /// Bundle id and player id that the current item was requested for.
+    item_requested: Option<(String, String)>,
     /// Now playing changed since the last `publish`.
     now_playing_changed: bool,
     /// Volume changed since the last `publish`.
@@ -1068,6 +1219,7 @@ impl State {
             volume_tx,
             recording_tx,
             item_id: None,
+            item_requested: None,
             now_playing_changed: false,
             volume_changed: false,
         }
@@ -1107,6 +1259,26 @@ impl State {
         id.is_some()
     }
 
+    /// True when the active player has a state but no item, and it is not
+    /// the player that the item was requested for last. A reply without an
+    /// item does not make it true again. Once the player has an item, or after
+    /// another player was active, it can be asked again later.
+    fn item_missing(&mut self) -> bool {
+        let Some((client, player)) = self.now_playing.player_without_item() else {
+            self.item_requested = None;
+            return false;
+        };
+        if self
+            .item_requested
+            .as_ref()
+            .is_some_and(|(c, p)| c == client && p == player)
+        {
+            return false;
+        }
+        self.item_requested = Some((client.to_owned(), player.to_owned()));
+        true
+    }
+
     /// Publishes what changed since the last call.
     fn publish(&mut self) {
         if std::mem::take(&mut self.now_playing_changed) {
@@ -1134,15 +1306,17 @@ async fn run(
     shared: Arc<Shared>,
     link: LinkTx,
     messages: broadcast::Sender<Envelope>,
-    state: State,
+    mut state: State,
 ) {
-    // Waiting requests fail and `close` returns right away.
+    // Waiting requests fail and `close` returns at once. A local, so it is
+    // dropped before `state`: the link closes before the value receivers
+    // close.
     let mut guard = CloseGuard::new(link, || {
         let mut out = shared.outbox();
         out.pending.clear();
         out.close = None;
     });
-    guard.reason = match run_inner(conns, &shared, &messages, state).await {
+    guard.reason = match run_inner(conns, &shared, &messages, &mut state).await {
         Ok(()) => {
             tracing::debug!("connection closed");
             None
@@ -1154,11 +1328,46 @@ async fn run(
     };
 }
 
+/// Reads the control data that tokio has seen as ready, without waiting
+/// for more. True if any was read.
+fn read_waiting(control: &TcpStream, channel: &mut Channel) -> Result<bool, Error> {
+    let mut read = false;
+    loop {
+        match control.try_read_buf(channel.receive_buffer(READ_CHUNK)) {
+            Ok(0) => return Err(Error::Disconnected),
+            Ok(_) => read = true,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if read {
+        control_replies(channel)?;
+    }
+    Ok(read)
+}
+
+/// Reads the control replies. They are only logged when not OK.
+fn control_replies(channel: &mut Channel) -> Result<(), Error> {
+    while let Some(m) = channel.poll_message()? {
+        if m.status() != Some(200) {
+            tracing::debug!(status = ?m.status(), "control response");
+        }
+    }
+    Ok(())
+}
+
+/// Timer for feedback requests. No burst of them after a long write.
+fn feedback_timer(start: Instant) -> tokio::time::Interval {
+    let mut timer = tokio::time::interval_at(start, FEEDBACK_INTERVAL);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    timer
+}
+
 async fn run_inner(
     conns: Connections,
     shared: &Shared,
     messages: &broadcast::Sender<Envelope>,
-    mut state: State,
+    state: &mut State,
 ) -> Result<(), Error> {
     let Connections {
         mut control,
@@ -1172,8 +1381,9 @@ async fn run_inner(
     let mut details = BytesMut::new();
     let mut received = Vec::new();
     let start = Instant::now() + FEEDBACK_INTERVAL;
-    let mut feedback = tokio::time::interval_at(start, FEEDBACK_INTERVAL);
-    let mut last_control = Instant::now();
+    let mut feedback = feedback_timer(start);
+    // Time of the first feedback request sent after the last control data.
+    let mut unanswered: Option<Instant> = None;
 
     loop {
         // Pushed items often lack languages, chapters and next items.
@@ -1186,45 +1396,37 @@ async fn run_inner(
             );
             stream.send(&details);
         }
+        // A new connection gets no item for a paused player in the background.
+        // Also asked later, when the active player has no item.
+        if state.item_missing() {
+            details.clear();
+            encode(&messages::playback_queue_item(), Some("item"), &mut details);
+            stream.send(&details);
+        }
         if stream.has_transmit() {
             tcp::write_all(&mut data, &stream.take_transmit()).await?;
         }
         tokio::select! {
-            () = shared.wake.notified() => {
-                let (chunk, close) = {
-                    let mut out = shared.outbox();
-                    (out.buf.split(), out.close.take())
-                };
-                // Sent before TEARDOWN, so a release queued before `close` arrives.
-                stream.send(&chunk);
-                if let Some(done) = close {
-                    if stream.has_transmit() {
-                        tcp::write_all(&mut data, &stream.take_transmit()).await?;
-                    }
-                    airplay::teardown(&mut control, &mut channel, &mut session).await;
-                    let _ = done.send(());
-                    return Ok(());
+            n = control.read_buf(channel.receive_buffer(READ_CHUNK)) => {
+                if n? == 0 {
+                    return Err(Error::Disconnected);
                 }
-            },
+                unanswered = None;
+                control_replies(&mut channel)?;
+            }
             _ = feedback.tick() => {
-                if last_control.elapsed() > FEEDBACK_TIMEOUT {
+                // After a long write, replies can wait unread.
+                if read_waiting(&control, &mut channel)? {
+                    unanswered = None;
+                }
+                if unanswered.is_some_and(|t| t.elapsed() > FEEDBACK_TIMEOUT) {
                     tracing::debug!("no answer to feedback");
                     return Err(Error::NoAnswer("feedback"));
                 }
                 tracing::trace!("feedback");
                 session.feedback(&mut channel);
+                unanswered.get_or_insert_with(Instant::now);
                 airplay::flush(&mut control, &mut channel).await?;
-            }
-            n = control.read_buf(channel.receive_buffer(READ_CHUNK)) => {
-                if n? == 0 {
-                    return Err(Error::Disconnected);
-                }
-                last_control = Instant::now();
-                while let Some(m) = channel.poll_message()? {
-                    if m.status() != Some(200) {
-                        tracing::debug!(status = ?m.status(), "control response");
-                    }
-                }
             }
             n = events.read_buf(event_channel.receive_buffer(READ_CHUNK)) => {
                 if n? == 0 {
@@ -1256,6 +1458,23 @@ async fn run_inner(
                     dispatch(env, shared, messages);
                 }
             }
+            () = shared.wake.notified() => {
+                let (chunk, close) = {
+                    let mut out = shared.outbox();
+                    out.batches.take();
+                    (out.buf.split(), out.close.take())
+                };
+                // Sent before TEARDOWN, so a release queued before `close` arrives.
+                stream.send(&chunk);
+                if let Some(done) = close {
+                    if stream.has_transmit() {
+                        tcp::write_all(&mut data, &stream.take_transmit()).await?;
+                    }
+                    airplay::teardown(&mut control, &mut channel, &mut session).await;
+                    let _ = done.send(());
+                    return Ok(());
+                }
+            },
         }
     }
 }
@@ -1277,4 +1496,20 @@ fn dispatch(env: Envelope, shared: &Shared, messages: &broadcast::Sender<Envelop
         }
     }
     let _ = messages.send(env);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// After a long write, one feedback request is sent, not a burst.
+    #[tokio::test(start_paused = true)]
+    async fn feedback_after_long_write() {
+        let mut timer = feedback_timer(Instant::now());
+        timer.tick().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        timer.tick().await;
+        let next = tokio::time::timeout(Duration::from_millis(1), timer.tick()).await;
+        assert!(next.is_err());
+    }
 }

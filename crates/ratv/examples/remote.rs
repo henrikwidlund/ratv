@@ -4,7 +4,8 @@
 //! cargo run --example remote -- <credentials file> <command> [device name or IP]
 //! ```
 //!
-//! Without a name the first Apple TV found is used. Commands: `up`, `down`,
+//! Without a name the first Apple TV found is used. A link-local IPv6 address
+//! needs the interface index, for example `fe80::1%4`. Commands: `up`, `down`,
 //! `left`, `right`, `select`, `menu`, `home`, `top_menu`, `guide`, `control_center`, `play`, `pause`, `toggle`,
 //! `next`, `previous`, `stop`, `on`, `off`, `seek=<s>`, `skip=<s>`,
 //! `volume=<0..1>`, `launch=<bundle id>`, `artwork=<file>`, `watch`,
@@ -33,15 +34,16 @@
 mod caf;
 #[path = "common/credentials.rs"]
 mod credentials;
+#[path = "common/host.rs"]
+mod host;
 #[cfg(feature = "opus")]
 #[path = "common/wav.rs"]
 mod wav;
 
-use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime};
 
 use ratv::companion::MediaControl;
-use ratv::discovery::{Device, MDNS_PORT, ScanOptions, scan};
+use ratv::discovery::{Device, ScanOptions, scan};
 use ratv::mrp::{self, RepeatMode, ShuffleMode, cocoa_time};
 use ratv::{AppleTv, ClientOptions, Endpoints, Key};
 
@@ -423,14 +425,14 @@ async fn details(
     tv: &AppleTv,
     ready: impl Fn(&mrp::NowPlaying) -> bool,
 ) -> Result<mrp::NowPlaying, Box<dyn std::error::Error>> {
-    let mut np = tv.now_playing().ok_or("not connected")?;
+    let mut np = tv.now_playing();
     let _ = tokio::time::timeout(Duration::from_secs(3), np.wait_for(ready)).await;
     Ok(np.borrow().clone())
 }
 
 /// Prints all now playing fields once the device has sent them.
 async fn info(tv: &AppleTv) -> Result<(), Box<dyn std::error::Error>> {
-    let mut np = tv.now_playing().ok_or("not connected")?;
+    let mut np = tv.now_playing();
     let _ = tokio::time::timeout(Duration::from_secs(3), np.wait_for(|n| n.title.is_some())).await;
     println!("{:#?}", *np.borrow());
     Ok(())
@@ -438,7 +440,7 @@ async fn info(tv: &AppleTv) -> Result<(), Box<dyn std::error::Error>> {
 
 async fn save_artwork(tv: &AppleTv, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // The device sends the image only after it has sent the now playing state.
-    let mut rx = tv.now_playing().ok_or("not connected")?;
+    let mut rx = tv.now_playing();
     let wait = rx.wait_for(|np| np.artwork_id.is_some());
     if let Ok(np) = tokio::time::timeout(Duration::from_secs(3), wait).await {
         println!("url: {}", opt(np?.artwork_url_sized(600, 600)));
@@ -460,7 +462,7 @@ async fn save_artwork(tv: &AppleTv, path: &str) -> Result<(), Box<dyn std::error
 }
 
 async fn watch(tv: &AppleTv) -> Result<(), Box<dyn std::error::Error>> {
-    let mut rx = tv.now_playing().ok_or("not connected")?;
+    let mut rx = tv.now_playing();
     // Print the current state first, then every change.
     rx.mark_changed();
     while rx.changed().await.is_ok() {
@@ -485,16 +487,24 @@ async fn watch(tv: &AppleTv) -> Result<(), Box<dyn std::error::Error>> {
 /// The device with this name or IP, else the first Apple TV found.
 async fn find_device(wanted: Option<&str>) -> Result<Device, Box<dyn std::error::Error>> {
     let mut options = ScanOptions::default();
-    if let Some(ip) = wanted.and_then(|w| w.parse::<IpAddr>().ok()) {
-        options.targets = vec![SocketAddr::new(ip, MDNS_PORT)];
+    let target = wanted.and_then(host::mdns_addr);
+    if let Some(addr) = target {
+        // An IPv6 target needs an IPv6 socket.
+        if addr.is_ipv6() {
+            options.bind = (std::net::Ipv6Addr::UNSPECIFIED, 0).into();
+        }
+        options.targets = vec![addr];
     }
+    // Device IPv4 addresses are plain IPv4, so IPv4-mapped input matches
+    // after `to_canonical`.
+    let wanted_ip = target.map(|a| a.ip().to_canonical());
     let devices = scan(&options).await?;
     let device = devices
         .into_iter()
         .find(|d| {
             wanted.map_or_else(
                 || d.model().is_some_and(|m| m.starts_with("AppleTV")),
-                |w| d.name() == w || d.addresses.iter().any(|a| a.to_string() == w),
+                |w| d.name() == w || d.addresses.iter().any(|a| Some(a.ip) == wanted_ip),
             )
         })
         .ok_or("device not found")?;
@@ -502,7 +512,7 @@ async fn find_device(wanted: Option<&str>) -> Result<Device, Box<dyn std::error:
 }
 
 async fn progress(tv: &AppleTv) -> Result<(), Box<dyn std::error::Error>> {
-    let mut rx = tv.now_playing().ok_or("not connected")?;
+    let mut rx = tv.now_playing();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         // `*` marks a state update from the device; other lines are computed locally.

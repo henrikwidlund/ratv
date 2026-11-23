@@ -17,7 +17,8 @@ fuzz_target!(|data: &[u8]| {
         let _ = Event::parse(&msg);
         let _ = text_input::session(&msg);
         let _ = message::session_start_response(&msg);
-        let _ = message::volume_response(&msg);
+        // A volume that is not finite is an error.
+        assert!(message::volume_response(&msg).map_or(true, f64::is_finite));
         let _ = message::apps_response(&msg);
         let _ = message::attention_response(&msg);
     }

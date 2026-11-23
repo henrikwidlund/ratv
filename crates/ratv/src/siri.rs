@@ -7,7 +7,8 @@ use crate::{Error, companion, mrp};
 /// Siri listening to voice input, from [`AppleTv::start_siri`](crate::AppleTv::start_siri).
 ///
 /// Siri is released when this is dropped, but call [`finish`](Self::finish)
-/// to send the rest of the audio and to know that the release was sent.
+/// to send the rest of the audio and to know whether the release failed.
+/// It holds a client clone, so dropping the other clones does not stop the connection.
 #[must_use = "Siri stays active until `finish` is called or this is dropped"]
 pub enum Siri {
     /// Over Companion, as the iPhone remote sends it.
@@ -18,7 +19,14 @@ pub enum Siri {
 
 impl Siri {
     /// Sends one Opus packet of 20 ms, 16 kHz, mono.
-    /// Send one packet every 20 ms.
+    /// Send one packet every 20 ms. A packet over 65535 bytes gives
+    /// [`Error::InvalidArgument`]. On a closed connection, fails with
+    /// [`Error::Closed`], unless the device stopped recording before (see
+    /// [`ended`](Self::ended)). Over MRP, fails with
+    /// [`Error::SiriNotRecording`] after 30 s of audio kept while the device
+    /// does not record.
+    /// On [`Error::QueueFull`] the packet is kept and sent with the next
+    /// call; do not send it again.
     pub async fn send(&mut self, packet: impl Into<Bytes>) -> Result<(), Error> {
         match self {
             Self::Companion(s) => s.send(&packet.into()).await,
@@ -27,7 +35,11 @@ impl Siri {
     }
 
     /// Sends signed 16-bit, 16 kHz, mono PCM in chunks of any size.
-    /// Do not mix with [`send`](Self::send).
+    /// Do not mix with [`send`](Self::send). Fails with [`Error::Closed`]
+    /// and, over MRP, [`Error::SiriNotRecording`] as [`send`](Self::send)
+    /// does.
+    /// On [`Error::QueueFull`] the audio is kept and sent with the next call;
+    /// do not push it again.
     #[cfg(feature = "opus")]
     pub async fn push_pcm(&mut self, pcm: &[i16]) -> Result<(), Error> {
         match self {
@@ -47,7 +59,10 @@ impl Siri {
 
     /// Sends the rest of the audio and releases Siri. The device then answers.
     ///
-    /// Fails with [`Error::SiriNoAudio`] if no audio was given.
+    /// Fails with [`Error::SiriNoAudio`] if no audio was sent, for example
+    /// because none was given, and with [`Error::Closed`] on a closed
+    /// connection. Over MRP, waits for the device to record first; fails with
+    /// [`Error::SiriNotRecording`] if it does not start in time.
     pub async fn finish(self) -> Result<(), Error> {
         match self {
             Self::Companion(s) => s.finish().await,

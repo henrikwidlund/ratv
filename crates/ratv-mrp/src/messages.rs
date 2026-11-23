@@ -275,13 +275,16 @@ pub fn repeat(mode: proto::repeat_mode::Enum) -> SendCommandMessage {
     )
 }
 
-/// Sets the volume, 0.0 to 1.0, of an output device.
+/// Sets the volume, 0.0 to 1.0, of an output device. Other values are
+/// limited to this range, and -0.0 becomes 0.0. NaN is sent as is, so check the value
+/// first.
 ///
 /// Use [`output_device_uid`](crate::output_device_uid) for the connected device.
 #[must_use]
 pub fn set_volume(volume: f32, output_device_uid: &str) -> SetVolumeMessage {
     SetVolumeMessage {
-        volume: Some(volume.clamp(0.0, 1.0)),
+        // `+ 0.0` turns -0.0 into 0.0.
+        volume: Some(volume.clamp(0.0, 1.0) + 0.0),
         output_device_uid: Some(output_device_uid.to_owned()),
         details: None,
     }
@@ -463,6 +466,18 @@ pub fn voice_input(packet: Bytes, start: u32) -> SendVoiceInputMessage {
     }
 }
 
+/// Requests the current item with its metadata. No artwork. See
+/// [`NowPlayingState::player_without_item`](crate::NowPlayingState::player_without_item).
+#[must_use]
+pub fn playback_queue_item() -> PlaybackQueueRequestMessage {
+    PlaybackQueueRequestMessage {
+        location: Some(0),
+        length: Some(1),
+        include_metadata: Some(true),
+        ..Default::default()
+    }
+}
+
 /// Requests the current item and up to `length - 1` next items, with
 /// language options, chapters and description. No artwork.
 #[must_use]
@@ -494,6 +509,10 @@ mod tests {
         assert_eq!(connected().state, Some(2));
         assert_eq!(client_updates_config().system_endpoint_updates, Some(false));
         assert_eq!(command(Command::Play).command, Some(1));
+
+        let q = playback_queue_item();
+        assert_eq!((q.length, q.include_metadata), (Some(1), Some(true)));
+        assert_eq!(q.artwork_width, None);
 
         let r = playback_rate(1.5);
         assert_eq!(r.command, Some(Command::ChangePlaybackRate as i32));
@@ -533,6 +552,7 @@ mod tests {
             Some(3)
         );
         assert_eq!(set_volume(1.5, "uid").volume, Some(1.0));
+        assert!(set_volume(-0.0, "uid").volume.unwrap().is_sign_positive());
         assert_eq!(get_volume("uid").output_device_uid.as_deref(), Some("uid"));
         assert_eq!(
             get_volume_muted("uid").output_device_uid.as_deref(),

@@ -62,8 +62,11 @@ impl DataStream {
     }
 
     /// Queues MRP messages. `messages` holds one or more length-prefixed
-    /// `ProtocolMessage`s.
+    /// `ProtocolMessage`s. Does nothing if `messages` is empty.
     pub fn send(&mut self, messages: &[u8]) {
+        if messages.is_empty() {
+            return;
+        }
         let mut buf = std::mem::take(&mut self.scratch);
         buf.clear();
         buf.resize(HEADER_LEN, 0);
@@ -253,6 +256,13 @@ mod tests {
         // The device answered both `sync` messages.
         deliver(&mut device, &mut client);
         assert!(client.poll().unwrap().is_none());
+        assert!(!client.has_transmit());
+    }
+
+    #[test]
+    fn send_empty_does_nothing() {
+        let (mut client, _) = pair();
+        client.send(b"");
         assert!(!client.has_transmit());
     }
 

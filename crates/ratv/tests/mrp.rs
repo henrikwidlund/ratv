@@ -24,6 +24,8 @@ const DEVICE_LTSK: [u8; 32] = [0x42; 32];
 const CLIENT_SEED: [u8; 32] = [0x11; 32];
 const CLIENT_ID: &[u8] = b"client-1";
 
+// Each flag is a separate fake device setting.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default, Debug)]
 struct Log {
     buttons: Vec<(u32, u32, bool)>,
@@ -44,6 +46,18 @@ struct Log {
     no_recording: bool,
     /// The device cannot change the volume.
     no_volume_control: bool,
+    /// Where the current item is missing.
+    no_item: NoItem,
+    /// Queue requests for one item without artwork.
+    item_requests: usize,
+    /// Sent on the data stream after the next read.
+    push: Option<Vec<u8>>,
+    /// From the next command on, the data stream is not read while this is set.
+    stop_reading: bool,
+    /// Closes the connection while it does not read.
+    hang_up: bool,
+    /// `SkipBackward` fails with a send error.
+    fail_skip: bool,
 }
 
 fn credentials() -> Credentials {
@@ -87,6 +101,17 @@ fn mrp<P: Payload>(payload: &P, id: Option<&str>, error_code: i32) -> Vec<u8> {
     // Adds the payload field to `pm`.
     pm.merge_length_delimited(&buf[..]).unwrap();
     pm.encode_length_delimited_to_vec()
+}
+
+/// Where the fake device leaves out the current item.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum NoItem {
+    #[default]
+    None,
+    /// The player is paused in the background: the state is sent without an item.
+    State,
+    /// As `State`, and queue requests without artwork get no item either.
+    Reply,
 }
 
 /// Step where the fake device fails.
@@ -148,7 +173,11 @@ async fn run_device(listener: TcpListener, log: Arc<Mutex<Log>>, fault: Fault) {
             ("SETUP", _) => {
                 let body = bplist::decode(&req.body()).unwrap().into_owned();
                 let sec = secret.clone().unwrap();
-                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                // A small receive buffer, so writes wait soon when the device does not read.
+                let socket = tokio::net::TcpSocket::new_v4().unwrap();
+                socket.set_recv_buffer_size(16 * 1024).unwrap();
+                socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let listener = socket.listen(8).unwrap();
                 let port = i64::from(listener.local_addr().unwrap().port());
                 if body.get("isRemoteControlOnly").is_some() {
                     let resp = Value::Dict(vec![("eventPort".into(), Value::Int(port))]).encode();
@@ -201,7 +230,7 @@ async fn run_device(listener: TcpListener, log: Arc<Mutex<Log>>, fault: Fault) {
     }
 }
 
-/// Sends one request right away, before RECORD is answered.
+/// Sends one request right after it connects, before RECORD is answered.
 async fn event_channel(listener: TcpListener, secret: SharedSecret, log: Arc<Mutex<Log>>) {
     let (mut s, _) = listener.accept().await.unwrap();
     let mut ch = Channel::new();
@@ -233,21 +262,32 @@ async fn data_stream(
         if n == 0 {
             return;
         }
-        let mut close = false;
+        let (mut close, mut command) = (false, false);
         while let Some(data) = ds.poll().unwrap() {
             for env in frames(data) {
                 let env = env.unwrap();
                 close |= drop && env.is::<proto::ClientUpdatesConfigMessage>();
+                command |= env.is::<proto::SendCommandMessage>();
                 if let Some(out) = handle(&env, &log) {
                     ds.send(&out);
                 }
             }
+        }
+        let pushed = log.lock().unwrap().push.take();
+        if let Some(out) = pushed {
+            ds.send(&out);
         }
         if ds.has_transmit() {
             s.write_all(&ds.take_transmit()).await.unwrap();
         }
         if close {
             return;
+        }
+        while command && log.lock().unwrap().stop_reading {
+            if log.lock().unwrap().hang_up {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 }
@@ -275,7 +315,8 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
         return Some(out);
     }
     if env.is::<proto::ClientUpdatesConfigMessage>() {
-        return Some(initial_state());
+        let no_item = log.lock().unwrap().no_item != NoItem::None;
+        return Some(initial_state(no_item));
     }
     if env.is::<proto::SendButtonEventMessage>() {
         let b: proto::SendButtonEventMessage = env.payload().unwrap();
@@ -299,7 +340,9 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
             // Device-level error code on the envelope.
             return Some(mrp(&proto::SendCommandResultMessage::default(), id, 6));
         }
-        let send_error = i32::from(cmd == Command::Stop as i32);
+        let fail = cmd == Command::Stop as i32
+            || (cmd == Command::SkipBackward as i32 && log.lock().unwrap().fail_skip);
+        let send_error = i32::from(fail);
         let result = proto::SendCommandResultMessage {
             send_error: Some(send_error),
             ..Default::default()
@@ -308,9 +351,22 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
     }
     if env.is::<proto::PlaybackQueueRequestMessage>() {
         let r: proto::PlaybackQueueRequestMessage = env.payload().unwrap();
+        let mut l = log.lock().unwrap();
+        if r.length == Some(1) && r.artwork_width.is_none() {
+            l.item_requests += 1;
+        }
+        let artwork = r.return_content_item_assets_in_user_completion == Some(true);
+        if l.no_item == NoItem::Reply && !artwork {
+            let state = proto::SetStateMessage {
+                playback_queue: Some(proto::PlaybackQueue::default()),
+                ..Default::default()
+            };
+            return Some(mrp(&state, id, 0));
+        }
+        drop(l);
         // Only artwork requests get an image, like on a real device.
         #[allow(clippy::cast_possible_truncation)]
-        let item = if r.return_content_item_assets_in_user_completion == Some(true) {
+        let item = if artwork {
             proto::ContentItem {
                 identifier: Some("video-1".into()),
                 artwork_data: Some(bytes::Bytes::from_static(b"\x89PNG")),
@@ -338,7 +394,8 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
 }
 
 /// Now playing client and state, sent after `CLIENT_UPDATES_CONFIG`.
-fn initial_state() -> Vec<u8> {
+/// With `no_item`, a paused state without an item.
+fn initial_state(no_item: bool) -> Vec<u8> {
     let client = proto::NowPlayingClient {
         bundle_identifier: Some("com.apple.TVMusic".into()),
         display_name: Some("Music".into()),
@@ -388,6 +445,16 @@ fn initial_state() -> Vec<u8> {
         }),
         ..Default::default()
     };
+    if no_item {
+        let paused = proto::SetStateMessage {
+            playback_state: Some(PlaybackState::Paused as i32),
+            playback_queue: None,
+            now_playing_info: None,
+            ..state
+        };
+        out.extend(mrp(&paused, None, 0));
+        return out;
+    }
     out.extend(mrp(&state, None, 0));
     out
 }
@@ -523,6 +590,21 @@ fn options() -> ClientOptions {
     options
 }
 
+/// Numbers that are not finite are not sent.
+async fn invalid_numbers_not_sent(client: &Client) {
+    let invalid = [
+        client.seek(f64::NAN).await,
+        client.skip(f64::INFINITY).await,
+        client.skip(1e300).await,
+        client.set_playback_rate(f32::NAN).await,
+        client.set_rating(f32::NEG_INFINITY).await,
+    ];
+    for result in invalid {
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    }
+}
+
 #[tokio::test]
 async fn session() {
     let device = start_device().await;
@@ -550,6 +632,7 @@ async fn session() {
     client.press(Button::Select).await.unwrap();
     client.command(Command::Pause).await.unwrap();
     client.seek(30.0).await.unwrap();
+    invalid_numbers_not_sent(&client).await;
     match client.command(Command::Stop).await.unwrap_err() {
         Error::CommandFailed { send_error, .. } => assert_eq!(send_error, 1),
         other => panic!("unexpected {other}"),
@@ -638,6 +721,68 @@ async fn session() {
     assert!(log.teardown);
 }
 
+/// A `Siri` kept over a close gives `Closed`, not `SiriActive`, so
+/// `is_closed` is true.
+#[tokio::test]
+async fn siri_kept_over_close() {
+    let device = start_device().await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    // Recording never starts. `send` and `finish` must still give `Closed`
+    // and not wait for recording.
+    device.log.lock().unwrap().no_recording = true;
+    let mut kept = client.start_siri().await.unwrap();
+    client.close().await.unwrap();
+    let err = client.start_siri().await.err().unwrap();
+    assert!(matches!(err, Error::Closed), "{err}");
+    // The packet size is checked first.
+    let err = kept.send(vec![0; 65_536]).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    // Only the error can be seen here, not the kept packets.
+    let err = kept.send(&b"one"[..]).await.unwrap_err();
+    assert!(matches!(err, Error::Closed), "{err}");
+    let err = kept.finish().await.unwrap_err();
+    assert!(matches!(err, Error::Closed), "{err}");
+
+    // Also after recording started.
+    let device = start_device().await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    let mut siri = client.start_siri().await.unwrap();
+    // Packets are sent once the device records.
+    for _ in 0..250 {
+        siri.send(&b"one"[..]).await.unwrap();
+        if !device.log.lock().unwrap().voice.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_ne!(device.log.lock().unwrap().voice.len(), 0);
+    client.close().await.unwrap();
+    for _ in 0..2 {
+        let err = siri.send(&b"two"[..]).await.unwrap_err();
+        assert!(matches!(err, Error::Closed), "{err}");
+    }
+}
+
+/// Packets over 65535 bytes are refused, as over Companion.
+#[tokio::test]
+async fn siri_packet_too_large() {
+    let device = start_device().await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    let mut siri = client.start_siri().await.unwrap();
+    let err = siri.send(vec![0; 65_536]).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    siri.send(vec![0; 65_535]).await.unwrap();
+}
+
 #[tokio::test]
 async fn siri() {
     let device = start_device().await;
@@ -686,7 +831,8 @@ async fn closed_by_device() {
     );
     assert!(!client.is_connected());
     let err = client.press(Button::Select).await.unwrap_err();
-    assert!(matches!(err, Error::Disconnected), "{err}");
+    assert!(matches!(err, Error::Closed), "{err}");
+    assert!(err.is_not_sent());
     // Nothing to close any more.
     client.close().await.unwrap();
 }
@@ -735,7 +881,7 @@ async fn siri_in_task() {
     client.close().await.unwrap();
     assert!(client.closed().await.is_none());
     let err = client.press(Button::Select).await.unwrap_err();
-    assert!(matches!(err, Error::Disconnected), "{err}");
+    assert!(matches!(err, Error::Closed), "{err}");
     // Lets the device read TEARDOWN.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -817,6 +963,63 @@ async fn volume_not_available() {
     let err = client.set_muted(true).await.unwrap_err();
     assert!(matches!(err, Error::VolumeNotAvailable), "{err}");
     client.close().await.unwrap();
+    // Not `VolumeNotAvailable` from the last value, so `is_closed` is true.
+    let err = client.set_volume(0.5).await.unwrap_err();
+    assert!(matches!(err, Error::Closed), "{err}");
+    let err = client.set_muted(true).await.unwrap_err();
+    assert!(matches!(err, Error::Closed), "{err}");
+}
+
+/// Message receivers close with the connection, also ones made after it.
+#[tokio::test]
+async fn messages_close_with_connection() {
+    let device = start_device().await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    let mut before = client.messages();
+    client.close().await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if before.recv().await == Err(tokio::sync::broadcast::error::RecvError::Closed) {
+                break;
+            }
+        }
+    });
+    closed.await.unwrap();
+    let mut after = client.messages();
+    let after = tokio::time::timeout(Duration::from_secs(1), after.recv()).await;
+    assert!(after.unwrap().is_err());
+}
+
+/// `AppleTv::set_volume` checks the argument before the volume state.
+#[cfg(feature = "companion")]
+#[tokio::test]
+async fn apple_tv_volume_argument_first() {
+    use ratv::{AppleTv, Endpoints};
+
+    let device = start_device().await;
+    device.log.lock().unwrap().no_volume_control = true;
+    let endpoints = Endpoints {
+        companion: None,
+        airplay: Some(format!("127.0.0.1:{}", device.port).parse().unwrap()),
+    };
+    let tv = AppleTv::connect(&endpoints, &credentials(), &options())
+        .await
+        .unwrap();
+    let mut volume = tv.volume().unwrap();
+    let ready = volume.wait_for(|v| v.available == Some(false));
+    tokio::time::timeout(Duration::from_secs(2), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(volume);
+    let err = tv.set_volume(f32::NAN).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    let err = tv.set_volume(0.5).await.unwrap_err();
+    assert!(matches!(err, Error::VolumeNotAvailable), "{err}");
+    tv.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -914,7 +1117,7 @@ async fn apple_tv_chapters_and_subtitles() {
     let tv = AppleTv::connect(&endpoints, &credentials(), &opts)
         .await
         .unwrap();
-    let mut np = tv.now_playing().unwrap();
+    let mut np = tv.now_playing();
     let ready = np.wait_for(|n| n.chapters.len() == 4 && n.subtitle_language.is_some());
     tokio::time::timeout(Duration::from_secs(2), ready)
         .await
@@ -989,6 +1192,307 @@ async fn apple_tv_uses_supported_commands() {
     assert!((110.0..111.0).contains(&log.seeks[0]), "{:?}", log.seeks);
 }
 
+/// A paused player in the background is sent without its item.
+/// One queue request gets it.
+#[tokio::test]
+async fn paused_item_requested() {
+    let device = start_device().await;
+    device.log.lock().unwrap().no_item = NoItem::State;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    let mut np = client.now_playing();
+    let wait = np.wait_for(|n| n.duration.is_some() && n.chapters.len() == 4);
+    tokio::time::timeout(Duration::from_secs(2), wait)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(np.borrow().state, Some(PlaybackState::Paused));
+    client.close().await.unwrap();
+    assert_eq!(device.log.lock().unwrap().item_requests, 1);
+}
+
+/// A reply without an item does not start another request.
+#[tokio::test]
+async fn paused_item_requested_once() {
+    let device = start_device().await;
+    device.log.lock().unwrap().no_item = NoItem::Reply;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    // Subscribed after connect. This works because `#[tokio::test]` runs on
+    // one thread, so the task has not read the reply yet.
+    let mut messages = client.messages();
+    // Wait for the reply, then for more requests.
+    let reply = async {
+        while messages
+            .recv()
+            .await
+            .unwrap()
+            .identifier()
+            .is_none_or(|id| id != "item")
+        {}
+    };
+    tokio::time::timeout(Duration::from_secs(2), reply)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.close().await.unwrap();
+    assert_eq!(device.log.lock().unwrap().item_requests, 1);
+    assert_eq!(client.now_playing().borrow().title, None);
+}
+
+/// Waits until `done` is true for the log of the fake device.
+async fn wait_log(log: &Mutex<Log>, done: impl Fn(&Log) -> bool) {
+    wait_log_within(log, Duration::from_secs(5), done).await;
+}
+
+/// Waits at most `limit` until `done` is true for the log of the fake device.
+async fn wait_log_within(log: &Mutex<Log>, limit: Duration, done: impl Fn(&Log) -> bool) {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        if done(&log.lock().unwrap()) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out: {:?}", log.lock().unwrap());
+}
+
+/// Voice message with 64 KiB of audio, to fill the socket buffers.
+fn filler() -> proto::SendVoiceInputMessage {
+    proto::SendVoiceInputMessage {
+        data_block: Some(proto::AudioDataBlock {
+            buffer: Some(proto::AudioBuffer {
+                contents: Some(vec![0; 64 * 1024].into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    }
+}
+
+/// Time for the fake device to read several MiB, also in a slow debug build.
+/// Each client write must still end within its 10 s write limit.
+const DRAIN: Duration = Duration::from_secs(30);
+
+/// Makes the fake device send `out` after it reads the next message.
+async fn push(client: &Client, log: &Mutex<Log>, out: Vec<u8>) {
+    log.lock().unwrap().push = Some(out);
+    client.press(Button::Select).await.unwrap();
+}
+
+/// The item is requested again when the same player loses it, and when
+/// another app becomes active with a state but no item.
+#[tokio::test]
+async fn missing_item_requested_again() {
+    let device = start_device().await;
+    let log = &device.log;
+    log.lock().unwrap().no_item = NoItem::State;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    let mut np = client.now_playing();
+    let has_item = |n: &mrp::NowPlaying| n.duration.is_some();
+    let wait = np.wait_for(has_item);
+    tokio::time::timeout(Duration::from_secs(2), wait)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(log.lock().unwrap().item_requests, 1);
+
+    let player_path = |bundle: &str| {
+        Some(proto::PlayerPath {
+            client: Some(proto::NowPlayingClient {
+                bundle_identifier: Some(bundle.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    };
+    // The same player loses its item.
+    let lost = proto::SetStateMessage {
+        player_path: player_path("com.apple.TVMusic"),
+        playback_queue: Some(proto::PlaybackQueue::default()),
+        ..Default::default()
+    };
+    push(&client, log, mrp(&lost, None, 0)).await;
+    wait_log(log, |l| l.item_requests == 2).await;
+    let wait = np.wait_for(has_item);
+    tokio::time::timeout(Duration::from_secs(2), wait)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Another app with a paused player and no item.
+    let other = "com.example.Video";
+    let mut out = mrp(
+        &proto::SetNowPlayingClientMessage {
+            client: player_path(other).and_then(|p| p.client),
+        },
+        None,
+        0,
+    );
+    let paused = proto::SetStateMessage {
+        player_path: player_path(other),
+        playback_state: Some(PlaybackState::Paused as i32),
+        ..Default::default()
+    };
+    out.extend(mrp(&paused, None, 0));
+    push(&client, log, out).await;
+    let wait = np.wait_for(|n| n.app.as_deref() == Some(other) && n.duration.is_some());
+    tokio::time::timeout(Duration::from_secs(2), wait)
+        .await
+        .unwrap()
+        .unwrap();
+    client.close().await.unwrap();
+    assert_eq!(log.lock().unwrap().item_requests, 3);
+}
+
+/// A request that stays in the outbox while the device does not read is
+/// removed. Later messages are still sent whole.
+#[tokio::test]
+async fn request_not_written_is_not_sent() {
+    let device = start_device().await;
+    let log = &device.log;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let mut opts = options();
+    opts.timeout = Duration::from_millis(300);
+    opts.connect_timeout = Some(Duration::from_secs(2));
+    let client = Client::connect(addr, &credentials(), &opts).await.unwrap();
+    log.lock().unwrap().stop_reading = true;
+    // The last message that the device reads.
+    client.command(Command::Play).await.unwrap();
+
+    // The task takes it and writes it, but the device does not read it.
+    let err = client.command(Command::Pause).await.unwrap_err();
+    assert!(matches!(err, Error::NoAnswer(_)), "{err}");
+    assert!(!err.is_not_sent());
+
+    // Fills the socket buffers until the task waits in a write.
+    let filler = filler();
+    let mut written = 0;
+    let err = loop {
+        // 512 KiB per loop.
+        for _ in 0..8 {
+            client.send(&filler).await.unwrap();
+        }
+        let err = client.command(Command::Stop).await.unwrap_err();
+        if !matches!(err, Error::NoAnswer(_)) {
+            break err;
+        }
+        written += 1;
+        assert!(written < 16, "writes did not wait after 8 MiB");
+    };
+    assert!(matches!(err, Error::SendTimeout(_)), "{err}");
+    assert!(err.is_not_sent());
+    assert!(client.is_connected());
+    // Queued after the removed request.
+    client.press(Button::Menu).await.unwrap();
+
+    log.lock().unwrap().stop_reading = false;
+    wait_log_within(log, DRAIN, |l| l.buttons.len() == 2).await;
+    let log = log.lock().unwrap();
+    let mut commands = vec![Command::Play as i32, Command::Pause as i32];
+    commands.extend(std::iter::repeat_n(Command::Stop as i32, written));
+    assert_eq!(log.commands, commands);
+    assert_eq!(log.buttons, [(1, 0x86, true), (1, 0x86, false)]);
+}
+
+/// A request that is still in the outbox when the connection closes was not
+/// sent.
+#[tokio::test]
+async fn request_queued_at_close_is_not_sent() {
+    let device = start_device().await;
+    let log = &device.log;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let mut opts = options();
+    opts.timeout = Duration::from_millis(300);
+    opts.connect_timeout = Some(Duration::from_secs(2));
+    let client = Client::connect(addr, &credentials(), &opts).await.unwrap();
+    log.lock().unwrap().stop_reading = true;
+    // The last message that the device reads.
+    client.command(Command::Play).await.unwrap();
+
+    // Fills the socket buffers until the task waits in a write.
+    let filler = filler();
+    for round in 0.. {
+        // 512 KiB per loop.
+        for _ in 0..8 {
+            client.send(&filler).await.unwrap();
+        }
+        let err = client.command(Command::Stop).await.unwrap_err();
+        if matches!(err, Error::SendTimeout(_)) {
+            break;
+        }
+        assert!(matches!(err, Error::NoAnswer(_)), "{err}");
+        assert!(round < 16, "writes did not wait after 8 MiB");
+    }
+
+    let request = client.command(Command::Pause);
+    let hang_up = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        log.lock().unwrap().hang_up = true;
+    };
+    let (result, ()) = tokio::join!(request, hang_up);
+    let err = result.unwrap_err();
+    assert!(matches!(err, Error::Closed), "{err}");
+    assert!(err.is_not_sent());
+    assert!(!client.is_connected());
+}
+
+/// Releases skip the outbox limit. A press that does not fit sends nothing.
+#[tokio::test]
+async fn release_queued_when_outbox_full() {
+    let device = start_device().await;
+    let log = &device.log;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    let hold = client.hold(Button::Home, Duration::from_millis(50));
+    tokio::pin!(hold);
+    // Sends the press, then waits in the sleep, which is not polled again here.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(5), &mut hold)
+            .await
+            .is_err()
+    );
+    wait_log(log, |l| l.buttons.len() == 1).await;
+    log.lock().unwrap().stop_reading = true;
+    // The last message that the device reads.
+    client.command(Command::Play).await.unwrap();
+
+    // Lets the task write until the socket is full and the write waits.
+    // Only then the outbox fills up.
+    let filler = filler();
+    let mut sent = 0;
+    let err = loop {
+        match client.send(&filler).await {
+            Ok(()) => sent += 1,
+            Err(err) => break err,
+        }
+        assert!(sent < 512, "outbox not full after 32 MiB");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+    assert!(matches!(err, Error::QueueFull), "{err}");
+    let err = client.press(Button::Menu).await.unwrap_err();
+    assert!(matches!(err, Error::QueueFull), "{err}");
+    // The task still waits in the write, so the outbox stays full.
+    hold.await.unwrap();
+
+    log.lock().unwrap().stop_reading = false;
+    wait_log_within(log, DRAIN, |l| l.buttons.len() == 2).await;
+    assert_eq!(
+        log.lock().unwrap().buttons,
+        [(0x0c, 0x40, true), (0x0c, 0x40, false)]
+    );
+    assert!(client.is_connected());
+}
+
 /// Waits until the fake device got TEARDOWN.
 async fn wait_teardown(log: &Mutex<Log>) {
     for _ in 0..100 {
@@ -1046,6 +1550,36 @@ async fn connection_refused() {
         Client::connect(addr, &credentials(), &options()).await,
         Err(Error::Io(_) | Error::Timeout)
     ));
+}
+
+#[tokio::test]
+async fn connect_timeout_limits_setup_steps() {
+    let device = start_faulty_device(Fault::DeviceInfo).await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let mut options = options();
+    options.timeout = Duration::from_secs(30);
+    options.connect_timeout = Some(Duration::from_millis(200));
+    let start = Instant::now();
+    let result = Client::connect(addr, &credentials(), &options).await;
+    assert!(matches!(result, Err(Error::Timeout)));
+    assert!(start.elapsed() < Duration::from_secs(5));
+    wait_teardown(&device.log).await;
+}
+
+#[tokio::test]
+async fn other_device_fails() {
+    let device = start_device().await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let good = credentials();
+    let creds = Credentials::new(
+        *good.accessory_ltpk(),
+        CLIENT_SEED.into(),
+        b"other".to_vec(),
+        good.client_id().to_vec(),
+    );
+    let err = Client::connect(addr, &creds, &options()).await.unwrap_err();
+    assert!(err.is_other_device(), "{err}");
+    assert!(!err.is_auth(), "{err}");
 }
 
 #[tokio::test]
@@ -1117,6 +1651,21 @@ async fn apple_tv_connects_missing_protocol() {
     // MRP closes, so both are missing. Only MRP connects again, on a new port.
     tv.mrp().unwrap().close().await.unwrap();
     assert!(!tv.is_open(Protocol::Mrp));
+    // Calls on the closed protocol give `Closed`.
+    for err in [
+        tv.seek(1.0).await.unwrap_err(),
+        tv.set_muted(true).await.unwrap_err(),
+        tv.press(Key::Select).await.unwrap_err(),
+        tv.artwork(0, 0).await.unwrap_err(),
+        tv.set_volume(0.5).await.unwrap_err(),
+        tv.begin_fast_forward().await.unwrap_err(),
+        tv.end_fast_forward().await.unwrap_err(),
+        tv.play_pause().await.unwrap_err(),
+        tv.next_chapter().await.unwrap_err(),
+        tv.start_siri().await.err().unwrap(),
+    ] {
+        assert!(matches!(err, Error::Closed), "{err}");
+    }
     let second = start_device().await;
     endpoints.airplay = Some(format!("127.0.0.1:{}", second.port).parse().unwrap());
     let new = tv
@@ -1133,6 +1682,45 @@ async fn apple_tv_connects_missing_protocol() {
     new.close().await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(second.log.lock().unwrap().buttons[0], (1, 0x89, true));
+}
+
+/// The app lists `SkipBackward` but not `BeginRewind`, so rewind skips.
+#[cfg(feature = "companion")]
+#[tokio::test]
+async fn rewind_end_after_failed_skip() {
+    use ratv::{AppleTv, Endpoints};
+
+    let refused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let companion = refused.local_addr().unwrap();
+    drop(refused);
+    let endpoints = |device: &Device| Endpoints {
+        companion: Some(companion),
+        airplay: Some(format!("127.0.0.1:{}", device.port).parse().unwrap()),
+    };
+    let mut opts = options();
+    // Windows tries a refused connect again for about 2 s.
+    opts.timeout = Duration::from_secs(10);
+
+    // After a skip that worked, the end does nothing, also when closed.
+    let device = start_device().await;
+    let tv = AppleTv::connect(&endpoints(&device), &credentials(), &opts)
+        .await
+        .unwrap();
+    tv.begin_rewind().await.unwrap();
+    tv.mrp().unwrap().close().await.unwrap();
+    tv.end_rewind().await.unwrap();
+
+    // After a failed skip, the end checks again and gives `Closed`.
+    let device = start_device().await;
+    device.log.lock().unwrap().fail_skip = true;
+    let tv = AppleTv::connect(&endpoints(&device), &credentials(), &opts)
+        .await
+        .unwrap();
+    let err = tv.begin_rewind().await.unwrap_err();
+    assert!(matches!(err, Error::CommandFailed { .. }), "{err}");
+    tv.mrp().unwrap().close().await.unwrap();
+    let err = tv.end_rewind().await.unwrap_err();
+    assert!(matches!(err, Error::Closed), "{err}");
 }
 
 /// Companion is refused, so `AppleTv` uses only MRP.
@@ -1155,12 +1743,17 @@ async fn apple_tv_falls_back_to_mrp() {
         .unwrap();
     assert!(tv.companion().is_none());
     assert!(tv.mrp().is_some());
-    assert!(tv.now_playing().is_some());
 
     tv.press(Key::Select).await.unwrap();
     tv.press(Key::TopMenu).await.unwrap();
     tv.pause().await.unwrap();
     tv.seek(10.0).await.unwrap();
+    for seconds in [f64::NAN, 1e300] {
+        assert!(matches!(
+            tv.skip(seconds).await,
+            Err(Error::InvalidArgument("seconds"))
+        ));
+    }
     tv.set_volume(0.25).await.unwrap();
     assert!(matches!(
         tv.turn_on().await,

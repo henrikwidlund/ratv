@@ -52,9 +52,13 @@ pub(crate) async fn connect(
     timeout: Duration,
 ) -> Result<Connections, Error> {
     let mut control = tcp::connect(addr, timeout).await?;
-    let local = control.local_addr()?.ip().to_string();
     let mut channel = Channel::new();
-    let mut session = Session::new(&local, rng::u32(), rng::u64(), rng::u32());
+    let mut session = Session::new(
+        control.local_addr()?.ip(),
+        rng::u32(),
+        rng::u64(),
+        rng::u32(),
+    );
 
     let mut rng = rng::os();
     let (m1, state) = pair_verify::start(credentials, &mut rng);

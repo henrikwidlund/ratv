@@ -13,6 +13,8 @@ use crate::{Envelope, Error};
 #[non_exhaustive]
 pub struct Volume {
     /// Level from 0.0 to 1.0. `None` when volume control is not available.
+    /// A device level outside 0.0 to 1.0 is limited to it. A level that is
+    /// not finite is not taken; the old level stays.
     pub level: Option<f32>,
     /// True when muted. `None` when volume control is not available.
     pub muted: Option<bool>,
@@ -32,7 +34,8 @@ pub struct OutputDevice {
     pub uid: String,
     /// Name shown to users.
     pub name: String,
-    /// Level from 0.0 to 1.0, when known.
+    /// Level from 0.0 to 1.0, when known. A device level outside 0.0 to 1.0
+    /// is limited to it. A level that is not finite is not taken.
     pub volume: Option<f32>,
     /// True when muted, when known.
     pub muted: Option<bool>,
@@ -88,21 +91,21 @@ impl VolumeState {
             .iter()
             .map(|d| (d.device_uid.as_deref(), d.name.as_str()));
         let old = std::mem::take(&mut self.volume.outputs);
-        self.volume.outputs = own
-            .into_iter()
-            .chain(grouped)
-            .filter_map(|(uid, name)| {
-                let uid = uid?;
-                // Keep known volumes of devices that stay in the group.
-                let known = old.iter().find(|o| o.uid == uid);
-                Some(OutputDevice {
-                    uid: uid.to_owned(),
-                    name: name.to_owned(),
-                    volume: known.and_then(|o| o.volume),
-                    muted: known.and_then(|o| o.muted),
-                })
-            })
-            .collect();
+        for (uid, name) in own.into_iter().chain(grouped) {
+            // A UID that is listed again is skipped: the first entry counts.
+            let Some(uid) = uid else { continue };
+            if self.volume.outputs.iter().any(|o| o.uid == uid) {
+                continue;
+            }
+            // Keep known volumes of devices that stay in the group.
+            let known = old.iter().find(|o| o.uid == uid);
+            self.volume.outputs.push(OutputDevice {
+                uid: uid.to_owned(),
+                name: name.to_owned(),
+                volume: known.and_then(|o| o.volume),
+                muted: known.and_then(|o| o.muted),
+            });
+        }
         self.volume.outputs != old
     }
 
@@ -116,11 +119,12 @@ impl VolumeState {
             outputs = self.set_device(&env.payload()?);
         } else if env.is::<VolumeDidChangeMessage>() {
             let msg: VolumeDidChangeMessage = env.payload()?;
+            let level = level(msg.volume);
             if self.is_ours(msg.output_device_uid.as_deref()) {
-                self.volume.level = msg.volume.or(self.volume.level);
+                self.volume.level = level.or(self.volume.level);
             }
             if let Some(o) = self.output(msg.output_device_uid.as_deref()) {
-                outputs = update(&mut o.volume, msg.volume);
+                outputs = update(&mut o.volume, level);
             }
         } else if env.is::<VolumeMutedDidChangeMessage>() {
             let msg: VolumeMutedDidChangeMessage = env.payload()?;
@@ -149,7 +153,7 @@ impl VolumeState {
             }
         } else if env.is::<GetVolumeResultMessage>() {
             let msg: GetVolumeResultMessage = env.payload()?;
-            self.volume.level = msg.volume.or(self.volume.level);
+            self.volume.level = level(msg.volume).or(self.volume.level);
         } else if env.is::<GetVolumeMutedResultMessage>() {
             let msg: GetVolumeMutedResultMessage = env.payload()?;
             self.volume.muted = msg.is_muted.or(self.volume.muted);
@@ -179,9 +183,14 @@ impl VolumeState {
             &msg.cluster_aware_output_devices
         };
         let mut changed = false;
-        for d in devices {
-            if let Some(o) = self.output(d.unique_identifier.as_deref()) {
-                changed |= update(&mut o.volume, d.volume);
+        // The first entry for a UID counts, as for the connected device below.
+        for o in &mut self.volume.outputs {
+            let uid = Some(o.uid.as_str());
+            if let Some(d) = devices
+                .iter()
+                .find(|d| d.unique_identifier.as_deref() == uid)
+            {
+                changed |= update(&mut o.volume, level(d.volume));
                 changed |= update(&mut o.muted, d.volume_muted);
             }
         }
@@ -195,7 +204,7 @@ impl VolumeState {
             return changed;
         };
         let v = &mut self.volume;
-        v.level = d.volume.or(v.level);
+        v.level = level(d.volume).or(v.level);
         v.muted = d.volume_muted.or(v.muted);
         v.available = d.is_volume_control_available.or(v.available);
         v.capabilities = d.volume_capabilities.or(v.capabilities);
@@ -220,6 +229,15 @@ impl VolumeState {
             _ => true,
         }
     }
+}
+
+/// A level from the device, limited to 0.0 to 1.0, or `None` if it is not
+/// finite. The caller then keeps the old level. -0.0 becomes 0.0.
+fn level(value: Option<f32>) -> Option<f32> {
+    value
+        .filter(|l| l.is_finite())
+        // `+ 0.0` turns -0.0 into 0.0.
+        .map(|l| l.clamp(0.0, 1.0) + 0.0)
 }
 
 /// Sets `field` to `value` if `value` is set. Returns true if it changed.
@@ -286,6 +304,39 @@ mod tests {
         };
         assert!(!s.apply(&env(&other)).unwrap());
         assert_eq!(s.volume().level, Some(0.4));
+
+        // A level that is not finite is not taken, and is no change.
+        let nan = VolumeDidChangeMessage {
+            volume: Some(f32::NAN),
+            output_device_uid: Some("tv".into()),
+            ..Default::default()
+        };
+        assert!(!s.apply(&env(&nan)).unwrap());
+        assert_eq!(s.volume().level, Some(0.4));
+        // A level above 1.0 is limited.
+        let high = VolumeDidChangeMessage {
+            volume: Some(3.0),
+            output_device_uid: Some("tv".into()),
+            ..Default::default()
+        };
+        assert!(s.apply(&env(&high)).unwrap());
+        assert_eq!(s.volume().level, Some(1.0));
+        // A level below 0.0 is limited.
+        let low = VolumeDidChangeMessage {
+            volume: Some(-0.5),
+            output_device_uid: Some("tv".into()),
+            ..Default::default()
+        };
+        assert!(s.apply(&env(&low)).unwrap());
+        assert_eq!(s.volume().level, Some(0.0));
+        // -0.0 is stored as 0.0.
+        let minus_zero = VolumeDidChangeMessage {
+            volume: Some(-0.0),
+            output_device_uid: Some("tv".into()),
+            ..Default::default()
+        };
+        assert!(!s.apply(&env(&minus_zero)).unwrap());
+        assert!(s.volume().level.unwrap().is_sign_positive());
     }
 
     #[test]
@@ -361,6 +412,17 @@ mod tests {
         assert!(s.apply(&env(&info)).unwrap());
         let names: Vec<_> = s.volume().outputs.iter().map(|o| o.name.as_str()).collect();
         assert_eq!(names, ["Living Room", "Kitchen"]);
+        // A UID listed again, also the own UID, is skipped: the first entry counts.
+        let mut twice = info.clone();
+        twice.grouped_devices = vec![
+            member("hp1", "Kitchen"),
+            member("hp1", "Other"),
+            member("tv", "Again"),
+        ];
+        let mut t = VolumeState::new();
+        assert!(t.apply(&env(&twice)).unwrap());
+        let names: Vec<_> = t.volume().outputs.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["Living Room", "Kitchen"]);
 
         // Volume of another device goes to its output, not to the connected device.
         let msg = VolumeDidChangeMessage {
@@ -374,6 +436,25 @@ mod tests {
         // The same values again change nothing.
         assert!(!s.apply(&env(&msg)).unwrap());
         assert!(!s.apply(&env(&info)).unwrap());
+
+        // A UID listed twice: the first entry counts, so the same message
+        // again is no change.
+        let twice = UpdateOutputDeviceMessage {
+            output_devices: ["hp1", "hp1"]
+                .iter()
+                .zip([0.1, 0.2])
+                .map(|(uid, volume)| AvOutputDeviceDescriptor {
+                    unique_identifier: Some((*uid).into()),
+                    volume: Some(volume),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(s.apply(&env(&twice)).unwrap());
+        assert_eq!(s.volume().outputs[1].volume, Some(0.1));
+        assert!(!s.apply(&env(&twice)).unwrap());
+        assert!(s.apply(&env(&msg)).unwrap());
 
         // A second speaker joins; the first keeps its volume.
         let mut info = info;

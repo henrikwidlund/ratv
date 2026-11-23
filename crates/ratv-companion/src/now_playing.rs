@@ -69,13 +69,16 @@ pub struct NowPlaying {
     pub title: Option<String>,
     /// Bundle id of the app. Not sent by all apps.
     pub app: Option<String>,
-    /// Player id. Changes when another player or item takes over.
+    /// Player id. Changes when another player or item becomes active.
     pub player: Option<String>,
     /// Playback state.
     pub state: Option<PlaybackState>,
-    /// Playback rate, 1.0 is normal speed.
+    /// Playback rate, 1.0 is normal speed. The device can send the old rate
+    /// for a short time after the state changes, so it can be 1 while
+    /// paused. The merged value of `ratv::AppleTv` uses 0 then.
     pub rate: Option<f32>,
-    /// Length in seconds. 0 for live streams.
+    /// Length in seconds. 0 for live streams. Can be below 0 if the app sends
+    /// it.
     pub duration: Option<f64>,
     /// Position in seconds at `elapsed_timestamp`.
     pub elapsed: Option<f64>,
@@ -89,7 +92,9 @@ pub struct NowPlaying {
 
 impl NowPlaying {
     /// Applies a [`event::NOW_PLAYING_INFO`](crate::message::event::NOW_PLAYING_INFO)
-    /// event. Fields that the event does not hold keep their value.
+    /// event. Fields that the event does not hold keep their value. An event
+    /// with metadata replaces all metadata fields and the artwork. A number
+    /// that is not finite, or a rate too large for f32, clears its field.
     /// Returns true if something changed.
     pub fn apply(&mut self, msg: &Message<'_>) -> bool {
         let Some(data) = msg.field("NowPlayingInfoKey").and_then(Value::as_bytes) else {
@@ -117,7 +122,9 @@ impl NowPlaying {
             // Rates are small, so `f32` keeps them exact enough.
             #[allow(clippy::cast_possible_truncation)]
             let rate = v as f32;
-            changed |= set(&mut self.rate, Some(rate));
+            // NaN is never equal to itself, so it would count as a change
+            // each time. A rate that is not finite is not known.
+            changed |= set(&mut self.rate, rate.is_finite().then_some(rate));
         }
         if let Some(v) = field(objects, root, "captionsEnabled").and_then(P::as_bool) {
             changed |= set(&mut self.captions_enabled, Some(v));
@@ -155,28 +162,34 @@ impl NowPlaying {
             }
             changed |= set(
                 &mut self.duration,
-                field(objects, md, "duration").and_then(number),
+                finite(field(objects, md, "duration").and_then(number)),
             );
             changed |= set(
                 &mut self.elapsed,
-                field(objects, md, "timeOffset").and_then(number),
+                finite(field(objects, md, "timeOffset").and_then(number)),
             );
             changed |= set(
                 &mut self.elapsed_timestamp,
-                field(objects, md, "timestamp").and_then(number),
+                finite(field(objects, md, "timestamp").and_then(number)),
             );
         }
         changed
     }
 
-    /// Position in seconds at `now` (MRP time).
+    /// Position in seconds at `now` (MRP time). Values that are not finite
+    /// are treated as missing, and so is a result that is not finite. Never
+    /// below 0. Keeps growing while paused until the rate is 0, see
+    /// [`rate`](Self::rate).
     #[must_use]
     pub fn position(&self, now: f64) -> Option<f64> {
         let elapsed = self.elapsed.filter(|e| e.is_finite())?;
-        let (Some(ts), Some(rate)) = (self.elapsed_timestamp, self.rate) else {
-            return Some(elapsed);
+        let ts = self.elapsed_timestamp.filter(|t| t.is_finite());
+        let rate = self.rate.filter(|r| r.is_finite());
+        let pos = match (ts, rate) {
+            (Some(ts), Some(rate)) => elapsed + (now - ts) * f64::from(rate),
+            _ => elapsed,
         };
-        Some((elapsed + (now - ts) * f64::from(rate)).max(0.0))
+        pos.is_finite().then(|| pos.max(0.0))
     }
 }
 
@@ -204,6 +217,12 @@ fn string<'v>(objects: &'v [P<'_>], v: &'v P<'_>) -> Option<&'v str> {
 fn bytes<'v>(objects: &'v [P<'_>], v: &'v P<'_>) -> Option<&'v [u8]> {
     v.as_bytes()
         .or_else(|| resolve(objects, v.get("NS.data")?)?.as_bytes())
+}
+
+/// `None` if `v` is not finite. NaN is never equal to itself, so it would count
+/// as a change each time.
+fn finite(v: Option<f64>) -> Option<f64> {
+    v.filter(|v| v.is_finite())
 }
 
 const fn number(v: &P<'_>) -> Option<f64> {
@@ -236,6 +255,17 @@ mod tests {
         image: Option<&[u8]>,
         metadata: Option<(&str, f64, f64)>,
     ) -> Vec<u8> {
+        info_event_with_duration(state, rate, image, metadata, 3600.0)
+    }
+
+    /// As [`info_event`], with this duration in the metadata.
+    fn info_event_with_duration(
+        state: Option<i64>,
+        rate: Option<f64>,
+        image: Option<&[u8]>,
+        metadata: Option<(&str, f64, f64)>,
+        duration: f64,
+    ) -> Vec<u8> {
         let mut objects = vec![P::String("$null".into())];
         let mut add = |v: P<'static>| {
             objects.push(v);
@@ -251,7 +281,7 @@ mod tests {
                 "NS.string".into(),
                 P::String("com.apple.TVWatchList".into()),
             )]));
-            let duration = add(P::Real(3600.0));
+            let duration = add(P::Real(duration));
             let elapsed = add(P::Real(elapsed));
             let ts = add(P::Real(ts));
             add(P::Dict(vec![
@@ -327,6 +357,27 @@ mod tests {
         assert_eq!(np.title.as_deref(), Some("Nocturne"));
         assert!(apply(&mut np, &info_event(None, Some(0.0), None, None)));
         assert_eq!(np.position(200.0), Some(10.0));
+        // Finite input that overflows.
+        let overflow = NowPlaying {
+            elapsed_timestamp: Some(-1.7e308),
+            rate: Some(2.0),
+            ..np.clone()
+        };
+        assert_eq!(overflow.position(200.0), None);
+        // Also when it overflows below 0.
+        let backward = NowPlaying {
+            rate: Some(-2.0),
+            ..overflow
+        };
+        assert_eq!(backward.position(200.0), None);
+        assert_eq!(np.position(f64::NAN), None);
+        // Without a rate, the elapsed time is limited too.
+        let fixed = NowPlaying {
+            elapsed: Some(-3.0),
+            rate: None,
+            ..np.clone()
+        };
+        assert_eq!(fixed.position(200.0), Some(0.0));
         assert!(apply(&mut np, &info_event(Some(3), None, None, None)));
         assert_eq!(np.state, Some(PlaybackState::Stopped));
         assert!(np.artwork.is_some());
@@ -336,6 +387,22 @@ mod tests {
         assert!(apply(&mut np, &next));
         assert_eq!(np.title.as_deref(), Some("News"));
         assert_eq!(np.artwork, None);
+
+        // A rate that is not finite is not known, and is no change again.
+        let nan = info_event(None, Some(f64::NAN), None, None);
+        assert!(apply(&mut np, &nan));
+        assert_eq!(np.rate, None);
+        assert!(!apply(&mut np, &nan));
+        // The same for the position.
+        let nan = info_event(None, None, None, Some(("News", f64::NAN, f64::NAN)));
+        assert!(apply(&mut np, &nan));
+        assert_eq!((np.elapsed, np.elapsed_timestamp), (None, None));
+        assert!(!apply(&mut np, &nan));
+        // The same for the duration.
+        let nan = info_event_with_duration(None, None, None, Some(("News", 1.0, 1.0)), f64::NAN);
+        apply(&mut np, &nan);
+        assert_eq!(np.duration, None);
+        assert!(!apply(&mut np, &nan));
     }
 
     #[test]

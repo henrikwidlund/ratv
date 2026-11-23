@@ -8,6 +8,7 @@
 //! 4. [`Session::setup_data_stream`], connect to the data port.
 //! 5. [`Session::feedback`] every 2 seconds.
 
+use core::net::IpAddr;
 use std::borrow::Cow;
 
 use ratv_codec::bplist::{self, Value};
@@ -70,13 +71,18 @@ pub struct Session {
 }
 
 impl Session {
-    /// Creates a session. `local_host` is our IP address as the device sees it,
+    /// Creates a session. `local_ip` is our IP address as the device sees it,
     /// `session_id`, `dacp_id` and `active_remote` should be random.
+    /// An IPv6 address is put in brackets.
     #[must_use]
-    pub fn new(local_host: &str, session_id: u32, dacp_id: u64, active_remote: u32) -> Self {
+    pub fn new(local_ip: IpAddr, session_id: u32, dacp_id: u64, active_remote: u32) -> Self {
+        let url = match local_ip {
+            IpAddr::V4(a) => format!("rtsp://{a}/{session_id}"),
+            IpAddr::V6(a) => format!("rtsp://[{a}]/{session_id}"),
+        };
         Self {
             cseq: 0,
-            url: format!("rtsp://{local_host}/{session_id}"),
+            url,
             dacp_id: format!("{dacp_id:016X}"),
             active_remote: active_remote.to_string(),
         }
@@ -257,6 +263,8 @@ pub fn data_stream_port(resp: &Message) -> Result<(u16, Option<u64>), Error> {
 
 #[cfg(test)]
 mod tests {
+    use core::net::Ipv4Addr;
+
     use bytes::BytesMut;
 
     use super::*;
@@ -281,9 +289,17 @@ mod tests {
     }
 
     #[test]
+    fn session_url() {
+        let url = |ip: &str| Session::new(ip.parse().unwrap(), 7, 1, 1).url;
+        assert_eq!(url("10.0.0.5"), "rtsp://10.0.0.5/7");
+        assert_eq!(url("fe80::1"), "rtsp://[fe80::1]/7");
+        assert_eq!(url("::ffff:10.0.0.5"), "rtsp://[::ffff:10.0.0.5]/7");
+    }
+
+    #[test]
     fn rtsp_requests() {
         let mut ch = Channel::new();
-        let mut s = Session::new("10.0.0.5", 1234, 0xAB, 99);
+        let mut s = Session::new(Ipv4Addr::new(10, 0, 0, 5).into(), 1234, 0xAB, 99);
         assert_eq!(s.url(), "rtsp://10.0.0.5/1234");
 
         assert_eq!(s.setup_events(&mut ch, &info()), 0);
@@ -342,7 +358,7 @@ mod tests {
     #[test]
     fn pairing_requests() {
         let mut ch = Channel::new();
-        let mut s = Session::new("h", 1, 1, 1);
+        let mut s = Session::new(Ipv4Addr::LOCALHOST.into(), 1, 1, 1);
         s.pair_pin_start(&mut ch, Some("Living Room Remote"));
         let m = sent(&mut ch);
         assert_eq!(m.uri(), Some("/pair-pin-start"));

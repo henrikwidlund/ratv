@@ -5,7 +5,7 @@ Rust library to control Apple TV devices on the local network.
 Protocols:
 
 - **Companion**: pairing, buttons, apps, power, volume, accounts, text input, touch,
-  what is playing (title, state, position, artwork).
+  what is playing (title, state, rate, position, duration, artwork, subtitle state).
 - **MRP over AirPlay 2**: what is playing (title, artist, position, state),
   artwork, playback, languages, chapters,
   Up Next, volume, output devices, Siri voice input.
@@ -30,7 +30,8 @@ No C dependencies.
 
 Minimum Rust version: 1.100.
 
-Tested on an Apple TV 4K (AppleTV6,2) with tvOS 26.6.1.
+Tested on an Apple TV 4K (AppleTV6,2) with tvOS 26.6.1 and an Apple TV 4K
+(AppleTV18,1) with tvOS 27.2.1.
 
 ## Usage
 
@@ -84,11 +85,11 @@ async fn control() -> Result<(), Box<dyn std::error::Error>> {
     tv.press(Key::Select).await?;
     tv.pause().await?;
     tv.launch_app("com.netflix.Netflix").await?;
-    if let Some(mut np) = tv.now_playing() {
-        np.changed().await?;
-        println!("{:?}", np.borrow().title);
-    }
-    // Returns when one connection closes. Close all, then connect again.
+    let mut np = tv.now_playing();
+    np.changed().await?;
+    println!("{:?}", np.borrow().title);
+    // Returns when one connection closes. Close all, then connect again,
+    // or use `connect_missing`.
     let reason = tv.closed().await;
     println!("closed: {reason:?}");
     tv.close().await?;
@@ -112,10 +113,14 @@ async fn ask_siri(tv: &ratv::AppleTv, packets: Vec<Vec<u8>>) -> Result<(), ratv:
 Siri uses Companion, as the iPhone remote does, and MRP if Companion is not
 connected. With feature `opus`, send 16-bit, 16 kHz, mono PCM in chunks of any
 size with `push_pcm` instead.
-`AppleTv` and the clients are cheap to clone, and `Siri` can move to another task.
+`AppleTv` and the clients are fast to clone, and `Siri` can move to another task.
 
 The TV closes an open Companion connection when a new one connects with the
 same credentials. Share one client with `clone()` instead of connecting again.
+When a call fails with an error where `Error::is_closed` is true, the
+connection is closed; connect again. With `AppleTv`, use `connect_missing`.
+`connect_missing` also adds a protocol that did not connect
+(`Error::NotConnected`).
 
 ## Networks
 
@@ -123,12 +128,23 @@ same credentials. Share one client with `clone()` instead of connecting again.
   subnets or VLANs, if an mDNS reflector forwards the multicast traffic.
 - If multicast is blocked, set `ScanOptions::targets` to the TV's address.
   The scan then asks the TV directly.
+- The default scan uses IPv4. A link-local IPv6 address (`fe80::`) needs the
+  scope id of its interface, and the scan learns it only over IPv6: set
+  `ScanOptions::bind` to an IPv6 address, for example `[::]:0`, and
+  `ScanOptions::targets` to `discovery::MDNS_IPV6` and `MDNS_PORT` with the
+  scope id of the interface, or to a link-local IPv6 address of the TV with
+  its scope id.
+  With `[::]:0`, IPv4 targets can stay in the list, if the system allows IPv4
+  on IPv6 sockets.
 - `discovery::scan_until` ends the scan when a test returns true, for
   example when the wanted device has answered. With multicast, `scan` waits
   for all of `ScanOptions::timeout`.
+- `ClientOptions::connect_timeout` limits each connect step (default:
+  `timeout`), and `timeout` limits each request after connect. Pairing uses
+  `PairOptions::timeout`.
 - `ClientOptions::stall_timeout` starts a connect again, one time, when a
   step gets no answer in that time. This helps when packets are lost, for
-  example right after the network comes up.
+  example right after the network is ready.
 
 ## App behavior
 

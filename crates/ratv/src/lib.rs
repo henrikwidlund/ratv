@@ -66,16 +66,50 @@ pub use options::{ClientOptions, PairOptions};
 #[cfg(all(feature = "companion", feature = "mrp"))]
 pub use siri::Siri;
 
-/// Checks a volume and limits it to 0.0 to 1.0.
+/// Checks a volume and limits it to 0.0 to 1.0. -0.0 becomes 0.0.
 #[cfg(any(feature = "companion", feature = "mrp"))]
 const fn volume_level(volume: f32) -> Result<f32, Error> {
     if volume.is_nan() {
         return Err(Error::InvalidArgument("volume"));
     }
-    Ok(volume.clamp(0.0, 1.0))
+    // `+ 0.0` turns -0.0 into 0.0.
+    Ok(volume.clamp(0.0, 1.0) + 0.0)
+}
+
+/// A receiver for `sender`. When the task that sends has ended, the
+/// receiver is closed.
+#[cfg(any(feature = "companion", feature = "mrp"))]
+fn subscribe<T: Clone>(
+    sender: &tokio::sync::broadcast::WeakSender<T>,
+) -> tokio::sync::broadcast::Receiver<T> {
+    sender
+        .upgrade()
+        .map_or_else(|| tokio::sync::broadcast::channel(1).1, |tx| tx.subscribe())
+}
+
+/// Checks that a number is finite.
+#[cfg(any(feature = "companion", feature = "mrp"))]
+const fn finite(value: f64, name: &'static str) -> Result<f64, Error> {
+    if !value.is_finite() {
+        return Err(Error::InvalidArgument(name));
+    }
+    Ok(value)
 }
 
 #[cfg(all(doctest, feature = "companion", feature = "mrp", feature = "discovery"))]
 #[doc = include_str!("../../../README.md")]
 struct ReadmeDoctests;
 pub use ratv_hap::{Credentials, ExposeSecret, SecretString};
+
+#[cfg(all(test, any(feature = "companion", feature = "mrp")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_level_limits() {
+        assert!(volume_level(f32::NAN).is_err());
+        assert_eq!(volume_level(2.0).unwrap(), 1.0);
+        assert_eq!(volume_level(f32::NEG_INFINITY).unwrap(), 0.0);
+        assert!(volume_level(-0.0).unwrap().is_sign_positive());
+    }
+}

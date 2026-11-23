@@ -1,28 +1,28 @@
 //! One handle for a device: Companion and MRP together.
 //!
-//! [`AppleTv::connect`] opens both protocols in parallel and keeps the ones
-//! that connect. [`AppleTv::connect_missing`] adds the others later. Each
+//! [`AppleTv::connect`] opens both protocols in parallel, returns when both
+//! have connected or failed, and keeps the ones that connect.
+//! [`AppleTv::connect_missing`] adds the others later. Each
 //! method uses the protocol that supports it:
 //!
 //! | Feature | Protocol |
 //! |---------|----------|
 //! | buttons | Companion, else MRP |
 //! | play, pause, next, previous, skip, fast forward, rewind | MRP, else Companion |
-//! | seek, stop, shuffle, repeat, speed, rating, like, languages, chapters, queue, now playing, artwork, volume state, mute | MRP |
+//! | seek, stop, shuffle, repeat, speed, rating, like, languages, chapters, queue, artwork, volume state, mute | MRP |
+//! | now playing | MRP, with Companion merged in, else Companion |
 //! | volume | MRP, else Companion |
 //! | power, apps, accounts, text input, swipe, tap | Companion |
 //! | Siri | Companion, else MRP |
 //!
 //! ```no_run
-//! # async fn run(device: ratv::discovery::Device, credentials: ratv::Credentials) -> Result<(), ratv::Error> {
-//! use ratv::{AppleTv, ClientOptions, Endpoints, Key};
+//! # async fn run(endpoints: ratv::Endpoints, credentials: ratv::Credentials) -> Result<(), ratv::Error> {
+//! use ratv::{AppleTv, ClientOptions, Key};
 //!
-//! let tv = AppleTv::connect(&Endpoints::from(&device), &credentials, &ClientOptions::default()).await?;
+//! let tv = AppleTv::connect(&endpoints, &credentials, &ClientOptions::default()).await?;
 //! tv.press(Key::Select).await?;
 //! tv.pause().await?;
-//! if let Some(np) = tv.now_playing() {
-//!     println!("{:?}", np.borrow().title);
-//! }
+//! println!("{:?}", tv.now_playing().borrow().title);
 //! # Ok(())
 //! # }
 //! ```
@@ -265,8 +265,11 @@ pub struct AppleTv {
     mrp: Option<mrp::Client>,
     connected_at: Instant,
     scrubs: Arc<Scrubs>,
-    /// Merged MRP and Companion now playing, while Companion is connected.
-    now_playing: Option<(watch::Receiver<NowPlaying>, Arc<now_playing::MergeTask>)>,
+    /// Now playing: merged when Companion connected, else from MRP. After
+    /// Companion closes, MRP data only.
+    now_playing: watch::Receiver<NowPlaying>,
+    /// Task that merges MRP and Companion now playing.
+    merge: Option<Arc<now_playing::MergeTask>>,
     /// Connect errors of the protocols that are not connected.
     companion_error: Option<Arc<Error>>,
     mrp_error: Option<Arc<Error>>,
@@ -275,9 +278,10 @@ pub struct AppleTv {
 impl AppleTv {
     /// Connects to all given endpoints in parallel.
     ///
-    /// Succeeds if at least one protocol connects. Fails with the first
-    /// error if none does. See [`connect_error`](Self::connect_error) for the
-    /// protocol that failed.
+    /// Succeeds if at least one protocol connects. Fails with the Companion
+    /// error, else the MRP error, if none does, or with
+    /// [`Error::NoEndpoints`] if no endpoint is given. On success, see
+    /// [`connect_error`](Self::connect_error) for the protocol that failed.
     pub async fn connect(
         endpoints: &Endpoints,
         credentials: &Credentials,
@@ -305,22 +309,33 @@ impl AppleTv {
     ///   again from the new handle. Receivers from `self` do not get data from
     ///   the added protocols. They stay open while their sender lives: an MRP
     ///   receiver until MRP closes, a merged one until all clones of `self`
-    ///   are dropped.
+    ///   are dropped or all its protocols have closed.
     ///
     /// A closed protocol that does not connect again is not in the new handle.
     ///
-    /// Returns `None` if all protocols are open. Fails with the first error
-    /// if no missing protocol connects. On success,
+    /// Returns `None` if all protocols are open. Fails with the Companion
+    /// error, else the MRP error, if no missing protocol connects, and with
+    /// [`Error::NoEndpoints`] if no missing protocol has an endpoint. On
+    /// failure, a protocol of `self` that closed is still in it, so
+    /// [`closed`](Self::closed) returns at once. A protocol that never
+    /// connected gives no event. Wait before trying again. On success,
     /// [`connect_error`](Self::connect_error) has the errors of the protocols
     /// that are still missing.
     ///
     /// ```no_run
     /// # async fn run(mut tv: ratv::AppleTv, endpoints: ratv::Endpoints, credentials: ratv::Credentials) -> Result<(), ratv::Error> {
-    /// use ratv::{ClientOptions, Protocol};
+    /// use ratv::{ClientOptions, Error, Protocol};
     ///
     /// if !tv.is_open(Protocol::Companion) || !tv.is_open(Protocol::Mrp) {
     ///     let options = ClientOptions::default();
-    ///     if let Some(new) = tv.connect_missing(&endpoints, &credentials, &options).await? {
+    ///     let result = tv.connect_missing(&endpoints, &credentials, &options).await;
+    ///     // The device does not offer the missing protocol: keep `tv`. If a
+    ///     // protocol closed, `closed()` returns at once, so wait before the
+    ///     // next try.
+    ///     if let Err(Error::NoEndpoints) = result {
+    ///         return Ok(());
+    ///     }
+    ///     if let Some(new) = result? {
     ///         // Not `tv.close()`: the old handle shares the open protocol.
     ///         tv = new;
     ///         // Get these again, and stop the tasks that use the old ones.
@@ -384,20 +399,25 @@ impl AppleTv {
         connected_at: Instant,
         scrubs: Arc<Scrubs>,
     ) -> Result<Self, Error> {
-        if companion.is_none() && mrp.is_none() {
-            return Err(first_error(companion_error, mrp_error));
-        }
-        let now_playing = companion.as_ref().map(|c| {
-            let (rx, task) =
-                now_playing::spawn(mrp.as_ref().map(mrp::Client::now_playing), c.now_playing());
-            (rx, Arc::new(task))
-        });
+        let (now_playing, merge) = match (&companion, &mrp) {
+            (Some(c), m) => {
+                let (rx, task) = now_playing::spawn(
+                    m.as_ref().map(mrp::Client::now_playing),
+                    c.now_playing(),
+                    c.now_playing_known(),
+                );
+                (rx, Some(Arc::new(task)))
+            }
+            (None, Some(m)) => (m.now_playing(), None),
+            (None, None) => return Err(first_error(companion_error, mrp_error)),
+        };
         Ok(Self {
             companion,
             mrp,
             connected_at,
             scrubs,
             now_playing,
+            merge,
             companion_error,
             mrp_error,
         })
@@ -442,13 +462,15 @@ impl AppleTv {
         }
     }
 
-    /// Companion client, if connected.
+    /// Companion client, if it connected. It may have closed since:
+    /// check with [`is_open`](Self::is_open).
     #[must_use]
     pub const fn companion(&self) -> Option<&companion::Client> {
         self.companion.as_ref()
     }
 
-    /// MRP client, if connected.
+    /// MRP client, if it connected. It may have closed since:
+    /// check with [`is_open`](Self::is_open).
     #[must_use]
     pub const fn mrp(&self) -> Option<&mrp::Client> {
         self.mrp.as_ref()
@@ -466,9 +488,9 @@ impl AppleTv {
 
     /// Picks the client for a call that Companion does with `a` and MRP with `b`.
     ///
-    /// An open connection wins over a closed one. If both are open or both
+    /// An open connection is used before a closed one. If both are open or both
     /// are closed, MRP is used when `prefer_mrp` is true. A closed client
-    /// returns [`Error::Disconnected`].
+    /// returns [`Error::Closed`].
     fn route<A, B>(&self, prefer_mrp: bool, a: Option<A>, b: Option<B>) -> Option<Route<'_, A, B>> {
         let c = self.companion.as_ref().zip(a);
         let m = self.mrp.as_ref().zip(b);
@@ -503,18 +525,25 @@ impl AppleTv {
     ///
     /// MRP data. With Companion, state and position change about 0.5 s
     /// sooner, and [`NowPlaying::artwork_data`] and
-    /// [`NowPlaying::captions_enabled`] are set. Without MRP, only the
-    /// Companion data: title, state, position and artwork, and the app only
-    /// for the Apple TV app.
+    /// [`NowPlaying::captions_enabled`] are set when both name the same item.
+    /// Without MRP, only the
+    /// Companion data: title, state, rate, position, duration, artwork and
+    /// subtitle state, and the app only for the Apple TV app. With both, the
+    /// app is cleared after Home when MRP has no title and Companion says
+    /// that nothing plays. A first value that is not empty counts as a
+    /// change. When MRP closes, only the Companion data stays; when Companion
+    /// closes, only the MRP data. When all its protocols have closed, the
+    /// receiver keeps the last value and closes. A merged receiver also
+    /// closes when all clones of this handle are dropped. Keep each
+    /// `borrow()` short, and do not borrow another now playing receiver
+    /// while you hold one: the merge reads them while it writes this one.
     #[must_use]
-    pub fn now_playing(&self) -> Option<watch::Receiver<NowPlaying>> {
-        self.now_playing
-            .as_ref()
-            .map(|(rx, _)| rx.clone())
-            .or_else(|| self.mrp.as_ref().map(mrp::Client::now_playing))
+    pub fn now_playing(&self) -> watch::Receiver<NowPlaying> {
+        self.now_playing.clone()
     }
 
-    /// Volume and mute state. Needs MRP.
+    /// Volume and mute state. Needs MRP. After MRP closes, it keeps the last
+    /// value and closes.
     #[must_use]
     pub fn volume(&self) -> Option<watch::Receiver<mrp::Volume>> {
         self.mrp.as_ref().map(mrp::Client::volume)
@@ -526,7 +555,7 @@ impl AppleTv {
     }
 
     /// Presses and releases a key.
-    /// Over MRP the device does not answer, so `Ok` only means that the message was sent.
+    /// Over MRP the device does not answer, so `Ok` only means that the message was queued.
     pub async fn press(&self, key: Key) -> Result<(), Error> {
         match self.key_route(key)? {
             Route::Companion(c, hid) => c.press(hid).await,
@@ -535,7 +564,9 @@ impl AppleTv {
     }
 
     /// Presses and releases a key two times fast.
-    /// Over MRP the device does not answer, so `Ok` only means that the message was sent.
+    /// Over MRP the device does not answer, so `Ok` only means that the message was queued.
+    /// When it fails, some of its 4 messages can still be sent, also with an
+    /// error where [`Error::is_not_sent`] is true.
     pub async fn double_tap(&self, key: Key) -> Result<(), Error> {
         match self.key_route(key)? {
             Route::Companion(c, hid) => c.double_tap(hid).await,
@@ -560,7 +591,7 @@ impl AppleTv {
 
     /// Holds a key for `duration`. The key is released also if the
     /// returned future is dropped.
-    /// Over MRP the device does not answer, so `Ok` only means that the message was sent.
+    /// Over MRP the device does not answer, so `Ok` only means that the message was queued.
     pub async fn hold(&self, key: Key, duration: Duration) -> Result<(), Error> {
         match self.key_route(key)? {
             Route::Companion(c, hid) => c.hold(hid, duration).await,
@@ -569,7 +600,7 @@ impl AppleTv {
     }
 
     /// Sends a key down or up event.
-    /// Over MRP the device does not answer, so `Ok` only means that the message was sent.
+    /// Over MRP the device does not answer, so `Ok` only means that the message was queued.
     pub async fn key(&self, key: Key, down: bool) -> Result<(), Error> {
         match self.key_route(key)? {
             Route::Companion(c, hid) => {
@@ -621,9 +652,10 @@ impl AppleTv {
     /// True if playing, false if paused or stopped, `None` if not known.
     /// Uses the merged state, which changes sooner than the MRP state.
     fn playing(&self) -> Option<bool> {
-        let state = match &self.now_playing {
-            Some((rx, _)) => rx.borrow().state,
-            None => self.with_now_playing(|np| np.state).flatten(),
+        let state = if self.merge.is_some() {
+            self.now_playing.borrow().state
+        } else {
+            self.with_now_playing(|np| np.state).flatten()
         };
         match state? {
             PlaybackState::Playing => Some(true),
@@ -667,7 +699,8 @@ impl AppleTv {
         }
     }
 
-    /// Starts playback.
+    /// Starts playback. When the app does not list Play and the device
+    /// already plays, this sends nothing.
     pub async fn play(&self) -> Result<(), Error> {
         self.wait_for_state().await;
         if self.support(Command::Play) == Support::No {
@@ -680,7 +713,8 @@ impl AppleTv {
             .await
     }
 
-    /// Pauses playback.
+    /// Pauses playback. When the app does not list Pause and the device is
+    /// already paused or stopped, this sends nothing.
     pub async fn pause(&self) -> Result<(), Error> {
         self.wait_for_state().await;
         if self.support(Command::Pause) == Support::No {
@@ -696,7 +730,8 @@ impl AppleTv {
     /// Toggles play and pause.
     pub async fn play_pause(&self) -> Result<(), Error> {
         self.wait_for_state().await;
-        if self.support(Command::TogglePlayPause) == Support::No {
+        let support = self.support(Command::TogglePlayPause);
+        if support == Support::No {
             let command = match self.playing() {
                 Some(true) => Command::Pause,
                 _ => Command::Play,
@@ -706,10 +741,20 @@ impl AppleTv {
             }
             return self.press(Key::PlayPause).await;
         }
-        let support = self.support(Command::TogglePlayPause);
         match self.media_route(support, Some(HidCommand::PlayPause))? {
             Route::Companion(c, hid) => c.press(hid).await,
-            Route::Mrp(m, ()) => m.command(Command::TogglePlayPause).await,
+            Route::Mrp(m, ()) => {
+                let result = m.command(Command::TogglePlayPause).await;
+                // Right after connect the command list may not be known yet,
+                // as in `playback`.
+                if support == Support::Unknown
+                    && is_unsupported(&result)
+                    && let Some(c) = self.open_companion()
+                {
+                    return c.press(HidCommand::PlayPause).await;
+                }
+                result
+            }
         }
     }
 
@@ -734,21 +779,29 @@ impl AppleTv {
         self.playback(Command::Stop, Command::Stop, None).await
     }
 
-    /// Seeks to `position` seconds. Needs MRP.
+    /// Seeks to `position` seconds. Needs MRP. A position that is not finite
+    /// gives [`Error::InvalidArgument`].
     pub async fn seek(&self, position: f64) -> Result<(), Error> {
+        crate::finite(position, "position")?;
         self.need_mrp()?.seek(position).await
     }
 
     /// Skips `seconds` forward, or backward if negative.
     /// Seeks instead if the app supports seeking but not skipping.
+    /// A value that is not finite, or too large for a 32-bit float, gives
+    /// [`Error::InvalidArgument`].
     pub async fn skip(&self, seconds: f64) -> Result<(), Error> {
+        // MRP sends a 32-bit float. Checked here, so all ways behave the same.
+        #[allow(clippy::cast_possible_truncation)]
+        crate::finite(f64::from(seconds as f32), "seconds")?;
         self.wait_for_state().await;
         let check = if seconds < 0.0 {
             Command::SkipBackward
         } else {
             Command::SkipForward
         };
-        if self.support(check) == Support::No
+        let support = self.support(check);
+        if support == Support::No
             && self.support(Command::SeekToPlaybackPosition) == Support::Yes
             && let Some(pos) = self
                 .with_now_playing(|np| np.position(mrp::cocoa_time(SystemTime::now())))
@@ -756,9 +809,20 @@ impl AppleTv {
         {
             return self.seek((pos + seconds).max(0.0)).await;
         }
-        match self.media_route(self.support(check), Some(MediaControl::SkipBy(seconds)))? {
+        match self.media_route(support, Some(MediaControl::SkipBy(seconds)))? {
             Route::Companion(c, f) => c.media(f).await,
-            Route::Mrp(m, ()) => m.skip(seconds).await,
+            Route::Mrp(m, ()) => {
+                let result = m.skip(seconds).await;
+                // Right after connect the command list may not be known yet,
+                // as in `playback`.
+                if support == Support::Unknown
+                    && is_unsupported(&result)
+                    && let Some(c) = self.open_companion()
+                {
+                    return c.media(MediaControl::SkipBy(seconds)).await;
+                }
+                result
+            }
         }
     }
 
@@ -766,7 +830,8 @@ impl AppleTv {
     ///
     /// Skips forward instead if the app supports skipping but not fast forward,
     /// or if fast forward is known not to work in the app. The skip uses
-    /// [`NowPlaying::skip_forward_interval`], else 10 s.
+    /// [`NowPlaying::skip_forward_interval`], else 10 s. Do not call the
+    /// begin and end of one direction at the same time.
     pub async fn begin_fast_forward(&self) -> Result<(), Error> {
         self.begin_scrub(
             Command::BeginFastForward,
@@ -776,8 +841,9 @@ impl AppleTv {
         .await
     }
 
-    /// Stops fast forward. Does nothing if [`begin_fast_forward`](Self::begin_fast_forward)
-    /// skipped instead.
+    /// Stops fast forward. Does nothing if
+    /// [`begin_fast_forward`](Self::begin_fast_forward) skipped instead, also
+    /// when the connection closed since.
     pub async fn end_fast_forward(&self) -> Result<(), Error> {
         self.end_scrub(
             Command::BeginFastForward,
@@ -796,7 +862,8 @@ impl AppleTv {
             .await
     }
 
-    /// Stops rewind. Does nothing if [`begin_rewind`](Self::begin_rewind) skipped instead.
+    /// Stops rewind. Does nothing if [`begin_rewind`](Self::begin_rewind)
+    /// skipped instead, also when the connection closed since.
     pub async fn end_rewind(&self) -> Result<(), Error> {
         self.end_scrub(
             Command::BeginRewind,
@@ -829,7 +896,10 @@ impl AppleTv {
             } else {
                 np.skip_backward_interval
             };
-            let seconds = interval.filter(|s| *s > 0.0).unwrap_or(SCRUB_SKIP);
+            // `skip` takes only values that fit in an f32.
+            let seconds = interval
+                .filter(|s| *s > 0.0 && *s <= f64::from(f32::MAX))
+                .unwrap_or(SCRUB_SKIP);
             Some(if forward { seconds } else { -seconds })
         })
         .flatten()
@@ -841,25 +911,34 @@ impl AppleTv {
         fallback: MediaControl,
         forward: bool,
     ) -> Result<(), Error> {
+        // Set before the first wait, so a canceled call leaves no old state.
+        // Each state is set only after its command worked.
+        self.scrubs.set(forward, Scrubs::UNKNOWN);
         self.wait_for_state().await;
         if let Some(s) = self.skip_instead(begin, forward) {
-            self.scrubs.set(forward, Scrubs::SKIPPED);
-            return self.skip(s).await;
+            return self.scrub_skip(forward, s).await;
         }
         let result = self.playback(begin, begin, Some(fallback)).await;
         // The command list may have arrived while waiting for the answer.
         if is_unsupported(&result)
             && let Some(s) = self.skip_instead(begin, forward)
         {
-            self.scrubs.set(forward, Scrubs::SKIPPED);
-            return self.skip(s).await;
+            return self.scrub_skip(forward, s).await;
         }
-        let state = if result.is_ok() {
-            Scrubs::STARTED
-        } else {
-            Scrubs::UNKNOWN
-        };
-        self.scrubs.set(forward, state);
+        if result.is_ok() {
+            self.scrubs.set(forward, Scrubs::STARTED);
+        }
+        result
+    }
+
+    /// Skips instead of a scrub. After a failed skip the state stays
+    /// unknown, so the next end checks again. Then the next end does not
+    /// return `Ok` when the connection is closed.
+    async fn scrub_skip(&self, forward: bool, seconds: f64) -> Result<(), Error> {
+        let result = self.skip(seconds).await;
+        if result.is_ok() {
+            self.scrubs.set(forward, Scrubs::SKIPPED);
+        }
         result
     }
 
@@ -909,12 +988,18 @@ impl AppleTv {
 
     /// Next chapter. Needs MRP. See [`NowPlaying::chapters`], which is filled shortly
     /// after the item starts.
+    /// Fails with [`Error::NoChapter`] if the app does not support the
+    /// command and no position or no target chapter start is known, and with [`Error::Closed`] when
+    /// MRP is closed.
     pub async fn next_chapter(&self) -> Result<(), Error> {
         self.chapter(Command::NextChapter, NowPlaying::next_chapter_start)
             .await
     }
 
     /// Start of the current chapter, or the previous chapter in the first 3 s. Needs MRP.
+    /// Fails with [`Error::NoChapter`] if the app does not support the
+    /// command and no position or no target chapter start is known, and with [`Error::Closed`] when
+    /// MRP is closed.
     pub async fn previous_chapter(&self) -> Result<(), Error> {
         self.chapter(Command::PreviousChapter, |np, pos| {
             // Before the first chapter start, go to the start of the item.
@@ -932,6 +1017,10 @@ impl AppleTv {
     ) -> Result<(), Error> {
         self.wait_for_state().await;
         let m = self.need_mrp()?;
+        // The last value of a closed connection would give `NoChapter`.
+        if !m.is_connected() {
+            return Err(Error::Closed);
+        }
         let start = {
             let np = m.now_playing();
             let np = np.borrow();
@@ -965,6 +1054,11 @@ impl AppleTv {
     /// Uses Companion, as the iPhone remote does, else MRP. Siri must be on
     /// in the device settings, see [`siri_enabled`](Self::siri_enabled). To choose, use
     /// [`companion::Client::start_siri`] or [`mrp::Client::start_siri`].
+    /// Fails with [`Error::SiriActive`] while another [`Siri`] on the same
+    /// protocol exists, over
+    /// Companion with [`Error::SiriDisabled`] if Siri is off, and with
+    /// [`Error::Closed`] if the protocol it uses is closed. Over MRP, audio is
+    /// kept until the device records, see [`Error::SiriNotRecording`].
     pub async fn start_siri(&self) -> Result<Siri, Error> {
         match self.route(false, Some(()), Some(())) {
             Some(Route::Companion(c, ())) => c
@@ -987,9 +1081,11 @@ impl AppleTv {
     }
 
     /// Sets the volume, 0.0 to 1.0. Fails with [`Error::VolumeNotAvailable`] if MRP
-    /// reports that the device cannot change it.
-    /// Over MRP the device does not answer, so `Ok` only means that the message was sent.
+    /// reports that the device cannot change it. NaN gives
+    /// [`Error::InvalidArgument`]; other values are limited to 0.0 to 1.0.
+    /// Over MRP the device does not answer, so `Ok` only means that the message was queued.
     pub async fn set_volume(&self, volume: f32) -> Result<(), Error> {
+        crate::volume_level(volume)?;
         self.check_volume().await?;
         match self
             .route(true, Some(()), Some(()))
@@ -1001,13 +1097,17 @@ impl AppleTv {
     }
 
     /// Sets the playback rate, 1.0 is normal speed. Needs MRP.
-    /// See [`NowPlaying::playback_speeds`].
+    /// See [`NowPlaying::playback_speeds`]. A rate that is not finite gives
+    /// [`Error::InvalidArgument`].
     pub async fn set_playback_rate(&self, rate: f32) -> Result<(), Error> {
+        crate::finite(f64::from(rate), "rate")?;
         self.need_mrp()?.set_playback_rate(rate).await
     }
 
     /// Rates the current item. Needs MRP. See [`NowPlaying::rating_range`].
+    /// A rating that is not finite gives [`Error::InvalidArgument`].
     pub async fn set_rating(&self, rating: f32) -> Result<(), Error> {
+        crate::finite(f64::from(rating), "rating")?;
         self.need_mrp()?.set_rating(rating).await
     }
 
@@ -1023,7 +1123,7 @@ impl AppleTv {
 
     /// Mutes or unmutes the device. Needs MRP. Fails with [`Error::VolumeNotAvailable`]
     /// if the device cannot change the volume.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn set_muted(&self, muted: bool) -> Result<(), Error> {
         self.check_volume().await?;
         self.need_mrp()?.set_muted(muted).await
@@ -1039,7 +1139,9 @@ impl AppleTv {
         if let Some(left) = STATE_WAIT.checked_sub(self.connected_at.elapsed()) {
             let _ = tokio::time::timeout(left, volume.wait_for(|v| v.available.is_some())).await;
         }
-        if volume.borrow().available == Some(false) {
+        // MRP can close while this waits. Then `route` picks Companion, or MRP
+        // gives `Closed`.
+        if m.is_connected() && volume.borrow().available == Some(false) {
             return Err(Error::VolumeNotAvailable);
         }
         Ok(())
@@ -1082,7 +1184,7 @@ impl AppleTv {
 
     /// Swipes from `from` to `to` in about `duration`. Coordinates range from 0.0 to 1.0.
     /// Needs Companion.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn swipe(
         &self,
         from: (f64, f64),
@@ -1093,7 +1195,7 @@ impl AppleTv {
     }
 
     /// Taps at `x`, `y` without a click. Coordinates range from 0.0 to 1.0. Needs Companion.
-    /// The device does not answer, so `Ok` only means that the message was sent.
+    /// The device does not answer, so `Ok` only means that the message was queued.
     pub async fn tap(&self, x: f64, y: f64) -> Result<(), Error> {
         self.need_companion()?.tap(x, y).await
     }
@@ -1103,22 +1205,28 @@ impl AppleTv {
         self.need_companion()?.text().await
     }
 
-    /// Replaces the text of the focused text field. Needs Companion.
+    /// Replaces the text of the focused text field. Needs Companion. Fails with
+    /// [`Error::NoTextField`] if no text field has focus.
     pub async fn set_text(&self, text: &str) -> Result<(), Error> {
         self.need_companion()?.set_text(text).await
     }
 
-    /// Adds text at the cursor of the focused text field. Needs Companion.
+    /// Adds text at the cursor of the focused text field. Needs Companion. Fails with
+    /// [`Error::NoTextField`] if no text field has focus.
     pub async fn append_text(&self, text: &str) -> Result<(), Error> {
         self.need_companion()?.append_text(text).await
     }
 
-    /// Removes all text of the focused text field. Needs Companion.
+    /// Removes all text of the focused text field. Needs Companion. Fails with
+    /// [`Error::NoTextField`] if no text field has focus.
     pub async fn clear_text(&self) -> Result<(), Error> {
         self.need_companion()?.clear_text().await
     }
 
-    /// Closes all connections.
+    /// Closes all connections. When the device does not read, this can take
+    /// as long as the slower client close, see
+    /// [`companion::Client::close`](crate::companion::Client::close) and
+    /// [`mrp::Client::close`](crate::mrp::Client::close).
     pub async fn close(&self) -> Result<(), Error> {
         let (a, b) = tokio::join!(
             async {
@@ -1137,18 +1245,20 @@ impl AppleTv {
         a.and(b)
     }
 
-    /// True if Siri is on in the device settings.
-    /// `None` without Companion or if the device does not say.
+    /// True if Siri is on in the device settings. Only Companion sends this.
+    /// `None` without an open Companion connection or if the device does not
+    /// say. [`start_siri`](Self::start_siri) can still use MRP.
     #[must_use]
     pub fn siri_enabled(&self) -> Option<bool> {
-        self.companion.as_ref()?.siri_enabled()
+        self.open_companion()?.siri_enabled()
     }
 
-    /// True if the Guide button does something on the current screen.
-    /// `None` without Companion or if the device did not say.
+    /// True if the Guide button does something on the current screen. Only
+    /// Companion sends this. `None` without an open Companion connection or if
+    /// the device did not say.
     #[must_use]
     pub fn guide_supported(&self) -> Option<bool> {
-        self.companion.as_ref()?.guide_supported()
+        self.open_companion()?.guide_supported()
     }
 
     /// True until one of the connected protocols closes.
@@ -1161,11 +1271,17 @@ impl AppleTv {
     }
 
     /// Waits until one of the connected protocols closes. Returns the error
-    /// that closed it, or `None` after [`close`](Self::close).
+    /// that closed it, or `None` after [`close`](Self::close). After `close`,
+    /// a write error or [`Error::NoAnswer`] can still be returned when the
+    /// device did not read, [`Error::Disconnected`] when the device closed
+    /// the connection first, or the error of a protocol that closed before
+    /// `close`. Returns at once when a protocol is already closed.
     ///
     /// The other protocol stays connected. To get all protocols back, call
     /// [`connect_missing`](Self::connect_missing), or call
-    /// [`close`](Self::close) or drop all clones, then connect again.
+    /// [`close`](Self::close) or drop all clones, then connect again. If
+    /// `connect_missing` fails, this handle still has the closed protocol, so
+    /// wait before trying again.
     pub async fn closed(&self) -> Option<Arc<Error>> {
         let companion = async {
             match &self.companion {
