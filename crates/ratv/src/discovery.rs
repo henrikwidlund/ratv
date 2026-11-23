@@ -46,7 +46,7 @@ pub struct ScanOptions {
     /// devices answer by multicast, which this socket does not get. For a
     /// link-local IPv6 address, set the scope id of the interface. The IPv6
     /// address `[::]` also sends to IPv4 targets, if the system allows IPv4
-    /// on IPv6 sockets.
+    /// on IPv6 sockets. A specific IPv6 address sends only to IPv6 targets.
     pub bind: SocketAddr,
     /// Service types to look for.
     pub services: Vec<ServiceKind>,
@@ -248,9 +248,11 @@ mod tests {
 
     use super::*;
 
-    /// An IPv6 socket also takes IPv4, so IPv4 targets can be sent to. Only
-    /// Windows makes IPv6 sockets IPv6-only by default.
-    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    /// `bind` turns off IPv6-only, so a socket bound to `[::]` can also send to
+    /// IPv4. Only Windows makes IPv6 sockets IPv6-only by default. Not on Linux:
+    /// it makes a socket bound to a specific IPv6 address, such as `[::1]`,
+    /// IPv6-only.
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn ipv6_socket_takes_ipv4() {
         let Ok(socket) = bind("[::1]:0".parse().unwrap()) else {
