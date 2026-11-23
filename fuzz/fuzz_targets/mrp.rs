@@ -42,6 +42,9 @@ fuzz_target!(|data: &[u8]| {
                 );
             }
             assert!(np.rate.is_none_or(f32::is_finite));
+            // Current automatic subtitles are always in the list.
+            let subtitles = &np.subtitle_languages;
+            assert!(!np.subtitles_auto() || subtitles.iter().any(|o| o.is_auto()));
             assert!(np.chapters.iter().all(|c| c.duration.is_none_or(|d| d >= 0.0)));
             // Normal speeds: sorted, above 0 and up to 2.0, with 1.0.
             let speeds = np.playback_speeds();

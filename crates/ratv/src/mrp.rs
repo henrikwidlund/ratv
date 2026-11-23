@@ -1031,7 +1031,8 @@ impl Client {
         self.run_command(&messages::enable_language(option)).await
     }
 
-    /// Turns off a language. Use it with [`NowPlaying::subtitle_language`] to turn off subtitles.
+    /// Turns off a language. To turn off subtitles, use [`disable_subtitles`](Self::disable_subtitles),
+    /// which also works when subtitles are automatic.
     pub async fn disable_language(&self, option: &LanguageOption) -> Result<(), Error> {
         self.run_command(&messages::disable_language(option)).await
     }

@@ -1044,7 +1044,8 @@ impl AppleTv {
         self.need_mrp()?.enable_language(option).await
     }
 
-    /// Turns off a language, for example [`NowPlaying::subtitle_language`]. Needs MRP.
+    /// Turns off a language. Needs MRP. To turn off subtitles, use
+    /// [`disable_subtitles`](Self::disable_subtitles), which also works when subtitles are automatic.
     pub async fn disable_language(&self, option: &LanguageOption) -> Result<(), Error> {
         self.need_mrp()?.disable_language(option).await
     }

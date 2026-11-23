@@ -165,7 +165,8 @@ fn feedback(command: Command, active: bool) -> SendCommandMessage {
     command_with(command, options)
 }
 
-/// Turns on an audio or subtitle language from `ContentItem::available_language_options`.
+/// Turns on an audio or subtitle language from `ContentItem::available_language_options`
+/// or from the language lists of `NowPlaying`.
 #[must_use]
 pub fn enable_language(option: &LanguageOption) -> SendCommandMessage {
     language(Command::EnableLanguageOption, option)
@@ -177,8 +178,9 @@ pub fn disable_language(option: &LanguageOption) -> SendCommandMessage {
     language(Command::DisableLanguageOption, option)
 }
 
-/// Turns off subtitles when the current subtitle is not known.
-/// The device may show another subtitle instead; prefer [`disable_language`] with the current one.
+/// Turns off subtitles when the current subtitle is not known or is automatic.
+/// The device may show another subtitle instead. Otherwise prefer
+/// [`disable_language`] with the current one.
 #[must_use]
 pub fn disable_subtitles() -> SendCommandMessage {
     let option = LanguageOption {

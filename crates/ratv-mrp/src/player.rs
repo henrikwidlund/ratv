@@ -157,7 +157,10 @@ pub struct NowPlaying {
     pub description: Option<String>,
     /// Audio languages of the item.
     pub audio_languages: Vec<LanguageOption>,
-    /// Subtitle languages of the item.
+    /// Subtitle languages of the item. If automatic subtitles are current and
+    /// the device lists no automatic option, the current option is added at
+    /// the end, see [`subtitles_auto`](Self::subtitles_auto). This extra entry
+    /// is removed when automatic subtitles are no longer current.
     pub subtitle_languages: Vec<LanguageOption>,
     /// Current audio language.
     pub audio_language: Option<LanguageOption>,
@@ -910,6 +913,12 @@ fn copy_item(item: &ContentItem, np: &mut NowPlaying) {
         };
         *current = Some(option.clone());
     }
+    // The device does not always list the automatic option, even when it is current.
+    if let Some(auto) = np.subtitle_language.as_ref().filter(|o| o.is_auto())
+        && !np.subtitle_languages.iter().any(LanguageOption::is_auto)
+    {
+        np.subtitle_languages.push(auto.clone());
+    }
     np.chapters = item
         .sections
         .iter()
@@ -1490,6 +1499,60 @@ mod tests {
         assert_eq!(np.up_next, []);
         assert_eq!(np.audio_languages, []);
         assert_eq!(s.item_id(), Some("b"));
+    }
+
+    #[test]
+    fn current_auto_subtitles_listed() {
+        let sv = language(LanguageType::Legible, "sv");
+        let auto = language(LanguageType::Legible, AUTO_LANGUAGE);
+        let mut s = NowPlayingState::new();
+        set_client(&mut s, "com.apple.TVMusic");
+        let mut msg = playing();
+        let current = &mut msg.playback_queue.as_mut().unwrap().content_items[0];
+        current.available_language_options = vec![proto::LanguageOptionGroup {
+            language_options: vec![sv.clone()],
+            ..Default::default()
+        }];
+        current.current_language_options = vec![auto.clone()];
+        assert!(s.apply(&env(&msg)).unwrap());
+        let on = s.now_playing();
+        assert_eq!(on.subtitle_languages, [sv.clone(), auto.clone()]);
+
+        // Another current option removes the extra entry, so the snapshot differs.
+        let update = |options: Vec<LanguageOption>| UpdateContentItemMessage {
+            player_path: path("com.apple.TVMusic", None),
+            content_items: vec![ContentItem {
+                identifier: Some("a".into()),
+                current_language_options: options,
+                ..Default::default()
+            }],
+        };
+        s.apply(&env(&update(vec![sv.clone()]))).unwrap();
+        let off = s.now_playing();
+        assert_eq!(off.subtitle_languages, std::slice::from_ref(&sv));
+        assert_ne!(off, on);
+        s.apply(&env(&update(vec![auto.clone()]))).unwrap();
+        assert_eq!(s.now_playing(), on);
+
+        // Not added when the device lists an automatic option.
+        let mut np = NowPlaying::default();
+        let mut item = item("a", "Movie");
+        item.available_language_options = vec![proto::LanguageOptionGroup {
+            language_options: vec![auto.clone(), sv.clone()],
+            ..Default::default()
+        }];
+        item.current_language_options = vec![auto.clone()];
+        copy_item(&item, &mut np);
+        assert_eq!(np.subtitle_languages, [auto, sv]);
+        // Not added for an automatic audio option.
+        let mut np = NowPlaying::default();
+        let audio = language(LanguageType::Audible, AUTO_LANGUAGE);
+        item.available_language_options.clear();
+        item.current_language_options = vec![audio.clone()];
+        copy_item(&item, &mut np);
+        assert_eq!(np.subtitle_languages, []);
+        assert_eq!(np.audio_languages, []);
+        assert_eq!(np.audio_language, Some(audio));
     }
 
     #[test]
