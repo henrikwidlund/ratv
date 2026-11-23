@@ -135,6 +135,33 @@ impl Error {
         matches!(self, Self::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused)
     }
 
+    /// True if the device got a request and answered with an error, for
+    /// example because the app has no handler for a command. Companion connect
+    /// also returns it if the device rejects the system info or session start
+    /// request. Pairing errors are not included.
+    #[must_use]
+    pub const fn is_rejected(&self) -> bool {
+        match self {
+            #[cfg(feature = "companion")]
+            Self::Companion(ratv_companion::Error::Device { .. }) => true,
+            #[cfg(feature = "mrp")]
+            Self::Mrp(ratv_mrp::Error::Device { .. }) | Self::CommandFailed { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// True if a Companion message was too large. From a call on an open
+    /// connection: our message, for example a very long text or URL. Nothing was
+    /// sent and the connection stays open. From `closed`: a frame from the device.
+    #[must_use]
+    pub const fn is_too_large(&self) -> bool {
+        match self {
+            #[cfg(feature = "companion")]
+            Self::Companion(ratv_companion::Error::FrameTooLarge(_)) => true,
+            _ => false,
+        }
+    }
+
     /// True if the device rejected the credentials, or the PIN while pairing.
     /// After a failed connect, pair again to fix it.
     #[must_use]
@@ -175,6 +202,42 @@ mod tests {
         );
         assert!(!Error::Hap(ratv_hap::Error::Decrypt).is_auth());
         assert!(!Error::Timeout.is_auth());
+    }
+
+    #[test]
+    fn is_rejected() {
+        assert!(!Error::Disconnected.is_rejected());
+        assert!(!Error::NoAnswer("x").is_rejected());
+        #[cfg(feature = "companion")]
+        {
+            let device = ratv_companion::Error::Device {
+                code: 1,
+                domain: String::new(),
+                message: String::new(),
+            };
+            assert!(Error::Companion(device).is_rejected());
+            assert!(!Error::Companion(ratv_companion::Error::FrameTooLarge(1)).is_rejected());
+        }
+        #[cfg(feature = "mrp")]
+        {
+            let device = ratv_mrp::Error::Device {
+                code: 1,
+                description: String::new(),
+            };
+            assert!(Error::Mrp(device).is_rejected());
+            let failed = Error::CommandFailed {
+                send_error: 0,
+                handler_status: 404,
+            };
+            assert!(failed.is_rejected());
+        }
+    }
+
+    #[test]
+    fn is_too_large() {
+        assert!(!Error::QueueFull.is_too_large());
+        #[cfg(feature = "companion")]
+        assert!(Error::Companion(ratv_companion::Error::FrameTooLarge(1)).is_too_large());
     }
 
     #[test]

@@ -18,6 +18,12 @@ pub(crate) const READ_CHUNK: usize = 4096;
 /// Time to send TEARDOWN. The response is not awaited.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// `addr` with another port. Keeps the IPv6 zone, unlike `SocketAddr::new`.
+const fn with_port(mut addr: SocketAddr, port: u16) -> SocketAddr {
+    addr.set_port(port);
+    addr
+}
+
 /// Identity sent in the events SETUP.
 pub(crate) struct Identity<'a> {
     pub(crate) name: &'a str,
@@ -82,7 +88,7 @@ pub(crate) async fn connect(
         let event_port = rtsp::event_port(&resp)?;
         tracing::debug!(event_port, "event SETUP done");
 
-        let mut events = tcp::connect(SocketAddr::new(addr.ip(), event_port), timeout).await?;
+        let mut events = tcp::connect(with_port(addr, event_port), timeout).await?;
         let mut event_channel = Channel::new();
         event_channel.enable_encryption(keys::events(&secret, Side::Client));
 
@@ -113,7 +119,7 @@ pub(crate) async fn connect(
         let (data_port, _) = rtsp::data_stream_port(&resp)?;
         tracing::debug!(data_port, "RECORD and data stream SETUP done");
 
-        let data = tcp::connect(SocketAddr::new(addr.ip(), data_port), timeout).await?;
+        let data = tcp::connect(with_port(addr, data_port), timeout).await?;
         let stream = DataStream::new(
             keys::data_stream(&secret, seed, Side::Client),
             0x1_0000_0000 | u64::from(rng::u32()),
@@ -218,4 +224,30 @@ pub(crate) async fn acknowledge_events(
         event_channel.acknowledge(&req);
     }
     flush(events, event_channel).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv6Addr, SocketAddrV6};
+
+    use super::*;
+
+    #[test]
+    fn with_port_keeps_zone() {
+        let addr = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            7000,
+            0,
+            4,
+        ));
+        let SocketAddr::V6(v6) = with_port(addr, 51234) else {
+            panic!("not IPv6");
+        };
+        assert_eq!((v6.port(), v6.scope_id()), (51234, 4));
+        let v4 = SocketAddr::from(([10, 0, 0, 1], 7000));
+        assert_eq!(
+            with_port(v4, 51234),
+            SocketAddr::from(([10, 0, 0, 1], 51234))
+        );
+    }
 }
