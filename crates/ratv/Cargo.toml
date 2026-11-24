@@ -12,8 +12,15 @@ categories = ["network-programming", "api-bindings"]
 
 [features]
 default = ["companion", "discovery", "mrp"]
-companion = ["dep:bytes", "dep:getrandom", "dep:rand_core", "dep:ratv-companion", "dep:socket2"]
-discovery = ["dep:ratv-discovery", "dep:socket2"]
+companion = [
+    "dep:bytes",
+    "dep:getrandom",
+    "dep:rand_core",
+    "dep:ratv-companion",
+    "dep:socket2",
+    "dep:tracing",
+]
+discovery = ["dep:ratv-discovery", "dep:socket2", "dep:tracing"]
 mrp = [
     "dep:bytes",
     "dep:getrandom",
@@ -22,6 +29,7 @@ mrp = [
     "dep:ratv-codec",
     "dep:ratv-mrp",
     "dep:socket2",
+    "dep:tracing",
 ]
 # Siri voice input from PCM.
 opus = ["mrp", "ratv-mrp/opus"]
@@ -41,7 +49,7 @@ thiserror.workspace = true
 tokio = { version = "1.44", default-features = false, features = ["net", "io-util", "sync", "time", "rt", "macros"] }
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
 rand_core = { workspace = true, optional = true }
-tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 socket2 = { version = "0.6.5", features = ["all"], optional = true }
 
 [dev-dependencies]
