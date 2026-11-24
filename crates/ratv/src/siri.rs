@@ -71,6 +71,11 @@ impl Siri {
     /// this does not fail with [`Error::Closed`], see
     /// [`companion::Siri::finish`](crate::companion::Siri::finish).
     ///
+    /// Over Companion on tvOS 27.2.1, when the device stopped recording before
+    /// this call, the screen could stay dimmed after the answer, and no remote
+    /// could control the app for some minutes. Control Center still worked. Apple's Siri Remote does the same. To avoid
+    /// it, call this before the device stops recording.
+    ///
     /// Over Companion, keep the connection open until the device has answered,
     /// for example for 20 s: the answer can take some seconds. On tvOS 27.2.1,
     /// when the connection closed a few seconds after `finish`, Siri did not

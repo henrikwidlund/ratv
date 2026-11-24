@@ -1234,8 +1234,7 @@ async fn siri_endpoint() {
     siri.send(&[3]).await.unwrap();
     siri.finish().await.unwrap();
     settle(&client).await;
-    // No `_siriStop` after `_siriEndpoint`: on tvOS 27.2.1 the remotes then
-    // stopped working.
+    // No `_siriStop` after `_siriEndpoint`: the device already ended the session.
     assert_eq!(
         log.lock().unwrap().siri,
         ["start", "99+1+1+1+1", "endpoint reply"]

@@ -174,11 +174,13 @@ impl Siri {
     ///
     /// After the device stopped recording (see [`ended`](Self::ended)), and
     /// audio was sent, no release is sent and this does not fail with
-    /// [`Error::Closed`]. On tvOS 27.2.1, after a release at that point the
-    /// screen stayed dimmed and no remote worked until the device ended the
-    /// session after some minutes.
-    /// Apple's Siri Remote does the same when it is held past the end of
-    /// listening.
+    /// [`Error::Closed`]: the device already ended the session.
+    ///
+    /// On tvOS 27.2.1, when the device stopped recording before the release,
+    /// Siri answered, but then the screen stayed dimmed and no remote could
+    /// control the app for some minutes. Control Center still worked. This also happened without a release, and with
+    /// Apple's Siri Remote held past the end of listening. To avoid it, call
+    /// this before the device stops recording.
     ///
     /// Keep the connection open until the device has answered, for example
     /// for 20 s: the answer can take some seconds. On tvOS 27.2.1, when the
@@ -237,11 +239,9 @@ impl Siri {
     }
 
     /// True if no release is sent: the device stopped recording, and audio
-    /// was sent.
-    /// On tvOS 27.2.1 a `_siriStop` after `_siriEndpoint` left the screen
-    /// dimmed and no remote worked. A stop sent before the endpoint arrives
-    /// can still reach the device after it. Without audio, the endpoint is
-    /// most likely from an earlier session, so the release is sent.
+    /// was sent. The device then already ended the session. Without audio,
+    /// the endpoint is most likely from an earlier session, so the release
+    /// is sent.
     fn release_skipped(&mut self) -> bool {
         self.packets > 0 && self.ended()
     }
