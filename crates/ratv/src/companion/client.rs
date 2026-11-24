@@ -37,6 +37,10 @@ const NP_UNREADABLE: u8 = 2;
 /// [`Client::connect_stream`] could otherwise keep the task alive while a
 /// client exists.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// tvOS 27 ignores a Wake that comes less than about 5 s after the device
+/// starts to sleep (measured: 4 s fails, 5 s works). Some margin is added.
+const WAKE_AFTER_SLEEP: Duration = Duration::from_secs(6);
 /// Encoded messages that are not sent yet. Checked before each push, so the
 /// outbox can be larger than this by one message. Releases and the `_siriEndpoint`
 /// reply skip it.
@@ -97,6 +101,9 @@ struct Shared {
     /// [`NP_KNOWN`] when the device answered the now playing fetch or sent now
     /// playing that could be read, so an empty value means that nothing plays.
     now_playing_known: AtomicU8,
+    /// When the device started to sleep: the last `turn_off` that succeeded,
+    /// or an asleep event when no sleep was known. `None` while it is awake.
+    asleep_at: Mutex<Option<tokio::time::Instant>>,
 }
 
 /// Stores an `Option<bool>` in an atomic: 0 unknown, 1 false, 2 true.
@@ -163,6 +170,32 @@ impl Outbox {
 }
 
 impl Shared {
+    /// Records the power state from an event. Keeps the first time of a
+    /// sleep, so a repeated asleep event does not move it.
+    fn power_event(&self, state: AttentionState) {
+        let mut at = self
+            .asleep_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match state {
+            AttentionState::Asleep => {
+                at.get_or_insert_with(tokio::time::Instant::now);
+            }
+            AttentionState::Unknown => {}
+            _ => *at = None,
+        }
+    }
+
+    /// Time to wait before a Wake works, after the device started to sleep.
+    fn wake_wait(&self) -> Option<Duration> {
+        let at = *self
+            .asleep_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        at.and_then(|t| WAKE_AFTER_SLEEP.checked_sub(t.elapsed()))
+            .filter(|d| !d.is_zero())
+    }
+
     /// Sets `now_playing_known` to `new` if it is `old`.
     fn set_now_playing(&self, old: u8, new: u8) {
         let flag = &self.now_playing_known;
@@ -886,17 +919,38 @@ impl Client {
 
     /// Wakes the device.
     ///
-    /// `Ok` does not mean that the device woke. tvOS 27 ignores a wake that
-    /// comes less than about 5 s after [`turn_off`](Self::turn_off). After a
-    /// wake, [`power_state`](Self::power_state) returns `Awake` after about
-    /// 5 s.
+    /// tvOS 27 ignores a Wake that comes less than about 5 s after the device
+    /// starts to sleep. So this waits until 6 s have passed since the sleep
+    /// started, then sends the Wake. It can take up to 6 s. The sleep start is
+    /// the time of the last [`turn_off`](Self::turn_off) that succeeded, or
+    /// of an asleep power state event when no sleep was known. This event
+    /// also comes for a sleep from another remote. An awake, screensaver or
+    /// idle event clears the sleep start. A sleep that started before this
+    /// connection was made is not known.
+    ///
+    /// `Ok` does not mean that the device woke. Commands sent after it work,
+    /// also before [`power_state`](Self::power_state) returns `Awake`, which
+    /// takes about 5 s.
     pub async fn turn_on(&self) -> Result<(), Error> {
+        if let Some(wait) = self.inner.shared.wake_wait() {
+            tracing::debug!(parent: &self.inner.span, ?wait, "waiting before Wake");
+            tokio::time::sleep(wait).await;
+        }
         self.press(HidCommand::Wake).await
     }
 
     /// Puts the device to sleep.
     pub async fn turn_off(&self) -> Result<(), Error> {
-        self.press(HidCommand::Sleep).await
+        self.press(HidCommand::Sleep).await?;
+        // The asleep event comes later, so a `turn_on` right after this must
+        // know already.
+        *self
+            .inner
+            .shared
+            .asleep_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(tokio::time::Instant::now());
+        Ok(())
     }
 
     /// Stops the session and closes the connection of all clones. Returns
@@ -1138,6 +1192,7 @@ fn dispatch(
                     Event::SiriStatus { enabled } => shared
                         .siri_enabled
                         .store(to_flag(Some(enabled)), Ordering::Relaxed),
+                    Event::SystemStatus(state) => shared.power_event(state),
                     _ => {}
                 }
                 let _ = events.send(event);
@@ -1210,6 +1265,28 @@ mod tests {
             ),
         ])
         .encode()
+    }
+
+    #[test]
+    fn wake_waits_after_sleep() {
+        let shared = Shared::default();
+        assert_eq!(shared.wake_wait(), None);
+        shared.power_event(AttentionState::Asleep);
+        let wait = shared.wake_wait().unwrap();
+        assert!(wait > Duration::from_secs(5), "{wait:?}");
+        // A sleep that started 5 s ago: a repeated asleep event or an unknown
+        // state does not move it.
+        let old = tokio::time::Instant::now() - Duration::from_secs(5);
+        *shared.asleep_at.lock().unwrap() = Some(old);
+        shared.power_event(AttentionState::Asleep);
+        shared.power_event(AttentionState::Unknown);
+        assert!(shared.wake_wait().unwrap() <= Duration::from_secs(1));
+        // Long ago: no wait.
+        *shared.asleep_at.lock().unwrap() = Some(tokio::time::Instant::now() - WAKE_AFTER_SLEEP);
+        assert_eq!(shared.wake_wait(), None);
+        // Awake: no wait, and the next sleep starts new.
+        shared.power_event(AttentionState::Awake);
+        assert_eq!(*shared.asleep_at.lock().unwrap(), None);
     }
 
     #[test]

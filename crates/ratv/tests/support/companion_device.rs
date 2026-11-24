@@ -50,6 +50,9 @@ struct Log {
     late_now_playing: bool,
     /// Does not answer `_sessionStop`.
     no_stop_reply: bool,
+    /// Sends an asleep power state event before it handles the next message,
+    /// as when another remote puts the device to sleep.
+    asleep_event: bool,
 }
 
 /// Value of an integer key in an OPACK dictionary.
@@ -303,6 +306,20 @@ fn now_playing_event(title: &str, state: i64) -> Vec<u8> {
     ev
 }
 
+/// `SystemStatus` event: the device is asleep.
+fn asleep_event() -> Vec<u8> {
+    let mut ev = Vec::new();
+    Encoder::new(&mut ev).dict(4, |e| {
+        e.str("_i").str("SystemStatus");
+        e.str("_x").int(6);
+        e.str("_t").int(MessageType::Event as i64);
+        e.str("_c").dict(1, |e| {
+            e.str("state").int(1);
+        });
+    });
+    ev
+}
+
 fn empty(e: &mut Encoder<'_>) {
     e.dict(0, |_| {});
 }
@@ -351,6 +368,9 @@ async fn device_session(mut s: DuplexStream, controller: PairedController, log: 
         let xid = msg.xid().unwrap();
         let id = msg.id().unwrap().to_owned();
         let int = |k: &str| msg.field(k).and_then(Value::as_i64);
+        if std::mem::take(&mut log.lock().unwrap().asleep_event) {
+            send(&mut s, &mut conn, FrameType::E_OPACK, &asleep_event()).await;
+        }
         let reply = match id.as_str() {
             "_interest" => {
                 let reg = msg.field("_regEvents").and_then(Value::as_array).unwrap();

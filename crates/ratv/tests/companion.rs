@@ -999,6 +999,45 @@ async fn connect_with(log: Log) -> (companion::Client, Arc<Mutex<Log>>) {
     (client, log)
 }
 
+/// Time of `turn_on` after a sleep that started at `start`.
+async fn turn_on_after(client: &companion::Client, start: tokio::time::Instant) -> Duration {
+    client.turn_on().await.unwrap();
+    start.elapsed()
+}
+
+/// `turn_on` right after `turn_off` waits until the Wake can work.
+#[tokio::test(start_paused = true)]
+async fn turn_on_waits_after_turn_off() {
+    let (client, log) = connect_with(Log::default()).await;
+    let start = tokio::time::Instant::now();
+    client.turn_off().await.unwrap();
+    let took = turn_on_after(&client, start).await;
+    assert!(took >= Duration::from_secs(6), "{took:?}");
+    assert_eq!(log.lock().unwrap().hid.last(), Some(&(13, 2)));
+    // Asleep long enough: no wait.
+    let start = tokio::time::Instant::now();
+    let took = turn_on_after(&client, start).await;
+    assert!(took < Duration::from_secs(1), "{took:?}");
+}
+
+/// A sleep from another remote, seen as an event, also delays `turn_on`.
+#[tokio::test(start_paused = true)]
+async fn turn_on_waits_after_asleep_event() {
+    let (client, log) = connect_with(Log::default()).await;
+    log.lock().unwrap().asleep_event = true;
+    let mut events = client.events();
+    // Before the event, so the wait is at least 6 s from here.
+    let start = tokio::time::Instant::now();
+    settle(&client).await;
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        Event::SystemStatus(AttentionState::Asleep)
+    ));
+    let took = turn_on_after(&client, start).await;
+    assert!(took >= Duration::from_secs(6), "{took:?}");
+    assert_eq!(log.lock().unwrap().hid.last(), Some(&(13, 2)));
+}
+
 /// Waits until the device has read all messages that were sent before.
 async fn settle(client: &companion::Client) {
     client.volume().await.unwrap();
