@@ -58,6 +58,9 @@ struct Log {
     hang_up: bool,
     /// `SkipBackward` fails with a send error.
     fail_skip: bool,
+    /// The command list is not in the first state. It comes just before the
+    /// answer to `SkipForward` or `Stop`, which fails with handler status 404.
+    late_commands: bool,
 }
 
 fn credentials() -> Credentials {
@@ -315,8 +318,10 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
         return Some(out);
     }
     if env.is::<proto::ClientUpdatesConfigMessage>() {
-        let no_item = log.lock().unwrap().no_item != NoItem::None;
-        return Some(initial_state(no_item));
+        let l = log.lock().unwrap();
+        let (no_item, late_commands) = (l.no_item != NoItem::None, l.late_commands);
+        drop(l);
+        return Some(initial_state(no_item, late_commands));
     }
     if env.is::<proto::SendButtonEventMessage>() {
         let b: proto::SendButtonEventMessage = env.payload().unwrap();
@@ -327,27 +332,7 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
         return ((page, usage) == (0x0c, 0x04) && !log.no_recording).then(|| recording(down));
     }
     if env.is::<proto::SendCommandMessage>() {
-        let c: proto::SendCommandMessage = env.payload().unwrap();
-        let cmd = c.command?;
-        let mut l = log.lock().unwrap();
-        l.commands.push(cmd);
-        if let Some(o) = c.options {
-            l.seeks.extend(o.playback_position);
-            l.language_options.extend(o.language_option);
-        }
-        drop(l);
-        if cmd == Command::NextTrack as i32 {
-            // Device-level error code on the envelope.
-            return Some(mrp(&proto::SendCommandResultMessage::default(), id, 6));
-        }
-        let fail = cmd == Command::Stop as i32
-            || (cmd == Command::SkipBackward as i32 && log.lock().unwrap().fail_skip);
-        let send_error = i32::from(fail);
-        let result = proto::SendCommandResultMessage {
-            send_error: Some(send_error),
-            ..Default::default()
-        };
-        return Some(mrp(&result, id, 0));
+        return command_reply(env, id, log);
     }
     if env.is::<proto::PlaybackQueueRequestMessage>() {
         let r: proto::PlaybackQueueRequestMessage = env.payload().unwrap();
@@ -393,14 +378,53 @@ fn handle(env: &Envelope, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
     handle_voice(env, id, log).or_else(|| handle_volume(env, id, log))
 }
 
-/// Now playing client and state, sent after `CLIENT_UPDATES_CONFIG`.
-/// With `no_item`, a paused state without an item.
-fn initial_state(no_item: bool) -> Vec<u8> {
-    let client = proto::NowPlayingClient {
-        bundle_identifier: Some("com.apple.TVMusic".into()),
-        display_name: Some("Music".into()),
+/// Answer to a `SendCommandMessage`.
+fn command_reply(env: &Envelope, id: Option<&str>, log: &Arc<Mutex<Log>>) -> Option<Vec<u8>> {
+    let c: proto::SendCommandMessage = env.payload().unwrap();
+    let cmd = c.command?;
+    let mut l = log.lock().unwrap();
+    l.commands.push(cmd);
+    if let Some(o) = c.options {
+        l.seeks.extend(o.playback_position);
+        l.language_options.extend(o.language_option);
+    }
+    let (late_commands, fail_skip) = (l.late_commands, l.fail_skip);
+    drop(l);
+    if late_commands && (cmd == Command::SkipForward as i32 || cmd == Command::Stop as i32) {
+        let state = proto::SetStateMessage {
+            player_path: Some(proto::PlayerPath {
+                client: Some(music_client()),
+                ..Default::default()
+            }),
+            supported_commands: Some(supported_commands()),
+            ..Default::default()
+        };
+        let result = proto::SendCommandResultMessage {
+            handler_return_status: Some(404),
+            ..Default::default()
+        };
+        let mut out = mrp(&state, None, 0);
+        out.extend(mrp(&result, id, 0));
+        return Some(out);
+    }
+    if cmd == Command::NextTrack as i32 {
+        // Device-level error code on the envelope.
+        return Some(mrp(&proto::SendCommandResultMessage::default(), id, 6));
+    }
+    let fail = cmd == Command::Stop as i32 || (cmd == Command::SkipBackward as i32 && fail_skip);
+    let send_error = i32::from(fail);
+    let result = proto::SendCommandResultMessage {
+        send_error: Some(send_error),
         ..Default::default()
     };
+    Some(mrp(&result, id, 0))
+}
+
+/// Now playing client and state, sent after `CLIENT_UPDATES_CONFIG`.
+/// With `no_item`, a paused state without an item. With `late_commands`,
+/// without the command list.
+fn initial_state(no_item: bool, late_commands: bool) -> Vec<u8> {
+    let client = music_client();
     let mut out = mrp(
         &proto::SetNowPlayingClientMessage {
             client: Some(client.clone()),
@@ -426,23 +450,7 @@ fn initial_state(no_item: bool) -> Vec<u8> {
             content_items: vec![video_item()],
             ..Default::default()
         }),
-        // Not listed, so `AppleTv` uses another way: `PreviousChapter`, `Play`,
-        // `TogglePlayPause`, `Stop`, `SkipForward`, `BeginFastForward`.
-        supported_commands: Some(proto::SupportedCommands {
-            supported_commands: [
-                Command::NextChapter,
-                Command::Pause,
-                Command::SeekToPlaybackPosition,
-                Command::SkipBackward,
-            ]
-            .into_iter()
-            .map(|c| proto::CommandInfo {
-                command: Some(c as i32),
-                enabled: Some(true),
-                ..Default::default()
-            })
-            .collect(),
-        }),
+        supported_commands: (!late_commands).then(supported_commands),
         ..Default::default()
     };
     if no_item {
@@ -457,6 +465,35 @@ fn initial_state(no_item: bool) -> Vec<u8> {
     }
     out.extend(mrp(&state, None, 0));
     out
+}
+
+fn music_client() -> proto::NowPlayingClient {
+    proto::NowPlayingClient {
+        bundle_identifier: Some("com.apple.TVMusic".into()),
+        display_name: Some("Music".into()),
+        ..Default::default()
+    }
+}
+
+/// Commands of the app. These are not listed, so `AppleTv` uses another way:
+/// `PreviousChapter`, `Play`, `TogglePlayPause`, `Stop`, `SkipForward`,
+/// `BeginFastForward`.
+fn supported_commands() -> proto::SupportedCommands {
+    proto::SupportedCommands {
+        supported_commands: [
+            Command::NextChapter,
+            Command::Pause,
+            Command::SeekToPlaybackPosition,
+            Command::SkipBackward,
+        ]
+        .into_iter()
+        .map(|c| proto::CommandInfo {
+            command: Some(c as i32),
+            enabled: Some(true),
+            ..Default::default()
+        })
+        .collect(),
+    }
 }
 
 /// Item with chapters at 0, 60, 120 and 180 s, and Swedish subtitles on.
@@ -1721,6 +1758,51 @@ async fn rewind_end_after_failed_skip() {
     tv.mrp().unwrap().close().await.unwrap();
     let err = tv.end_rewind().await.unwrap_err();
     assert!(matches!(err, Error::Closed), "{err}");
+}
+
+/// Connects to a fake device that sends the command list only with the 404
+/// answer to `SkipForward` or `Stop`.
+#[cfg(feature = "companion")]
+async fn late_commands_device() -> (Device, ratv::AppleTv) {
+    let device = start_device().await;
+    device.log.lock().unwrap().late_commands = true;
+    let endpoints = ratv::Endpoints {
+        companion: None,
+        airplay: Some(format!("127.0.0.1:{}", device.port).parse().unwrap()),
+    };
+    let tv = ratv::AppleTv::connect(&endpoints, &credentials(), &options())
+        .await
+        .unwrap();
+    (device, tv)
+}
+
+/// The command list comes with the 404 answer. It does not list `SkipForward`
+/// or `Stop`, but lists seeking and `Pause`, so `skip` seeks and `stop` pauses.
+#[cfg(feature = "companion")]
+#[tokio::test]
+async fn commands_come_late() {
+    // Each device waits the full state wait time, so both run at once.
+    let ((skip_device, skip_tv), (stop_device, stop_tv)) =
+        tokio::join!(late_commands_device(), late_commands_device());
+    let (skipped, stopped) = tokio::join!(skip_tv.skip(5.0), stop_tv.stop());
+    skipped.unwrap();
+    stopped.unwrap();
+    skip_tv.close().await.unwrap();
+    stop_tv.close().await.unwrap();
+    let log = skip_device.log.lock().unwrap();
+    assert_eq!(
+        log.commands,
+        [
+            Command::SkipForward as i32,
+            Command::SeekToPlaybackPosition as i32
+        ]
+    );
+    // The item plays from 100 s.
+    assert!(log.seeks[0] >= 105.0, "{:?}", log.seeks);
+    assert_eq!(
+        stop_device.log.lock().unwrap().commands,
+        [Command::Stop as i32, Command::Pause as i32]
+    );
 }
 
 /// Companion is refused, so `AppleTv` uses only MRP.

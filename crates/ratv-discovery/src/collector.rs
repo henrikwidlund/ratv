@@ -129,7 +129,8 @@ pub struct Device {
     /// scope id, then link-local IPv6 without one. A link-local IPv6 address
     /// from AAAA records of two links is listed once for each link. Can hold
     /// the address the answer came from, see [`Collector::add`]. IPv4-mapped
-    /// IPv6 addresses are stored as IPv4.
+    /// IPv6 addresses are stored as IPv4. Unspecified, multicast and IPv4
+    /// broadcast addresses are left out.
     pub addresses: Vec<Address>,
     /// Services.
     pub services: Vec<Service>,
@@ -211,6 +212,12 @@ impl Device {
     }
 }
 
+/// False for addresses that cannot reach a device: unspecified, multicast
+/// and the IPv4 broadcast address.
+const fn usable(ip: IpAddr) -> bool {
+    !ip.is_unspecified() && !ip.is_multicast() && !matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
+}
+
 /// Sort key: IPv4, then IPv6 that is not link-local, then link-local with a
 /// scope id, then link-local without one, which cannot be used to connect.
 /// The fuzz target `dns` has a copy of this.
@@ -248,18 +255,21 @@ impl Collector {
 
     /// Adds a response. `source` is the address it came from; pass it on each
     /// call. The first source of a service is kept. Its address (with scope
-    /// id) is used when the host has no usable address: no A/AAAA record, or
-    /// only link-local IPv6 without a scope id. The scope id of an IPv6
-    /// `source` is given to the link-local addresses of this response (see
+    /// id) is used when the host has no address to connect to: no kept A/AAAA
+    /// record, or only link-local IPv6 without a scope id. The scope id of an
+    /// IPv6 `source` is given to the link-local addresses of this response (see
     /// [`Address::scope_id`]). The port is not used. A device uses only the
     /// source of its first service, in order of the instance name, ASCII
-    /// case ignored.
+    /// case ignored. An unspecified, multicast or IPv4 broadcast `source` is
+    /// not used as an address; its scope id is still used.
     pub fn add(&mut self, msg: &[u8], source: Option<SocketAddr>) -> Result<(), dns::Error> {
         let scope_id = match source {
             Some(SocketAddr::V6(a)) => a.scope_id(),
             _ => 0,
         };
-        let source = source.map(|a| Address::scoped(a.ip().to_canonical(), scope_id));
+        let source = source
+            .map(|a| Address::scoped(a.ip().to_canonical(), scope_id))
+            .filter(|a| usable(a.ip));
         for record in dns::parse(msg)? {
             match record.data {
                 RData::Ptr(instance) if record.ty == RecordType::PTR => {
@@ -300,7 +310,11 @@ impl Collector {
 
     /// Adds `addr` to `host`. A known scope id replaces 0 for the same IP,
     /// and an address with scope id 0 is not added when the IP is known.
+    /// Addresses that are not [`usable`] are left out.
     fn address(&mut self, host: &str, addr: Address) {
+        if !usable(addr.ip) {
+            return;
+        }
         let list = self.addresses.entry(host.to_ascii_lowercase()).or_default();
         let mut same_ip = list.iter_mut().filter(|a| a.ip == addr.ip);
         if addr.scope_id == 0 {
@@ -585,6 +599,33 @@ mod tests {
         c.add(&r.finish(), Some("[::ffff:10.0.0.9]:5353".parse().unwrap()))
             .unwrap();
         let d = &c.devices()[0];
+        assert_eq!(d.addresses, [Address::from(IpAddr::from([10, 0, 0, 9]))]);
+    }
+
+    #[test]
+    fn unusable_addresses_left_out() {
+        let mut r = Response::new();
+        r.srv(CL, 49153, HOST)
+            .txt(CL, &[])
+            .a(HOST, Ipv4Addr::UNSPECIFIED)
+            .a(HOST, Ipv4Addr::new(224, 0, 0, 251))
+            .a(HOST, Ipv4Addr::BROADCAST)
+            .aaaa(HOST, Ipv6Addr::UNSPECIFIED)
+            .aaaa(HOST, "ff02::fb".parse().unwrap())
+            .aaaa(HOST, Ipv4Addr::UNSPECIFIED.to_ipv6_mapped());
+        let msg = r.finish();
+        let mut c = Collector::new();
+        c.add(&msg, Some("0.0.0.0:5353".parse().unwrap())).unwrap();
+        // No address is known yet, so A is still asked for (one question).
+        assert!(!c.is_complete());
+        assert_eq!(c.follow_up_query().unwrap()[4..6], [0, 1]);
+        assert_eq!(c.complete_devices(), []);
+        assert_eq!(c.devices()[0].addresses, []);
+
+        // A usable source is used instead.
+        c.add(&msg, Some("10.0.0.9:5353".parse().unwrap())).unwrap();
+        assert!(c.is_complete());
+        let d = &c.complete_devices()[0];
         assert_eq!(d.addresses, [Address::from(IpAddr::from([10, 0, 0, 9]))]);
     }
 

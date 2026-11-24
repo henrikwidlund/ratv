@@ -773,10 +773,19 @@ impl AppleTv {
     /// Stops playback. Pauses if the app does not support stop. Needs MRP.
     pub async fn stop(&self) -> Result<(), Error> {
         self.wait_for_state().await;
-        if self.support(Command::Stop) == Support::No {
+        let support = self.support(Command::Stop);
+        if support == Support::No {
             return self.pause().await;
         }
-        self.playback(Command::Stop, Command::Stop, None).await
+        let result = self.playback(Command::Stop, Command::Stop, None).await;
+        // The command list may have arrived while waiting for the answer.
+        if support == Support::Unknown
+            && is_unsupported(&result)
+            && self.support(Command::Stop) == Support::No
+        {
+            return self.pause().await;
+        }
+        result
     }
 
     /// Seeks to `position` seconds. Needs MRP. A position that is not finite
@@ -801,29 +810,39 @@ impl AppleTv {
             Command::SkipForward
         };
         let support = self.support(check);
-        if support == Support::No
-            && self.support(Command::SeekToPlaybackPosition) == Support::Yes
-            && let Some(pos) = self
-                .with_now_playing(|np| np.position(mrp::cocoa_time(SystemTime::now())))
-                .flatten()
-        {
-            return self.seek((pos + seconds).max(0.0)).await;
+        if let Some(to) = self.seek_instead(support, seconds) {
+            return self.seek(to).await;
         }
         match self.media_route(support, Some(MediaControl::SkipBy(seconds)))? {
             Route::Companion(c, f) => c.media(f).await,
             Route::Mrp(m, ()) => {
                 let result = m.skip(seconds).await;
                 // Right after connect the command list may not be known yet,
-                // as in `playback`.
-                if support == Support::Unknown
-                    && is_unsupported(&result)
-                    && let Some(c) = self.open_companion()
-                {
-                    return c.media(MediaControl::SkipBy(seconds)).await;
+                // as in `playback`. It may have arrived while waiting for the
+                // answer, so check for seeking again first.
+                if support == Support::Unknown && is_unsupported(&result) {
+                    if let Some(to) = self.seek_instead(self.support(check), seconds) {
+                        return self.seek(to).await;
+                    }
+                    if let Some(c) = self.open_companion() {
+                        return c.media(MediaControl::SkipBy(seconds)).await;
+                    }
                 }
                 result
             }
         }
+    }
+
+    /// Target position when the app does not support the skip (`support`)
+    /// but supports seeking, and the position is known.
+    fn seek_instead(&self, support: Support, seconds: f64) -> Option<f64> {
+        if support != Support::No || self.support(Command::SeekToPlaybackPosition) != Support::Yes {
+            return None;
+        }
+        let pos = self
+            .with_now_playing(|np| np.position(mrp::cocoa_time(SystemTime::now())))
+            .flatten()?;
+        Some((pos + seconds).max(0.0))
     }
 
     /// Starts fast forward. Stop it with [`end_fast_forward`](Self::end_fast_forward).
@@ -918,13 +937,27 @@ impl AppleTv {
         if let Some(s) = self.skip_instead(begin, forward) {
             return self.scrub_skip(forward, s).await;
         }
-        let result = self.playback(begin, begin, Some(fallback)).await;
-        // The command list may have arrived while waiting for the answer.
-        if is_unsupported(&result)
-            && let Some(s) = self.skip_instead(begin, forward)
-        {
-            return self.scrub_skip(forward, s).await;
-        }
+        let support = self.support(begin);
+        let result = match self.media_route(support, Some(fallback))? {
+            Route::Companion(c, f) => c.media(f).await,
+            Route::Mrp(m, ()) => {
+                let result = m.command(begin).await;
+                if !is_unsupported(&result) {
+                    result
+                } else if let Some(s) = self.skip_instead(begin, forward) {
+                    // The command list may have arrived while waiting for the answer.
+                    return self.scrub_skip(forward, s).await;
+                } else if support == Support::Unknown
+                    && let Some(c) = self.open_companion()
+                {
+                    // Right after connect the command list may not be known
+                    // yet, as in `playback`.
+                    c.media(fallback).await
+                } else {
+                    result
+                }
+            }
+        };
         if result.is_ok() {
             self.scrubs.set(forward, Scrubs::STARTED);
         }

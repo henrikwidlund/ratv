@@ -37,6 +37,20 @@ fuzz_target!(|data: &[u8]| {
         0,
         3,
     )));
+    // Sources that are not kept as addresses.
+    let unspecified = Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5353)));
+    let multicast = Some(SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb),
+        5353,
+        0,
+        2,
+    )));
+    let broadcast = Some(SocketAddr::V6(SocketAddrV6::new(
+        Ipv4Addr::BROADCAST.to_ipv6_mapped(),
+        5353,
+        0,
+        3,
+    )));
     // Adds a message once from each source in the pair. The pairs with
     // `first` and `second` add the two parts of the input from different
     // sources, so one host can have scoped and unscoped link-local
@@ -53,6 +67,12 @@ fuzz_target!(|data: &[u8]| {
         // A scoped link-local source, then an AAAA record for the same IP
         // from an IPv4 packet (no scope id).
         [(first, link(1)), (second, v4)],
+        // A source that is not kept, then one that is.
+        [(data, unspecified), (data, v4)],
+        // A multicast source with a scope id.
+        [(data, multicast), (data, None)],
+        // An IPv4-mapped broadcast source with a scope id.
+        [(data, broadcast), (data, v4)],
         [(data, global), (data, None)],
         // A link-local source without a scope id.
         [(data, link(0)), (data, None)],
@@ -64,6 +84,8 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         let _ = (c.follow_up_query(), c.is_complete());
+        // A complete device always has an address.
+        assert!(c.complete_devices().iter().all(|d| !d.addresses.is_empty()));
         for device in c.devices().iter().chain(&c.complete_devices()) {
             let _ = (device.name(), device.model(), device.identifier());
             let _ = device.socket_addr(ServiceKind::Companion);
@@ -72,6 +94,9 @@ fuzz_target!(|data: &[u8]| {
                 let _ = (a.socket_addr(1), a.to_string());
                 // IPv4-mapped addresses are stored as IPv4.
                 assert_eq!(a.ip, a.ip.to_canonical());
+                // Unspecified, multicast and broadcast addresses are left out.
+                assert!(!a.ip.is_unspecified() && !a.ip.is_multicast());
+                assert!(!matches!(a.ip, IpAddr::V4(v4) if v4.is_broadcast()));
                 // Only link-local IPv6 addresses have a scope id.
                 assert!(
                     a.scope_id == 0
