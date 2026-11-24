@@ -885,6 +885,11 @@ impl Client {
     }
 
     /// Wakes the device.
+    ///
+    /// `Ok` does not mean that the device woke. tvOS 27 ignores a wake that
+    /// comes less than about 5 s after [`turn_off`](Self::turn_off). After a
+    /// wake, [`power_state`](Self::power_state) returns `Awake` after about
+    /// 5 s.
     pub async fn turn_on(&self) -> Result<(), Error> {
         self.press(HidCommand::Wake).await
     }

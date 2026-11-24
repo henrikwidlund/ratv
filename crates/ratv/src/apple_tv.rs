@@ -1181,7 +1181,7 @@ impl AppleTv {
         Ok(())
     }
 
-    /// Wakes the device. Needs Companion.
+    /// Wakes the device. Needs Companion. See [`companion::Client::turn_on`](crate::companion::Client::turn_on).
     pub async fn turn_on(&self) -> Result<(), Error> {
         self.need_companion()?.turn_on().await
     }
