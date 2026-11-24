@@ -8,7 +8,7 @@ Protocols:
   what is playing (title, state, rate, position, duration, artwork, subtitle state).
 - **MRP over AirPlay 2**: what is playing (title, artist, position, state),
   artwork, playback, languages, chapters,
-  Up Next, volume, output devices, Siri voice input.
+  play queue (Up Next), volume, output devices, Siri voice input.
 
 The Apple TV app sends some fields in a separate archive, not in the normal
 metadata fields. `NowPlaying` (from `AppleTv::now_playing`) reads them too:
