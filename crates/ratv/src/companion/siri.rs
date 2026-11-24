@@ -177,10 +177,12 @@ impl Siri {
     /// [`Error::Closed`]: the device already ended the session.
     ///
     /// On tvOS 27.2.1, when the device stopped recording before the release,
-    /// Siri answered, but then the screen stayed dimmed and no remote could
-    /// control the app for some minutes. Control Center still worked. This also happened without a release, and with
-    /// Apple's Siri Remote held past the end of listening. To avoid it, call
-    /// this before the device stops recording.
+    /// Siri answered, but then the dimmed Siri layer stayed on the screen for
+    /// some minutes and no remote could navigate in the app. Control Center
+    /// still worked. This also happened without a release, and with Apple's
+    /// Siri Remote held past the end of listening. To avoid it, call this
+    /// before the device stops recording. Pressing Siri and then Back twice
+    /// removed the Siri layer.
     ///
     /// Keep the connection open until the device has answered, for example
     /// for 20 s: the answer can take some seconds. On tvOS 27.2.1, when the

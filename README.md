@@ -118,9 +118,11 @@ Over Companion, keep the connection open until Siri has answered, for example
 for 20 s after `finish`. On tvOS 27.2.1, when the connection closed a few
 seconds after `finish`, Siri did not answer. Over MRP this was not tested.
 On tvOS 27.2.1, when the TV stopped listening before `finish` (see
-`Siri::ended`), the screen could stay dimmed after the answer, and no remote
-could control the app for some minutes. Control Center still worked. Apple's Siri Remote does the same when it is held
-too long. To avoid it, call `finish` before the TV stops listening.
+`Siri::ended`), the dimmed Siri layer could stay on the screen after the
+answer, and no remote could navigate in the app for some minutes. Control
+Center still worked. Apple's Siri Remote does the same when it is held too
+long. To avoid it, call `finish` before the TV stops listening. Pressing Siri
+and then Back twice removed the Siri layer.
 
 The TV closes an open Companion connection when a new one connects with the
 same credentials. Share one client with `clone()` instead of connecting again.
