@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["apple-tv", "homekit", "hap", "pairing", "srp"]
+categories = ["cryptography", "network-programming"]
 
 [features]
 # Accessory (Apple TV) side of pairing. Used to build fake devices in tests.

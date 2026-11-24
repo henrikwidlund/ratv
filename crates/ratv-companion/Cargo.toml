@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["apple-tv", "companion", "rapport", "remote", "sans-io"]
+categories = ["network-programming"]
 
 [dependencies]
 ratv-codec.workspace = true

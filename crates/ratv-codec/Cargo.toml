@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["apple-tv", "opack", "tlv8", "plist", "homekit"]
+categories = ["encoding", "parser-implementations"]
 
 [dependencies]
 thiserror.workspace = true

@@ -49,8 +49,6 @@ suboptimal_flops = "allow"
 multiple_crate_versions = "allow"
 # Reports guards that are already dropped at the end of their block.
 significant_drop_tightening = "allow"
-# Needs `repository`, which is not set yet.
-cargo_common_metadata = "allow"
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 # `expect` is only used for invariants that cannot fail.

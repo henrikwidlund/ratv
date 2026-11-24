@@ -6,6 +6,7 @@
 //!
 //! - [`Connection`]: framing and encryption. Takes received bytes, returns bytes to send.
 //! - [`message`]: request/event encoding and response decoding.
+//! - [`now_playing`]: what the device plays, from now playing events.
 //! - [`pairing`]: wraps HAP pairing TLV8 in Companion frames.
 //! - [`text_input`]: keyboard text.
 

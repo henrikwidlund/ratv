@@ -239,9 +239,9 @@ Fuzz targets: [`fuzz`](fuzz), for example `cargo +nightly fuzz run opack`.
 
 - [bunatv](https://github.com/JarekToro/bunatv) by JarekToro (MIT, from its
   `package.json`): main protocol reference. The `.proto` files in
-  [`crates/ratv-mrp/proto`](crates/ratv-mrp/proto) are from bunatv. They
-  describe Apple's message formats and come from Apple frameworks on macOS.
+  [`crates/ratv-mrp/proto`](crates/ratv-mrp/proto) are from bunatv.
 - [pyatv](https://github.com/postlund/pyatv) (MIT): second protocol reference.
+- Our own tests on Apple TV devices.
 
 This project is not made or supported by Apple. Apple TV, AirPlay and Siri
 are trademarks of Apple Inc.
