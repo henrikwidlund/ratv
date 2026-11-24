@@ -26,6 +26,13 @@ use crate::link::{Batches, CloseGuard, Link, LinkTx, Queued};
 use crate::{Error, log, rng, tcp, touch};
 
 const EVENT_CAPACITY: usize = 32;
+/// Value of `Shared::now_playing_known`: no now playing data from the device yet.
+const NP_UNKNOWN: u8 = 0;
+/// Value of `Shared::now_playing_known`: data from the device.
+const NP_KNOWN: u8 = 1;
+/// Value of `Shared::now_playing_known`: a now playing event came that could
+/// not be read. A later fetch answer then does not make the value known.
+const NP_UNREADABLE: u8 = 2;
 /// Time for the stream shutdown when the connection ends. A stream from
 /// [`Client::connect_stream`] could otherwise keep the task alive while a
 /// client exists.
@@ -87,9 +94,9 @@ struct Shared {
     guide_supported: AtomicU8,
     /// Siri on in the device settings, see [`to_flag`].
     siri_enabled: AtomicU8,
-    /// The device answered the now playing fetch or sent now playing, so an
-    /// empty value means that nothing plays.
-    now_playing_known: AtomicBool,
+    /// [`NP_KNOWN`] when the device answered the now playing fetch or sent now
+    /// playing that could be read, so an empty value means that nothing plays.
+    now_playing_known: AtomicU8,
 }
 
 /// Stores an `Option<bool>` in an atomic: 0 unknown, 1 false, 2 true.
@@ -156,6 +163,20 @@ impl Outbox {
 }
 
 impl Shared {
+    /// Sets `now_playing_known` to `new` if it is `old`.
+    fn set_now_playing(&self, old: u8, new: u8) {
+        let flag = &self.now_playing_known;
+        let _ = flag.compare_exchange(old, new, Ordering::Release, Ordering::Relaxed);
+    }
+
+    /// After the now playing fetch: an answer makes the value known, unless
+    /// an event that could not be read came first.
+    fn fetch_answered(&self, answered: bool) {
+        if answered {
+            self.set_now_playing(NP_UNKNOWN, NP_KNOWN);
+        }
+    }
+
     /// Locks the outbox. A panic while locked cannot leave it invalid.
     fn outbox(&self) -> MutexGuard<'_, Outbox> {
         self.outbox.lock().unwrap_or_else(PoisonError::into_inner)
@@ -312,7 +333,7 @@ impl Client {
             Ordering::Relaxed,
         );
         // If the device sent the now playing event, it came before this reply.
-        (client.inner.shared.now_playing_known).fetch_or(playing.is_ok(), Ordering::Release);
+        client.inner.shared.fetch_answered(playing.is_ok());
         // Older tvOS versions may not support these.
         for (id, result) in [
             ("_touchStart", touch_start),
@@ -467,6 +488,29 @@ impl Client {
         self.queue(msg, xid, None, release).map(drop)
     }
 
+    /// Queues two events, or neither: if the second one does not fit, the
+    /// first one is removed again.
+    fn queue_events<M: Outgoing>(&self, first: &M, second: &M) -> Result<(), Error> {
+        let (x1, x2) = (self.next_xid(), self.next_xid());
+        tracing::trace!(parent: &self.inner.span, id = M::ID, x1, x2, "events");
+        {
+            let mut out = self.inner.shared.outbox();
+            // Checked while locked: the task clears `pending` after the link closes.
+            if !self.inner.link.is_open() {
+                return Err(Error::Closed);
+            }
+            let queued = out.push(first, x1, false)?;
+            if let Err(err) = out.push(second, x2, false) {
+                // The task cannot take the first one while the outbox is locked.
+                let removed = out.remove(queued);
+                debug_assert!(removed);
+                return Err(err);
+            }
+        }
+        self.inner.shared.wake.notify_one();
+        Ok(())
+    }
+
     /// Flag that is true while a [`Siri`](super::Siri) exists.
     pub(super) fn siri_active(&self) -> &AtomicBool {
         &self.inner.siri_active
@@ -521,7 +565,10 @@ impl Client {
     }
 
     /// What the device plays. Faster than MRP, but has less data, and may not
-    /// hold an item that was paused before connecting. After the connection
+    /// hold an item that was paused before connecting. If the value is not
+    /// known after connect (no answer to the now playing fetch, or an event
+    /// that could not be read), the first event that can be read counts as a
+    /// change, also when the value stays the same. After the connection
     /// closes, the receiver keeps the last value and closes.
     #[must_use]
     pub fn now_playing(&self) -> watch::Receiver<NowPlaying> {
@@ -532,7 +579,7 @@ impl Client {
     /// An empty value then means that nothing plays.
     #[cfg(feature = "mrp")]
     pub(crate) fn now_playing_known(&self) -> bool {
-        self.inner.shared.now_playing_known.load(Ordering::Acquire)
+        self.inner.shared.now_playing_known.load(Ordering::Acquire) == NP_KNOWN
     }
 
     /// True if the Guide button does something on the current screen.
@@ -710,7 +757,9 @@ impl Client {
     }
 
     /// Replaces the text of the focused text field. Fails with
-    /// [`Error::NoTextField`] if no text field has focus.
+    /// [`Error::NoTextField`] if no text field has focus. If it fails, for
+    /// example with text that is too large ([`Error::is_too_large`]), the old
+    /// text stays.
     pub async fn set_text(&self, text: &str) -> Result<(), Error> {
         self.edit_text(text, true).await
     }
@@ -729,15 +778,17 @@ impl Client {
 
     async fn edit_text(&self, text: &str, clear: bool) -> Result<(), Error> {
         let session = self.text_session().await?.ok_or(Error::NoTextField)?;
-        if clear {
-            let data = text_input::clear_text(&session.uuid);
-            self.send_event(&TextInputCommand { data: &data }).await?;
+        let cleared = clear.then(|| text_input::clear_text(&session.uuid));
+        let inserted = (!text.is_empty()).then(|| text_input::insert_text(&session.uuid, text));
+        match (&cleared, &inserted) {
+            (Some(c), Some(i)) => {
+                self.queue_events(&TextInputCommand { data: c }, &TextInputCommand { data: i })
+            }
+            (Some(data), None) | (None, Some(data)) => {
+                self.send_event(&TextInputCommand { data }).await
+            }
+            (None, None) => Ok(()),
         }
-        if !text.is_empty() {
-            let data = text_input::insert_text(&session.uuid, text);
-            self.send_event(&TextInputCommand { data: &data }).await?;
-        }
-        Ok(())
     }
 
     /// Restarts the text input session to get the current text field.
@@ -1055,9 +1106,23 @@ fn dispatch(
     tracing::trace!(?msg, "received");
     match msg.kind() {
         Some(MessageType::Event) if msg.id() == Some(event::NOW_PLAYING_INFO) => {
-            now_playing.send_if_modified(|np| np.apply(&msg));
-            // After the send: who sees the flag also sees the value.
-            shared.now_playing_known.store(true, Ordering::Release);
+            // The first event that can be read is always a change, also when
+            // it is empty, so the merge task learns that the device sent data.
+            let first = shared.now_playing_known.load(Ordering::Relaxed) != NP_KNOWN;
+            let mut result = Ok(false);
+            now_playing.send_if_modified(|np| {
+                result = np.apply(&msg);
+                result.as_ref().is_ok_and(|&changed| changed || first)
+            });
+            match result {
+                // After the send: who sees the flag also sees the value.
+                Ok(_) if first => shared.now_playing_known.store(NP_KNOWN, Ordering::Release),
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::debug!(%err, "now playing event not read");
+                    shared.set_now_playing(NP_UNKNOWN, NP_UNREADABLE);
+                }
+            }
         }
         Some(MessageType::Event) => {
             if let Some(event) = Event::parse(&msg) {
@@ -1107,5 +1172,113 @@ fn dispatch(
                 tracing::debug!(id = ?msg.id(), xid = ?msg.xid(), "ignoring device request");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratv_codec::bplist::Value as P;
+    use ratv_codec::opack::Encoder;
+
+    use super::*;
+
+    /// `NowPlayingInfo` event with `data` as the archive.
+    fn now_playing_event(data: &[u8]) -> Bytes {
+        let mut out = Vec::new();
+        Encoder::new(&mut out).dict(3, |e| {
+            e.str("_i").str(event::NOW_PLAYING_INFO);
+            e.str("_t").int(MessageType::Event as i64);
+            e.str("_c").dict(1, |e| {
+                e.str("NowPlayingInfoKey").data(data);
+            });
+        });
+        out.into()
+    }
+
+    /// Archive whose root has no fields.
+    fn empty_archive() -> Vec<u8> {
+        P::Dict(vec![
+            ("$top".into(), P::Dict(vec![("root".into(), P::Uid(1))])),
+            (
+                "$objects".into(),
+                P::Array(vec![P::String("$null".into()), P::Dict(Vec::new())]),
+            ),
+        ])
+        .encode()
+    }
+
+    #[test]
+    fn now_playing_known_from_unknown() {
+        // A fetch that got no answer keeps the value unknown; an answer makes
+        // it known.
+        let shared = Shared::default();
+        shared.fetch_answered(false);
+        assert_eq!(shared.now_playing_known.load(Ordering::Relaxed), NP_UNKNOWN);
+        shared.fetch_answered(true);
+        assert_eq!(shared.now_playing_known.load(Ordering::Relaxed), NP_KNOWN);
+
+        // A readable event makes it known and is a change.
+        let shared = Shared::default();
+        let (events, _) = broadcast::channel(1);
+        let (tx, rx) = watch::channel(NowPlaying::default());
+        let event = now_playing_event(&empty_archive());
+        dispatch(FrameType::E_OPACK, event, &shared, &events, &tx);
+        assert_eq!(shared.now_playing_known.load(Ordering::Relaxed), NP_KNOWN);
+        assert!(rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn now_playing_known_only_when_read() {
+        let shared = Shared::default();
+        let (events, _) = broadcast::channel(1);
+        let (tx, mut rx) = watch::channel(NowPlaying::default());
+        let state = || shared.now_playing_known.load(Ordering::Relaxed);
+
+        // Cannot be read: not known, no change.
+        dispatch(
+            FrameType::E_OPACK,
+            now_playing_event(b"x"),
+            &shared,
+            &events,
+            &tx,
+        );
+        assert_eq!(state(), NP_UNREADABLE);
+        assert!(!rx.has_changed().unwrap());
+        // A fetch answer after it does not make the value known.
+        shared.fetch_answered(true);
+        assert_eq!(state(), NP_UNREADABLE);
+
+        // The first event that can be read is a change, also when empty.
+        let empty = empty_archive();
+        dispatch(
+            FrameType::E_OPACK,
+            now_playing_event(&empty),
+            &shared,
+            &events,
+            &tx,
+        );
+        assert_eq!(state(), NP_KNOWN);
+        assert!(rx.has_changed().unwrap());
+        rx.borrow_and_update();
+
+        // The same event again is no change. One that cannot be read keeps
+        // the value known.
+        dispatch(
+            FrameType::E_OPACK,
+            now_playing_event(&empty),
+            &shared,
+            &events,
+            &tx,
+        );
+        assert!(!rx.has_changed().unwrap());
+        dispatch(
+            FrameType::E_OPACK,
+            now_playing_event(b"x"),
+            &shared,
+            &events,
+            &tx,
+        );
+        assert_eq!(state(), NP_KNOWN);
+        assert!(!rx.has_changed().unwrap());
     }
 }

@@ -41,6 +41,10 @@ struct Log {
     siri_off: bool,
     /// Does not answer `FetchCurrentNowPlayingInfoEvent`.
     no_now_playing: bool,
+    /// Sends a now playing event that cannot be read before the answer to
+    /// `FetchCurrentNowPlayingInfoEvent`, and an empty one before the answer
+    /// to `FetchUserAccountsEvent`.
+    late_now_playing: bool,
     /// Does not answer `_sessionStop`.
     no_stop_reply: bool,
 }
@@ -220,6 +224,37 @@ fn siri_capability(status: i64) -> Vec<u8> {
         ),
     ])
     .encode()
+}
+
+/// `NowPlayingInfo` event with `archive` as its data.
+fn now_playing_event_with(archive: &[u8]) -> Vec<u8> {
+    let mut ev = Vec::new();
+    Encoder::new(&mut ev).dict(4, |e| {
+        e.str("_i").str("NowPlayingInfo");
+        e.str("_x").int(5);
+        e.str("_t").int(MessageType::Event as i64);
+        e.str("_c").dict(1, |e| {
+            e.str("NowPlayingInfoKey").data(archive);
+        });
+    });
+    ev
+}
+
+/// `NowPlayingInfo` event whose archive root has no fields.
+fn empty_now_playing_event() -> Vec<u8> {
+    use ratv_codec::bplist::Value as P;
+    let archive = P::Dict(
+        [
+            ("$top".into(), P::Dict([("root".into(), P::Uid(1))].into())),
+            (
+                "$objects".into(),
+                P::Array(vec![P::String("$null".into()), P::Dict(Vec::new())]),
+            ),
+        ]
+        .into(),
+    )
+    .encode();
+    now_playing_event_with(&archive)
 }
 
 /// `NowPlayingInfo` event with a keyed archive, as the device sends it.
@@ -415,17 +450,33 @@ async fn device_session(mut s: DuplexStream, controller: PairedController, log: 
                 Some(response(xid, &id, empty))
             }
             "FetchCurrentNowPlayingInfoEvent" if log.lock().unwrap().no_now_playing => None,
+            "FetchCurrentNowPlayingInfoEvent" if log.lock().unwrap().late_now_playing => {
+                let ev = now_playing_event_with(b"not a plist");
+                send(&mut s, &mut conn, FrameType::E_OPACK, &ev).await;
+                Some(response(xid, &id, empty))
+            }
             "FetchCurrentNowPlayingInfoEvent" => {
                 let ev = now_playing_event("Nocturne", 1);
                 send(&mut s, &mut conn, FrameType::E_OPACK, &ev).await;
                 Some(response(xid, &id, empty))
             }
-            "FetchUserAccountsEvent" => Some(response(xid, &id, |e| {
-                e.dict(2, |e| {
-                    e.str("acc-1").str("Anna");
-                    e.str("acc-2").str("Ben");
-                });
-            })),
+            "FetchUserAccountsEvent" => {
+                if log.lock().unwrap().late_now_playing {
+                    send(
+                        &mut s,
+                        &mut conn,
+                        FrameType::E_OPACK,
+                        &empty_now_playing_event(),
+                    )
+                    .await;
+                }
+                Some(response(xid, &id, |e| {
+                    e.dict(2, |e| {
+                        e.str("acc-1").str("Anna");
+                        e.str("acc-2").str("Ben");
+                    });
+                }))
+            }
             "SwitchUserAccountEvent" => {
                 let account = msg.field("SwitchAccountID").and_then(Value::as_str);
                 log.lock().unwrap().account = account.map(str::to_owned);
@@ -1443,6 +1494,14 @@ async fn too_large_message_fails_and_connection_stays() {
         }
         other => panic!("unexpected {other}"),
     }
+    // Text that is too large: the old text is not cleared first.
+    match client.set_text(&url).await.unwrap_err() {
+        Error::Companion(ratv_companion::Error::FrameTooLarge(len)) => {
+            assert!(len > ratv_companion::MAX_MESSAGE_LEN);
+        }
+        other => panic!("unexpected {other}"),
+    }
+    assert_eq!(client.text().await.unwrap().as_deref(), Some("hel"));
     client.double_tap(HidCommand::Home).await.unwrap();
     assert_eq!(log.lock().unwrap().hid.len(), 4);
 }
@@ -1616,6 +1675,22 @@ async fn connect_without_optional_answer() {
     assert!(client.is_connected());
     assert_eq!(client.now_playing().borrow().title, None);
     assert_eq!(accepted.load(Ordering::Relaxed), 1);
+}
+
+/// After a now playing event that cannot be read, the first one that can be
+/// read counts as a change, also when it is empty.
+#[tokio::test]
+async fn first_now_playing_event_is_a_change() {
+    let (client, _log) = connect_with(Log {
+        late_now_playing: true,
+        ..Log::default()
+    })
+    .await;
+    let mut rx = client.now_playing();
+    rx.borrow_and_update();
+    client.accounts().await.unwrap();
+    assert!(rx.has_changed().unwrap());
+    assert_eq!(*rx.borrow_and_update(), companion::NowPlaying::default());
 }
 
 /// A `Siri` kept over a close gives `Closed`, not `SiriActive`.

@@ -1240,7 +1240,9 @@ impl AppleTv {
     }
 
     /// Replaces the text of the focused text field. Needs Companion. Fails with
-    /// [`Error::NoTextField`] if no text field has focus.
+    /// [`Error::NoTextField`] if no text field has focus. If it fails, for
+    /// example with text that is too large ([`Error::is_too_large`]), the old
+    /// text stays.
     pub async fn set_text(&self, text: &str) -> Result<(), Error> {
         self.need_companion()?.set_text(text).await
     }

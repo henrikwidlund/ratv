@@ -30,7 +30,11 @@ fuzz_target!(|data: &[u8]| {
     let raw = event("NowPlayingInfo", "NowPlayingInfoKey", data, false);
     if let Ok(msg) = Message::decode(&raw) {
         let mut np = NowPlaying::default();
-        np.apply(&msg);
+        let first = np.apply(&msg);
+        // An event that cannot be read changes nothing.
+        if first.is_err() {
+            assert_eq!(np, NowPlaying::default());
+        }
         // A position that is not finite is `None`, also for extreme times.
         // Also not below 0.
         for now in [0.0, 1e308, -1e308, f64::NAN] {
@@ -42,7 +46,7 @@ fuzz_target!(|data: &[u8]| {
         for v in [np.duration, np.elapsed, np.elapsed_timestamp] {
             assert!(v.is_none_or(f64::is_finite));
         }
-        assert!(!np.apply(&msg));
+        assert_eq!(np.apply(&msg), first.map(|_| false));
     }
     let raw = event("SiriStatus", "deviceCapabilitiesV2", data, true);
     if let Ok(msg) = Message::decode(&raw) {

@@ -7,6 +7,7 @@ use bytes::Bytes;
 use ratv_codec::bplist::{self, Value as P};
 use ratv_codec::opack::{Encoder, Value};
 
+use crate::Error;
 use crate::message::{Message, Outgoing};
 
 /// Makes the device send [`event::NOW_PLAYING_INFO`](crate::message::event::NOW_PLAYING_INFO)
@@ -95,24 +96,25 @@ impl NowPlaying {
     /// event. Fields that the event does not hold keep their value. An event
     /// with metadata replaces all metadata fields and the artwork. A number
     /// that is not finite, or a rate too large for f32, clears its field.
-    /// Returns true if something changed.
-    pub fn apply(&mut self, msg: &Message<'_>) -> bool {
-        let Some(data) = msg.field("NowPlayingInfoKey").and_then(Value::as_bytes) else {
-            return false;
-        };
-        let Ok(archive) = bplist::decode(data) else {
-            return false;
-        };
-        let Some(objects) = archive.get("$objects").and_then(P::as_array) else {
-            return false;
-        };
-        let Some(root) = archive
+    /// Returns true if something changed. Fails with
+    /// [`Error::InvalidField`] if the event holds no archive that can be
+    /// read; then nothing changes.
+    pub fn apply(&mut self, msg: &Message<'_>) -> Result<bool, Error> {
+        const INVALID: Error = Error::InvalidField("NowPlayingInfoKey");
+        let data = msg
+            .field("NowPlayingInfoKey")
+            .and_then(Value::as_bytes)
+            .ok_or(INVALID)?;
+        let archive = bplist::decode(data).map_err(|_| INVALID)?;
+        let objects = archive
+            .get("$objects")
+            .and_then(P::as_array)
+            .ok_or(INVALID)?;
+        let root = archive
             .get("$top")
             .and_then(|t| t.get("root"))
             .and_then(|v| resolve(objects, v))
-        else {
-            return false;
-        };
+            .ok_or(INVALID)?;
 
         let mut changed = false;
         if let Some(v) = field(objects, root, "playbackState").and_then(P::as_i64) {
@@ -173,7 +175,7 @@ impl NowPlaying {
                 finite(field(objects, md, "timestamp").and_then(number)),
             );
         }
-        changed
+        Ok(changed)
     }
 
     /// Position in seconds at `now` (MRP time). Values that are not finite
@@ -320,7 +322,7 @@ mod tests {
     }
 
     fn apply(np: &mut NowPlaying, raw: &[u8]) -> bool {
-        np.apply(&Message::decode(raw).unwrap())
+        np.apply(&Message::decode(raw).unwrap()).unwrap()
     }
 
     #[test]
@@ -410,7 +412,8 @@ mod tests {
         let mut np = NowPlaying::default();
         let mut out = Vec::new();
         encode(&FetchNowPlaying, 1, &mut out);
-        assert!(!apply(&mut np, &out));
+        let invalid = Err(Error::InvalidField("NowPlayingInfoKey"));
+        assert_eq!(np.apply(&Message::decode(&out).unwrap()), invalid);
         let mut out = Vec::new();
         Encoder::new(&mut out).dict(2, |e| {
             e.str("_i").str("NowPlayingInfo");
@@ -418,7 +421,7 @@ mod tests {
                 e.str("NowPlayingInfoKey").data(b"not a plist");
             });
         });
-        assert!(!apply(&mut np, &out));
+        assert_eq!(np.apply(&Message::decode(&out).unwrap()), invalid);
         assert_eq!(np, NowPlaying::default());
         assert_eq!(PlaybackState::from_code(9), PlaybackState::Unknown);
         assert_eq!(PlaybackState::Seeking.code(), 5);

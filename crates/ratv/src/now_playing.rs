@@ -52,12 +52,20 @@ impl Merger {
     /// If MRP has no app yet, this also holds for the first MRP app, if it
     /// comes within [`FIRST_MRP_APP_WINDOW`].
     fn companion_known(&mut self, mrp_app: Option<&str>) {
-        self.companion_seen = true;
-        self.app_from = Source::Companion;
+        self.companion_known_late();
         self.mrp_app = mrp_app.map(str::to_owned);
         self.first_mrp_app_old = mrp_app
             .is_none()
             .then(|| Instant::now() + FIRST_MRP_APP_WINDOW);
+    }
+
+    /// Like [`companion_known`](Self::companion_known), for a first Companion
+    /// value that comes later. Does not set the MRP app or start
+    /// [`FIRST_MRP_APP_WINDOW`], so an MRP app that the merge has not handled
+    /// yet is newer.
+    const fn companion_known_late(&mut self) {
+        self.companion_seen = true;
+        self.app_from = Source::Companion;
     }
 
     /// Call when MRP closes. State and position then come from Companion, and
@@ -331,7 +339,8 @@ impl Drop for MergeTask {
 
 /// Starts a task that sends the merged now playing on each change.
 /// `comp_known`: the Companion value is data from the device, see
-/// [`Merger::companion_known`].
+/// [`Merger::companion_known`]. If not, the first Companion change is the
+/// first data from the device, see [`Known::check`].
 pub(crate) fn spawn(
     mut mrp: Option<watch::Receiver<NowPlaying>>,
     mut comp: watch::Receiver<companion::NowPlaying>,
@@ -341,9 +350,22 @@ pub(crate) fn spawn(
     if comp_known && let Some(m) = &mrp {
         merger.companion_known(m.borrow().app.as_deref());
     }
+    let mut known = Known {
+        known: comp_known,
+        late: false,
+    };
     let (tx, rx) = watch::channel(NowPlaying::default());
     // A first value that is not empty counts as a change, as for MRP alone.
-    update(&mut merger, &tx, mrp.as_mut(), &mut comp, true);
+    update(
+        &mut merger,
+        &tx,
+        mrp.as_mut(),
+        &mut comp,
+        true,
+        false,
+        &mut known,
+    );
+    known.late = true;
     let task = tokio::spawn(async move {
         loop {
             let mrp_changed = async {
@@ -355,23 +377,31 @@ pub(crate) fn spawn(
             // A new MRP value is copied, also when the Companion change comes
             // first (see `update`). Else a Companion change only sets the
             // merged fields in place.
-            let base_changed = tokio::select! {
+            let (base_changed, comp_changed) = tokio::select! {
                 ok = mrp_changed => {
                     if !ok {
                         mrp = None;
                         merger.mrp_closed();
                     }
-                    true
+                    (true, false)
                 },
                 ok = comp.changed() => {
                     if ok.is_err() {
                         break;
                     }
                     // Without MRP, the base is the Companion data.
-                    mrp.is_none()
+                    (mrp.is_none(), true)
                 },
             };
-            update(&mut merger, &tx, mrp.as_mut(), &mut comp, base_changed);
+            update(
+                &mut merger,
+                &tx,
+                mrp.as_mut(),
+                &mut comp,
+                base_changed,
+                comp_changed,
+                &mut known,
+            );
         }
         // Companion closed: MRP data only, also the current value.
         if let Some(m) = &mut mrp {
@@ -388,18 +418,49 @@ pub(crate) fn spawn(
     (rx, MergeTask(task))
 }
 
+/// Whether the Companion value is known as data from the device.
+struct Known {
+    /// The Companion value is data from the device.
+    known: bool,
+    /// After the start: use [`Merger::companion_known_late`].
+    late: bool,
+}
+
+impl Known {
+    /// While not known, a Companion change is the first data from the device.
+    /// Then calls [`Merger::companion_known`], or
+    /// [`Merger::companion_known_late`] after the start. Only with MRP.
+    fn check(&mut self, merger: &mut Merger, mrp: Option<&NowPlaying>, comp_changed: bool) {
+        if self.known || !comp_changed {
+            return;
+        }
+        self.known = true;
+        match mrp {
+            Some(_) if self.late => merger.companion_known_late(),
+            Some(m) => merger.companion_known(m.app.as_deref()),
+            None => {}
+        }
+    }
+}
+
 /// Merges the current values and sends the result if it changed.
+/// `comp_changed`: the task woke for a Companion change.
 fn update(
     merger: &mut Merger,
     tx: &watch::Sender<NowPlaying>,
     mrp: Option<&mut watch::Receiver<NowPlaying>>,
     comp: &mut watch::Receiver<companion::NowPlaying>,
     base_changed: bool,
+    comp_changed: bool,
+    known: &mut Known,
 ) {
     let now = cocoa_time(SystemTime::now());
     // Marked as seen here, so a value is not handled again in the next turn.
     let comp = comp.borrow_and_update();
     let mrp = mrp.map(watch::Receiver::borrow_and_update);
+    // From the same borrow, so a Companion change that comes during this turn
+    // is not marked as seen without this check.
+    known.check(merger, mrp.as_deref(), comp_changed || comp.has_changed());
     // A new MRP value is copied, also when the Companion change came first,
     // so the fields are not set on the old item.
     let base_changed = base_changed || mrp.as_ref().is_some_and(watch::Ref::has_changed);
@@ -974,6 +1035,84 @@ mod tests {
         changed(&mut rx).await.unwrap();
         assert_eq!(*rx.borrow(), playing);
         drop(task);
+    }
+
+    #[tokio::test]
+    async fn late_first_companion_event_clears_the_app() {
+        // The Companion now playing fetch timed out at connect. The first
+        // event comes later and is empty, as on the idle Home Screen.
+        let mut home = NowPlaying::default();
+        home.app = Some("com.apple.TVWatchList".into());
+        let (_mrp_tx, mrp_rx) = watch::channel(home);
+        let (comp_tx, comp_rx) = watch::channel(companion::NowPlaying::default());
+        let (mut rx, task) = spawn(Some(mrp_rx), comp_rx, false);
+        assert!(rx.borrow_and_update().app.is_some());
+        // The client sends the first event as a change, also when it is empty.
+        comp_tx.send_modify(|_| {});
+        changed(&mut rx).await.unwrap();
+        assert_eq!(rx.borrow().app, None);
+        drop(task);
+    }
+
+    #[tokio::test]
+    async fn app_after_late_first_companion_event_is_shown() {
+        // The first Companion event comes late and MRP has no app yet. An app
+        // that MRP sends after it is newer, so an empty Companion value does
+        // not clear it.
+        let (mrp_tx, mrp_rx) = watch::channel(NowPlaying::default());
+        let (comp_tx, comp_rx) = watch::channel(companion::NowPlaying::default());
+        let (mut rx, task) = spawn(Some(mrp_rx), comp_rx, false);
+        comp_tx.send_modify(|_| {});
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let mut app = NowPlaying::default();
+        app.app = Some("com.apple.TVMusic".into());
+        mrp_tx.send_replace(app.clone());
+        changed(&mut rx).await.unwrap();
+        assert_eq!(*rx.borrow(), app);
+        drop(task);
+    }
+
+    #[tokio::test]
+    async fn new_mrp_app_with_late_first_companion_event_is_shown() {
+        // A new MRP app and the first Companion event wait at the same time.
+        // The new app is newer than the empty Companion value. Repeated, as
+        // the order is random.
+        for _ in 0..20 {
+            let mut home = NowPlaying::default();
+            home.app = Some("com.apple.TVWatchList".into());
+            let (mrp_tx, mrp_rx) = watch::channel(home);
+            let (comp_tx, comp_rx) = watch::channel(companion::NowPlaying::default());
+            let (mut rx, task) = spawn(Some(mrp_rx), comp_rx, false);
+            rx.borrow_and_update();
+            let mut app = NowPlaying::default();
+            app.app = Some("com.apple.TVMusic".into());
+            mrp_tx.send_replace(app.clone());
+            comp_tx.send_modify(|_| {});
+            changed(&mut rx).await.unwrap();
+            assert_eq!(*rx.borrow(), app);
+            drop(task);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_companion_event_with_mrp_change() {
+        // An MRP change and the first Companion event wait at the same time.
+        // The task may take either one first. Repeated, as the order is random.
+        for _ in 0..20 {
+            let mut home = NowPlaying::default();
+            home.app = Some("com.apple.TVWatchList".into());
+            let (mrp_tx, mrp_rx) = watch::channel(home);
+            let (comp_tx, comp_rx) = watch::channel(companion::NowPlaying::default());
+            let (mut rx, task) = spawn(Some(mrp_rx), comp_rx, false);
+            assert!(rx.borrow_and_update().app.is_some());
+            mrp_tx.send_modify(|_| {});
+            comp_tx.send_modify(|_| {});
+            changed(&mut rx).await.unwrap();
+            assert_eq!(rx.borrow().app, None);
+            drop(task);
+        }
     }
 
     #[tokio::test]
