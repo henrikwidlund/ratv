@@ -26,6 +26,10 @@ use crate::link::{Batches, CloseGuard, Link, LinkTx, Queued};
 use crate::{Error, log, rng, tcp, touch};
 
 const EVENT_CAPACITY: usize = 32;
+/// Time for the stream shutdown when the connection ends. A stream from
+/// [`Client::connect_stream`] could otherwise keep the task alive while a
+/// client exists.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 /// Encoded messages that are not sent yet. Checked before each push, so the
 /// outbox can be larger than this by one message. Releases and the `_siriEndpoint`
 /// reply skip it.
@@ -1023,7 +1027,7 @@ async fn run<S>(
     drop(guard);
     // Receivers see the close also when the shutdown waits.
     drop((now_playing, events));
-    let _ = stream.shutdown().await;
+    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, stream.shutdown()).await;
 }
 
 fn dispatch(

@@ -630,15 +630,18 @@ fn options() -> ClientOptions {
 /// Numbers that are not finite are not sent.
 async fn invalid_numbers_not_sent(client: &Client) {
     let invalid = [
-        client.seek(f64::NAN).await,
-        client.skip(f64::INFINITY).await,
-        client.skip(1e300).await,
-        client.set_playback_rate(f32::NAN).await,
-        client.set_rating(f32::NEG_INFINITY).await,
+        (client.seek(f64::NAN).await, "position"),
+        (client.skip(f64::INFINITY).await, "seconds"),
+        (client.skip(1e300).await, "seconds"),
+        (client.set_playback_rate(f32::NAN).await, "rate"),
+        (client.set_rating(f32::NEG_INFINITY).await, "rating"),
     ];
-    for result in invalid {
+    for (result, field) in invalid {
         let err = result.unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+        assert!(
+            matches!(err, Error::InvalidArgument(f) if f == field),
+            "{err}"
+        );
     }
 }
 
@@ -776,7 +779,10 @@ async fn siri_kept_over_close() {
     assert!(matches!(err, Error::Closed), "{err}");
     // The packet size is checked first.
     let err = kept.send(vec![0; 65_536]).await.unwrap_err();
-    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    assert!(
+        matches!(err, Error::InvalidArgument("packet size")),
+        "{err}"
+    );
     // Only the error can be seen here, not the kept packets.
     let err = kept.send(&b"one"[..]).await.unwrap_err();
     assert!(matches!(err, Error::Closed), "{err}");
@@ -816,7 +822,10 @@ async fn siri_packet_too_large() {
         .unwrap();
     let mut siri = client.start_siri().await.unwrap();
     let err = siri.send(vec![0; 65_536]).await.unwrap_err();
-    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    assert!(
+        matches!(err, Error::InvalidArgument("packet size")),
+        "{err}"
+    );
     siri.send(vec![0; 65_535]).await.unwrap();
 }
 
@@ -1053,7 +1062,7 @@ async fn apple_tv_volume_argument_first() {
         .unwrap();
     drop(volume);
     let err = tv.set_volume(f32::NAN).await.unwrap_err();
-    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    assert!(matches!(err, Error::InvalidArgument("volume")), "{err}");
     let err = tv.set_volume(0.5).await.unwrap_err();
     assert!(matches!(err, Error::VolumeNotAvailable), "{err}");
     tv.close().await.unwrap();

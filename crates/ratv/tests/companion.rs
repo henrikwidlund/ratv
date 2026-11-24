@@ -1759,11 +1759,17 @@ async fn siri_ended_then_closed() {
     assert!(siri.ended());
     // The packet size is checked first.
     let err = siri.send(&vec![0; 65_536]).await.unwrap_err();
-    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    assert!(
+        matches!(err, Error::InvalidArgument("packet size")),
+        "{err}"
+    );
     client.close().await.unwrap();
     siri.send(&[3]).await.unwrap();
     let err = siri.send(&vec![0; 65_536]).await.unwrap_err();
-    assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    assert!(
+        matches!(err, Error::InvalidArgument("packet size")),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -1858,12 +1864,15 @@ async fn apple_tv_siri_uses_companion() {
     assert_eq!(tv.siri_enabled(), Some(true));
     assert_eq!(tv.guide_supported(), Some(true));
     // The argument is checked before the protocol.
-    for err in [
-        tv.seek(f64::NAN).await.unwrap_err(),
-        tv.set_playback_rate(f32::NAN).await.unwrap_err(),
-        tv.set_rating(f32::INFINITY).await.unwrap_err(),
+    for (err, field) in [
+        (tv.seek(f64::NAN).await.unwrap_err(), "position"),
+        (tv.set_playback_rate(f32::NAN).await.unwrap_err(), "rate"),
+        (tv.set_rating(f32::INFINITY).await.unwrap_err(), "rating"),
     ] {
-        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+        assert!(
+            matches!(err, Error::InvalidArgument(f) if f == field),
+            "{err}"
+        );
     }
     // Not the last value of a closed connection.
     tv.close().await.unwrap();
