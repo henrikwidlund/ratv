@@ -1265,18 +1265,23 @@ impl State {
     /// item does not make it true again. Once the player has an item, or after
     /// another player was active, it can be asked again later.
     fn item_missing(&mut self) -> bool {
-        let Some((client, player)) = self.now_playing.player_without_item() else {
+        let Some(ratv_mrp::PlayerRef {
+            bundle_id,
+            player_id,
+            ..
+        }) = self.now_playing.player_without_item()
+        else {
             self.item_requested = None;
             return false;
         };
         if self
             .item_requested
             .as_ref()
-            .is_some_and(|(c, p)| c == client && p == player)
+            .is_some_and(|(b, p)| b == bundle_id && p == player_id)
         {
             return false;
         }
-        self.item_requested = Some((client.to_owned(), player.to_owned()));
+        self.item_requested = Some((bundle_id.to_owned(), player_id.to_owned()));
         true
     }
 

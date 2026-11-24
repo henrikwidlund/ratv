@@ -43,7 +43,7 @@ pub use envelope::{Envelope, Frames, encode, encode_type, frames};
 pub use error::Error;
 pub use player::{
     Chapter, DEFAULT_PLAYER, LanguageType, MediaSubType, MediaType, NowPlaying, NowPlayingState,
-    PlaybackState, QueueItem, cocoa_time, four_cc,
+    PlaybackState, PlayerRef, QueueItem, cocoa_time, four_cc,
 };
 #[cfg(feature = "opus")]
 pub use voice::VoiceEncoder;

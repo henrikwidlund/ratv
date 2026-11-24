@@ -28,11 +28,13 @@ pub(crate) struct Merger {
     mrp_state: (Option<PlaybackState>, Option<f32>),
     mrp_app: Option<String>,
     companion_state: (Option<companion::PlaybackState>, Option<f32>),
+    companion_title: Option<String>,
     mrp_position: (Option<f64>, Option<f64>),
     companion_position: (Option<f64>, Option<f64>),
     state_from: Source,
     position_from: Source,
-    /// Which side changed last: the Companion state or the MRP app.
+    /// Which side changed last: the Companion state or title, or the MRP app.
+    /// A Companion rate change alone does not count.
     app_from: Source,
     /// Companion has sent a state or a title.
     companion_seen: bool,
@@ -230,8 +232,14 @@ impl Merger {
     fn combine(&mut self, mrp: &NowPlaying, has_mrp: bool, comp: &companion::NowPlaying) -> Fields {
         let comp_state = (comp.state, comp.rate);
         if comp_state != self.companion_state {
+            if comp.state != self.companion_state.0 {
+                self.app_from = Source::Companion;
+            }
             self.companion_state = comp_state;
             self.state_from = Source::Companion;
+        }
+        if comp.title != self.companion_title {
+            self.companion_title.clone_from(&comp.title);
             self.app_from = Source::Companion;
         }
         self.companion_seen |= comp.state.is_some() || comp.title.is_some();
@@ -816,6 +824,35 @@ mod tests {
         let mut other = NowPlaying::default();
         other.app = Some("com.apple.TVMusic".into());
         assert_eq!(merge(&mut m, Some(&other), &idle), other);
+    }
+
+    #[test]
+    fn companion_title_change_is_newer_than_mrp_app() {
+        // Companion sends a title without a state, then MRP names an app.
+        let mut m = Merger::default();
+        let mut title_only = companion::NowPlaying::default();
+        title_only.title = Some("Show".into());
+        let mut app = NowPlaying::default();
+        app.app = Some("com.apple.TVMusic".into());
+        assert_eq!(merge(&mut m, Some(&app), &title_only), app);
+        // Companion goes idle after that: the app is cleared.
+        let idle = companion::NowPlaying::default();
+        assert_eq!(merge(&mut m, Some(&app), &idle).app, None);
+    }
+
+    #[test]
+    fn companion_rate_change_while_stopped_keeps_newer_app() {
+        let mut m = Merger::default();
+        let mut stopped = companion::NowPlaying::default();
+        stopped.state = Some(C::Stopped);
+        stopped.rate = Some(0.0);
+        let mut app = NowPlaying::default();
+        app.app = Some("com.apple.TVMusic".into());
+        // The MRP app is newer than the Companion state.
+        assert_eq!(merge(&mut m, Some(&app), &stopped), app);
+        // A rate change alone does not make Companion newer.
+        stopped.rate = None;
+        assert_eq!(merge(&mut m, Some(&app), &stopped), app);
     }
 
     #[test]

@@ -60,6 +60,17 @@ pub struct Chapter {
     pub duration: Option<f64>,
 }
 
+/// A player of an app, see
+/// [`NowPlayingState::player_without_item`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PlayerRef<'a> {
+    /// Bundle id of the app.
+    pub bundle_id: &'a str,
+    /// Player id.
+    pub player_id: &'a str,
+}
+
 /// An item in the playback queue.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[non_exhaustive]
@@ -721,11 +732,13 @@ impl NowPlayingState {
     /// once for each player that this returns. The reply has no player path
     /// and updates the active player.
     #[must_use]
-    pub fn player_without_item(&self) -> Option<(&str, &str)> {
+    pub fn player_without_item(&self) -> Option<PlayerRef<'_>> {
         let client = self.active_client()?;
         let player = client.active()?;
-        (player.state.is_some() && player.item().is_none())
-            .then_some((client.bundle_id.as_str(), player.id.as_str()))
+        (player.state.is_some() && player.item().is_none()).then_some(PlayerRef {
+            bundle_id: &client.bundle_id,
+            player_id: &player.id,
+        })
     }
 
     /// Snapshot of the active player.
@@ -1756,7 +1769,13 @@ mod tests {
             ..Default::default()
         };
         s.apply(&env(&paused)).unwrap();
-        assert_eq!(s.player_without_item(), Some(("app", DEFAULT_PLAYER)));
+        assert_eq!(
+            s.player_without_item(),
+            Some(PlayerRef {
+                bundle_id: "app",
+                player_id: DEFAULT_PLAYER
+            })
+        );
         assert_eq!(s.now_playing().state, None);
 
         // The reply to `playback_queue_item` has no player path.
