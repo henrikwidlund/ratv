@@ -16,6 +16,7 @@
 //! `speed=<rate>`, `rate=<rating>`, `like`, `unlike`, `dislike`, `undislike`, `accounts`, `account=<id>`,
 //! `app_switcher`, `context_menu`, `double_tap=<key>` (key name from this list, for example `home`),
 //! `hold=<key>,<s>` (hold a key for some seconds),
+//! `key=<key>,<s>` (key down, wait some seconds, key up, with separate events),
 //! `swipe=<x1>,<y1>,<x2>,<y2>,<ms>` (0.0 to 1.0, duration in ms),
 //! `ff=<s>` and `rw=<s>` (fast forward or rewind for some seconds),
 //! `ff_companion=<s>`, `rw_companion=<s>`, `ff_mrp=<s>`, `rw_mrp=<s>` (the same with one protocol only), `shuffle`, `repeat`
@@ -72,9 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tv.companion().is_some(),
         tv.mrp().is_some()
     );
-    // `ff_*`, `rw_*` and `hold=` do not use the playback calls of `AppleTv`,
-    // which wait for this by themselves. Apps may ignore commands sent before it.
-    if ["ff_", "rw_", "hold="]
+    // `ff_*`, `rw_*`, `hold=` and `key=` do not use the playback calls of
+    // `AppleTv`, which wait for the app's command list by themselves. Apps may
+    // ignore commands sent before it.
+    if ["ff_", "rw_", "hold=", "key="]
         .iter()
         .any(|p| command.starts_with(p))
     {
@@ -240,6 +242,17 @@ async fn run_value(tv: &AppleTv, command: &str) -> Result<(), Box<dyn std::error
         let (k, s) = v.split_once(',').ok_or("expected hold=<key>,<s>")?;
         let k = key(k).ok_or("unknown key")?;
         tv.hold(k, Duration::from_secs_f64(s.parse()?)).await?;
+    } else if let Some(v) = value("key=") {
+        let (k, s) = v.split_once(',').ok_or("expected key=<key>,<s>")?;
+        let k = key(k).ok_or("unknown key")?;
+        let wait = Duration::from_secs_f64(s.parse()?);
+        if let Err(err) = tv.key(k, true).await {
+            // The device may have the key down anyway.
+            let _ = tv.key(k, false).await;
+            return Err(err.into());
+        }
+        tokio::time::sleep(wait).await;
+        tv.key(k, false).await?;
     } else if let Some(v) = value("ff_companion=") {
         scrub_companion(tv, true, v.parse()?).await?;
     } else if let Some(v) = value("rw_companion=") {
