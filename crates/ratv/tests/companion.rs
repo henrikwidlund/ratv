@@ -1214,6 +1214,7 @@ async fn siri_status_event_updates_state() {
 #[tokio::test]
 async fn siri_endpoint() {
     let (client, log) = connect().await;
+    let mut events = client.events();
     let mut siri = client
         .start_siri(&companion::SiriOptions::default())
         .await
@@ -1233,9 +1234,79 @@ async fn siri_endpoint() {
     siri.send(&[3]).await.unwrap();
     siri.finish().await.unwrap();
     settle(&client).await;
+    // No `_siriStop` after `_siriEndpoint`: on tvOS 27.2.1 the remotes then
+    // stopped working.
     assert_eq!(
         log.lock().unwrap().siri,
-        ["start", "99+1+1+1+1", "endpoint reply", "stop"]
+        ["start", "99+1+1+1+1", "endpoint reply"]
+    );
+    // Other subscribers get the event too.
+    assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|e| e == Event::SiriEndpoint));
+    // A new session does not see the old endpoint, and is released.
+    let mut siri = client
+        .start_siri(&companion::SiriOptions::default())
+        .await
+        .unwrap();
+    assert!(!siri.ended());
+    siri.send(&[4]).await.unwrap();
+    siri.finish().await.unwrap();
+    settle(&client).await;
+    assert_eq!(log.lock().unwrap().siri[3..], ["start", "1", "stop"]);
+}
+
+/// An endpoint before any audio is most likely from an earlier session, so
+/// the release is sent.
+#[tokio::test]
+async fn siri_endpoint_before_audio() {
+    struct SendSiriEndpoint;
+    impl ratv_companion::message::Outgoing for SendSiriEndpoint {
+        const ID: &str = "sendSiriEndpoint";
+        fn content(&self, e: &mut Encoder<'_>) {
+            empty(e);
+        }
+    }
+    let (client, log) = connect().await;
+    let mut siri = client
+        .start_siri(&companion::SiriOptions::default())
+        .await
+        .unwrap();
+    client.request(&SendSiriEndpoint).await.unwrap();
+    // The endpoint is counted before the reply to the request is read.
+    assert!(siri.ended());
+    siri.send(&[1]).await.unwrap(); // Not sent.
+    let err = siri.finish().await.unwrap_err();
+    assert!(matches!(err, Error::SiriNoAudio), "{err}");
+    settle(&client).await;
+    assert_eq!(
+        log.lock().unwrap().siri,
+        ["start", "endpoint reply", "stop"]
+    );
+}
+
+/// Dropping Siri after the device stopped recording sends no release either.
+#[tokio::test]
+async fn siri_dropped_after_endpoint() {
+    let (client, log) = connect().await;
+    let mut siri = client
+        .start_siri(&companion::SiriOptions::default())
+        .await
+        .unwrap();
+    for size in [99, 1, 1, 1, 1] {
+        siri.send(&vec![0; size]).await.unwrap();
+    }
+    // The device answers the first event with `_siriEndpoint`. At most 5 s.
+    for _ in 0..250 {
+        if siri.ended() {
+            break;
+        }
+        siri.send(&[2]).await.unwrap();
+    }
+    assert!(siri.ended());
+    drop(siri);
+    settle(&client).await;
+    assert_eq!(
+        log.lock().unwrap().siri,
+        ["start", "99+1+1+1+1", "endpoint reply"]
     );
 }
 
@@ -1263,11 +1334,11 @@ async fn volume_limited() {
     );
 }
 
-/// After the device stopped recording, sending is not an error, also on a
-/// closed connection.
+/// After the device stopped recording, sending and `finish` are not errors,
+/// also on a closed connection.
 #[tokio::test]
 async fn siri_ended_then_closed() {
-    let (client, _log) = connect().await;
+    let (client, log) = connect().await;
     let mut siri = client
         .start_siri(&companion::SiriOptions::default())
         .await
@@ -1296,6 +1367,9 @@ async fn siri_ended_then_closed() {
         matches!(err, Error::InvalidArgument("packet size")),
         "{err}"
     );
+    // No release is sent, so a closed connection is not an error.
+    siri.finish().await.unwrap();
+    assert!(!log.lock().unwrap().siri.iter().any(|s| s == "stop"));
 }
 
 #[tokio::test]

@@ -148,6 +148,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Keeps the connection open while Siri answers. Closing it earlier can
+/// stop the answer on tvOS 27.2.1.
+async fn wait_for_answer() {
+    println!("done, waiting 20 s for the answer");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+}
+
 /// Sends a CAF file to Siri, one packet every 20 ms.
 async fn ask_siri(tv: &AppleTv, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let file = bytes::Bytes::from(tokio::fs::read(path).await?);
@@ -160,7 +167,7 @@ async fn ask_siri(tv: &AppleTv, path: &str) -> Result<(), Box<dyn std::error::Er
         siri.send(file.slice_ref(packet)).await?;
     }
     siri.finish().await?;
-    println!("done");
+    wait_for_answer().await;
     Ok(())
 }
 
@@ -199,7 +206,7 @@ async fn ask_siri_pcm(
         siri.push_pcm(chunk).await?;
     }
     siri.finish().await?;
-    println!("done");
+    wait_for_answer().await;
     Ok(())
 }
 

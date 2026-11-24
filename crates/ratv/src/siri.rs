@@ -8,6 +8,8 @@ use crate::{Error, companion, mrp};
 ///
 /// Siri is released when this is dropped, but call [`finish`](Self::finish)
 /// to send the rest of the audio and to know whether the release failed.
+/// Over Companion, no release is sent after the device stopped recording, if
+/// audio was sent.
 /// It holds a client clone, so dropping the other clones does not stop the connection.
 #[must_use = "Siri stays active until `finish` is called or this is dropped"]
 pub enum Siri {
@@ -60,9 +62,19 @@ impl Siri {
     /// Sends the rest of the audio and releases Siri. The device then answers.
     ///
     /// Fails with [`Error::SiriNoAudio`] if no audio was sent, for example
-    /// because none was given, and with [`Error::Closed`] on a closed
-    /// connection. Over MRP, waits for the device to record first; fails with
-    /// [`Error::SiriNotRecording`] if it does not start in time.
+    /// because none was given or because the device stopped recording before
+    /// audio was sent, and with [`Error::Closed`] on a closed connection. Over
+    /// MRP, waits for the device to record first; fails with
+    /// [`Error::SiriNotRecording`] if it does not start in time. Over
+    /// Companion, after the device stopped recording (see
+    /// [`ended`](Self::ended)), and audio was sent, no release is sent and
+    /// this does not fail with [`Error::Closed`], see
+    /// [`companion::Siri::finish`](crate::companion::Siri::finish).
+    ///
+    /// Over Companion, keep the connection open until the device has answered,
+    /// for example for 20 s: the answer can take some seconds. On tvOS 27.2.1,
+    /// when the connection closed a few seconds after `finish`, Siri did not
+    /// answer. Over MRP this was not tested.
     pub async fn finish(self) -> Result<(), Error> {
         match self {
             Self::Companion(s) => s.finish().await,

@@ -114,6 +114,9 @@ Siri uses Companion, as the iPhone remote does, and MRP if Companion is not
 connected. With feature `opus`, send 16-bit, 16 kHz, mono PCM in chunks of any
 size with `push_pcm` instead.
 `AppleTv` and the clients are fast to clone, and `Siri` can move to another task.
+Over Companion, keep the connection open until Siri has answered, for example
+for 20 s after `finish`. On tvOS 27.2.1, when the connection closed a few
+seconds after `finish`, Siri did not answer. Over MRP this was not tested.
 
 The TV closes an open Companion connection when a new one connects with the
 same credentials. Share one client with `clone()` instead of connecting again.
@@ -154,9 +157,13 @@ you show a control.
 - Fast-forward and rewind: Disney+ does not stop when asked, so `AppleTv`
   skips forward and back instead. HBO Max and Netflix do not list them.
   Skip works in all three.
-- Playback speed: some apps list `ChangePlaybackRate` without any rates.
-  Apple Podcasts then skips to the next episode instead. Use
-  `NowPlaying::playback_speeds` and send a speed only when it is not empty.
+- Playback speed: some apps list `ChangePlaybackRate` without any rates, or
+  with scan rates only. Apple Podcasts then skips to the next episode, and
+  the Apple TV app changes its scan speed. So `set_playback_rate` sends only
+  rates that the app lists, and 1.0 with other listed speeds
+  (`NowPlaying::accepts_rate`). Show speeds from `NowPlaying::playback_speeds`,
+  and only when it is not empty and `NowPlaying::supports` is true for
+  `ChangePlaybackRate`.
 
 ## Not supported
 

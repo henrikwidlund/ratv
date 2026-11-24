@@ -3,8 +3,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use ratv_companion::message::{Event, SiriAudio, SiriStart, SiriStop};
-use tokio::sync::broadcast;
+use ratv_companion::message::{SiriAudio, SiriStart, SiriStop};
 use tokio::time::Instant;
 
 use super::Client;
@@ -31,6 +30,7 @@ pub struct SiriOptions {
 /// more audio is not sent.
 /// Siri is released when this is dropped, but call [`finish`](Self::finish)
 /// to send the rest of the audio and to know whether the release failed.
+/// After the device stopped recording, and audio was sent, no release is sent.
 /// It holds a [`Client`] clone, so dropping the other clones does not stop the connection.
 #[must_use = "Siri stays active until `finish` is called or this is dropped"]
 pub struct Siri {
@@ -55,9 +55,10 @@ pub struct Siri {
     held: bool,
     /// When [`Client::start_siri`] was called.
     begin: Instant,
-    /// Events from the device, to see [`Event::SiriEndpoint`].
-    events: broadcast::Receiver<Event>,
-    /// True after [`Event::SiriEndpoint`].
+    /// [`Client::siri_endpoints`] before the start, to see
+    /// [`Event::SiriEndpoint`](super::Event::SiriEndpoint).
+    endpoints: u32,
+    /// True after [`Event::SiriEndpoint`](super::Event::SiriEndpoint).
     ended: bool,
 }
 
@@ -95,7 +96,7 @@ impl Client {
             next: None,
             held: true,
             begin,
-            events: self.events(),
+            endpoints: self.siri_endpoints(),
             ended: false,
         };
         let start = self
@@ -166,9 +167,22 @@ impl Siri {
     /// Sends the rest of the audio and releases Siri. The device then answers.
     ///
     /// Fails with [`Error::SiriNoAudio`] if no audio was sent, for example
-    /// because none was given, and with [`Error::Closed`] on a closed
-    /// connection. If the release gets [`Error::SendTimeout`], it is still
-    /// sent later.
+    /// because none was given or because the device stopped recording before
+    /// audio was sent, and with [`Error::Closed`] on a closed connection. If
+    /// the release gets [`Error::SendTimeout`], it is still sent later, unless
+    /// the device stopped recording and audio was sent.
+    ///
+    /// After the device stopped recording (see [`ended`](Self::ended)), and
+    /// audio was sent, no release is sent and this does not fail with
+    /// [`Error::Closed`]. On tvOS 27.2.1, after a release at that point the
+    /// screen stayed dimmed and no remote worked until the device ended the
+    /// session after some minutes.
+    /// Apple's Siri Remote does the same when it is held past the end of
+    /// listening.
+    ///
+    /// Keep the connection open until the device has answered, for example
+    /// for 20 s: the answer can take some seconds. On tvOS 27.2.1, when the
+    /// connection closed a few seconds after `finish`, Siri did not answer.
     pub async fn finish(mut self) -> Result<(), Error> {
         #[cfg(feature = "opus")]
         if let Some(encoder) = &mut self.encoder {
@@ -183,6 +197,15 @@ impl Siri {
         }
         self.send_events(true).await?;
         self.held = false;
+        if self.release_skipped() {
+            tracing::debug!(
+                parent: self.client.span(),
+                elapsed = ?self.begin.elapsed(),
+                packets = self.packets,
+                "Siri ended by the device, no release sent"
+            );
+            return Ok(());
+        }
         let stop = SiriStop {
             ptt_flags: self.ptt_flags,
         };
@@ -206,17 +229,21 @@ impl Siri {
     ///
     /// With push-to-talk, tvOS 26 stops recording only after [`finish`](Self::finish).
     pub fn ended(&mut self) -> bool {
-        while !self.ended {
-            match self.events.try_recv() {
-                Ok(Event::SiriEndpoint) => {
-                    self.ended = true;
-                    tracing::debug!(parent: self.client.span(), elapsed = ?self.begin.elapsed(), packets = self.packets, "Siri endpoint");
-                }
-                Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-                Err(_) => break,
-            }
+        if !self.ended && self.client.siri_endpoints() != self.endpoints {
+            self.ended = true;
+            tracing::debug!(parent: self.client.span(), elapsed = ?self.begin.elapsed(), packets = self.packets, "Siri endpoint");
         }
         self.ended
+    }
+
+    /// True if no release is sent: the device stopped recording, and audio
+    /// was sent.
+    /// On tvOS 27.2.1 a `_siriStop` after `_siriEndpoint` left the screen
+    /// dimmed and no remote worked. A stop sent before the endpoint arrives
+    /// can still reach the device after it. Without audio, the endpoint is
+    /// most likely from an earlier session, so the release is sent.
+    fn release_skipped(&mut self) -> bool {
+        self.packets > 0 && self.ended()
     }
 
     /// Sends full events, and with `all` also the last part.
@@ -282,7 +309,7 @@ fn keep(data: &mut Vec<u8>, sizes: &mut Vec<u16>, packet: &[u8]) -> Result<(), E
 
 impl Drop for Siri {
     fn drop(&mut self) {
-        if self.held {
+        if self.held && !self.release_skipped() {
             tracing::debug!(parent: self.client.span(), "Siri released on drop");
             let stop = SiriStop {
                 ptt_flags: self.ptt_flags,

@@ -572,6 +572,19 @@ async fn device_session(mut s: DuplexStream, controller: PairedController, log: 
                 log.lock().unwrap().siri.push("endpoint reply".into());
                 None
             }
+            // Test only: the device sends `_siriEndpoint` now, as a late one
+            // from an earlier session would come.
+            "sendSiriEndpoint" => {
+                let mut ev = Vec::new();
+                Encoder::new(&mut ev).dict(4, |e| {
+                    e.str("_i").str("_siriEndpoint");
+                    e.str("_x").int(2);
+                    e.str("_t").int(MessageType::Request as i64);
+                    e.str("_c").dict(0, |_| {});
+                });
+                send(&mut s, &mut conn, FrameType::E_OPACK, &ev).await;
+                Some(response(xid, &id, empty))
+            }
             // Test only: the device sends `SiriStatus` with Siri off.
             "turnSiriOff" => {
                 let capability = siri_capability(2);

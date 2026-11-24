@@ -98,6 +98,9 @@ struct Shared {
     guide_supported: AtomicU8,
     /// Siri on in the device settings, see [`to_flag`].
     siri_enabled: AtomicU8,
+    /// Number of [`Event::SiriEndpoint`] requests from the device. A full
+    /// event channel can lose an event; a counter cannot.
+    siri_endpoints: AtomicU32,
     /// [`NP_KNOWN`] when the device answered the now playing fetch or sent now
     /// playing that could be read, so an empty value means that nothing plays.
     now_playing_known: AtomicU8,
@@ -547,6 +550,11 @@ impl Client {
     /// Flag that is true while a [`Siri`](super::Siri) exists.
     pub(super) fn siri_active(&self) -> &AtomicBool {
         &self.inner.siri_active
+    }
+
+    /// Number of [`Event::SiriEndpoint`] requests from the device so far.
+    pub(super) fn siri_endpoints(&self) -> u32 {
+        self.inner.shared.siri_endpoints.load(Ordering::Acquire)
     }
 
     pub(super) fn span(&self) -> &Span {
@@ -1226,6 +1234,7 @@ fn dispatch(
                     tracing::debug!(%err, "_siriEndpoint reply failed");
                 }
                 shared.wake.notify_one();
+                shared.siri_endpoints.fetch_add(1, Ordering::Release);
                 let _ = events.send(event);
             } else {
                 // Not answered. Debug, not trace: the device may wait for an answer.
