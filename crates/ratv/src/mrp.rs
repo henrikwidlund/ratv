@@ -1000,11 +1000,28 @@ impl Client {
     }
 
     /// Sets the playback rate, 1.0 is normal speed.
-    /// Rates the app accepts are in [`NowPlaying::supported_rates`], normal speeds in
-    /// [`NowPlaying::playback_speeds`].
-    /// A rate that is not finite gives [`Error::InvalidArgument`].
+    /// Rates the app lists are in [`NowPlaying::supported_rates`], normal speeds in
+    /// [`NowPlaying::playback_speeds`]. Apps handle other rates in their own way:
+    /// the Apple TV app changes its scan speed, and Apple Podcasts skips to the
+    /// next episode. So a rate that is not finite, or that
+    /// [`NowPlaying::accepts_rate`] does not accept, gives
+    /// [`Error::InvalidArgument`] and is not sent. A rate close to a listed
+    /// rate sends the listed rate, see [`NowPlaying::listed_rate`]. To get
+    /// back to normal speed after a scan, send [`Command::Play`]. Right after
+    /// connect, wait until [`NowPlaying::commands`] is filled. On a closed
+    /// connection, fails with [`Error::Closed`].
     pub async fn set_playback_rate(&self, rate: f32) -> Result<(), Error> {
         crate::finite(f64::from(rate), "rate")?;
+        // The last value of a closed connection would give `InvalidArgument`.
+        if !self.is_connected() {
+            return Err(Error::Closed);
+        }
+        let rate = self
+            .inner
+            .now_playing
+            .borrow()
+            .listed_rate(rate)
+            .ok_or(Error::InvalidArgument("rate"))?;
         self.run_command(&messages::playback_rate(rate)).await
     }
 

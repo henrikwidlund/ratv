@@ -2,13 +2,24 @@
 
 include!("support/mrp_device.rs");
 
-/// Numbers that are not finite are not sent.
+/// Numbers that are not finite, and rates the item does not list, are not
+/// sent.
 async fn invalid_numbers_not_sent(client: &Client) {
+    // Rates are refused as not listed, not for a missing command list.
+    assert!(
+        client
+            .now_playing()
+            .borrow()
+            .supports(Command::ChangePlaybackRate)
+    );
     let invalid = [
         (client.seek(f64::NAN).await, "position"),
         (client.skip(f64::INFINITY).await, "seconds"),
         (client.skip(1e300).await, "seconds"),
         (client.set_playback_rate(f32::NAN).await, "rate"),
+        // The fake device lists only scan rates.
+        (client.set_playback_rate(1.5).await, "rate"),
+        (client.set_playback_rate(1.0).await, "rate"),
         (client.set_rating(f32::NEG_INFINITY).await, "rating"),
     ];
     for (result, field) in invalid {
@@ -18,6 +29,31 @@ async fn invalid_numbers_not_sent(client: &Client) {
             "{err}"
         );
     }
+}
+
+/// A rate the item lists is sent.
+#[tokio::test]
+async fn listed_rate_sent() {
+    let device = start_device().await;
+    let addr = format!("127.0.0.1:{}", device.port).parse().unwrap();
+    let client = Client::connect(addr, &credentials(), &options())
+        .await
+        .unwrap();
+    let mut np = client.now_playing();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        np.wait_for(|n| !n.supported_rates.is_empty()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    client.set_playback_rate(8.0).await.unwrap();
+    client.close().await.unwrap();
+    // The last state of a closed connection is not used.
+    let err = client.set_playback_rate(8.0).await.unwrap_err();
+    assert!(matches!(err, Error::Closed), "{err}");
+    let log = device.log.lock().unwrap();
+    assert_eq!(log.commands, [Command::ChangePlaybackRate as i32]);
 }
 
 #[tokio::test]
@@ -584,6 +620,9 @@ async fn apple_tv_uses_supported_commands() {
         .unwrap();
 
     // Playing at about 100 s. The first call waits for the command list.
+    let err = tv.set_playback_rate(1.5).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument("rate")), "{err}");
+    tv.set_playback_rate(8.0).await.unwrap(); // Listed scan rate.
     tv.play().await.unwrap(); // Already playing: nothing is sent.
     tv.play_pause().await.unwrap(); // Pause.
     tv.stop().await.unwrap(); // Pause.
@@ -601,6 +640,7 @@ async fn apple_tv_uses_supported_commands() {
     assert_eq!(
         log.commands,
         [
+            Command::ChangePlaybackRate as i32,
             Command::Pause as i32,
             Command::Pause as i32,
             Command::SeekToPlaybackPosition as i32,

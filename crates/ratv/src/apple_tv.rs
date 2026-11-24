@@ -1131,10 +1131,18 @@ impl AppleTv {
     }
 
     /// Sets the playback rate, 1.0 is normal speed. Needs MRP.
-    /// See [`NowPlaying::playback_speeds`]. A rate that is not finite gives
-    /// [`Error::InvalidArgument`].
+    /// Rates the app lists are in [`NowPlaying::supported_rates`], normal speeds in
+    /// [`NowPlaying::playback_speeds`]. Apps handle other rates in their own way:
+    /// the Apple TV app changes its scan speed, and Apple Podcasts skips to the
+    /// next episode. So a rate that is not finite, or that
+    /// [`NowPlaying::accepts_rate`] does not accept, gives
+    /// [`Error::InvalidArgument`] and is not sent. A rate close to a listed
+    /// rate sends the listed rate, see [`NowPlaying::listed_rate`]. To get
+    /// back to normal speed after a scan, use [`play`](Self::play). Without a
+    /// command list from the app, no rate is accepted.
     pub async fn set_playback_rate(&self, rate: f32) -> Result<(), Error> {
         crate::finite(f64::from(rate), "rate")?;
+        self.wait_for_state().await;
         self.need_mrp()?.set_playback_rate(rate).await
     }
 

@@ -3,6 +3,7 @@
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
+use ratv_mrp::proto::Command;
 use ratv_mrp::{NowPlayingState, PlaybackState, VolumeState, artwork, frames};
 
 fuzz_target!(|data: &[u8]| {
@@ -52,6 +53,26 @@ fuzz_target!(|data: &[u8]| {
             assert!(speeds.iter().all(|r| *r > 0.0 && *r <= 2.0));
             assert!(speeds.is_empty() || speeds.contains(&1.0));
             assert!(speeds.iter().all(|r| np.is_playback_speed(*r)));
+            let enabled = np.supports(Command::ChangePlaybackRate);
+            assert!(speeds.iter().all(|r| np.accepts_rate(*r) == enabled));
+            assert!(np.supported_rates.iter().all(|&r| {
+                np.listed_rate(r)
+                    .map_or(!enabled, |l| enabled && (l - r).abs() < 0.01)
+            }));
+            // The rate to send is a listed rate, or 1.0 with other normal speeds,
+            // and within 0.01 of the asked rate.
+            let near = np
+                .supported_rates
+                .iter()
+                .flat_map(|&r| [r - 0.005, r, r + 0.005]);
+            let fixed = [0.0, 0.993, 1.0, 1.007, 1.5, 8.0, -8.0];
+            for x in fixed.into_iter().chain(np.rate).chain(near) {
+                let listed = np.listed_rate(x);
+                assert!(enabled || listed.is_none());
+                assert!(listed.is_none_or(|l| (np.supported_rates.contains(&l)
+                    || (l == 1.0 && !speeds.is_empty()))
+                    && (l - x).abs() < 0.01));
+            }
             // Paused or stopped: rate 0. Playing: a normal speed.
             match np.state {
                 Some(PlaybackState::Paused | PlaybackState::Stopped) => {

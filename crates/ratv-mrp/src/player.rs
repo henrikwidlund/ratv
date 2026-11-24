@@ -198,7 +198,8 @@ pub struct NowPlaying {
     pub repeat: Option<proto::repeat_mode::Enum>,
     /// Enabled commands.
     pub commands: Vec<Command>,
-    /// Playback rates the app accepts for [`Command::ChangePlaybackRate`].
+    /// Playback rates the app lists for [`Command::ChangePlaybackRate`], also
+    /// when the command is not enabled.
     pub supported_rates: Vec<f32>,
     /// Seconds the app prefers for [`Command::SkipForward`], if it says.
     pub skip_forward_interval: Option<f64>,
@@ -300,7 +301,8 @@ impl NowPlaying {
     /// can also have scan speeds. Rates within 0.01 count as one rate. Empty
     /// if the app lists no normal speed other than 1.0. If empty,
     /// [`is_playback_speed`](Self::is_playback_speed) counts rates above 0 and
-    /// below 2.0 as normal speeds.
+    /// below 2.0 as normal speeds. Show them only when
+    /// [`Command::ChangePlaybackRate`] is enabled, see [`supports`](Self::supports).
     #[must_use]
     pub fn playback_speeds(&self) -> Vec<f32> {
         let mut speeds: Vec<f32> = self
@@ -316,6 +318,36 @@ impl NowPlaying {
             speeds.clear();
         }
         speeds
+    }
+
+    /// True if `rate` can be sent with [`Command::ChangePlaybackRate`], see
+    /// [`listed_rate`](Self::listed_rate).
+    #[must_use]
+    pub fn accepts_rate(&self, rate: f32) -> bool {
+        self.listed_rate(rate).is_some()
+    }
+
+    /// The rate to send with [`Command::ChangePlaybackRate`] for `rate`: the
+    /// closest rate in [`supported_rates`](Self::supported_rates) within 0.01
+    /// of it, or 1.0 for a rate within 0.01 of 1.0 when
+    /// [`playback_speeds`](Self::playback_speeds) is not empty.
+    /// `None` if the app does not list it, or if the command is not enabled.
+    #[must_use]
+    pub fn listed_rate(&self, rate: f32) -> Option<f32> {
+        if !self.supports(Command::ChangePlaybackRate) {
+            return None;
+        }
+        let rates = &self.supported_rates;
+        rates
+            .iter()
+            .copied()
+            .filter(|&r| same_rate(r, rate))
+            .min_by(|a, b| (a - rate).abs().total_cmp(&(b - rate).abs()))
+            .or_else(|| {
+                // The same rule as `playback_speeds`.
+                let speed = |r: f32| r > 0.0 && r <= MAX_PLAYBACK_SPEED && !same_rate(r, 1.0);
+                (same_rate(rate, 1.0) && rates.iter().copied().any(speed)).then_some(1.0)
+            })
     }
 
     /// True if `command` is enabled.
@@ -1152,6 +1184,45 @@ mod tests {
         assert!(!np.is_playback_speed(0.0));
         np.supported_rates = vec![-2.0, 2.0, 0.5, 96.0, 1.5, 0.0, 1.25];
         assert_eq!(np.playback_speeds(), [0.5, 1.0, 1.25, 1.5, 2.0]);
+    }
+
+    #[test]
+    fn accepts_rate() {
+        let mut np = NowPlaying {
+            commands: vec![Command::ChangePlaybackRate],
+            ..Default::default()
+        };
+        assert!(!np.accepts_rate(1.0));
+        // Scan rates only, as in the Apple TV app: 1.0 and 1.5 are not listed.
+        np.supported_rates = vec![-96.0, -48.0, -24.0, -8.0, 8.0, 24.0, 48.0, 96.0];
+        assert!(np.accepts_rate(8.0));
+        assert!(np.accepts_rate(-24.0));
+        assert!(!np.accepts_rate(1.0));
+        assert!(!np.accepts_rate(1.5));
+        // 1.0 counts when the app lists other normal speeds.
+        np.supported_rates = vec![0.5, 1.5, 2.0];
+        assert!(np.accepts_rate(1.0));
+        assert_eq!(np.listed_rate(1.505), Some(1.5));
+        assert_eq!(np.listed_rate(1.0), Some(1.0));
+        assert_eq!(np.listed_rate(1.25), None);
+        // The closest listed rate.
+        np.supported_rates = vec![1.245, 1.25];
+        assert_eq!(np.listed_rate(1.25), Some(1.25));
+        assert!(!np.accepts_rate(0.0));
+        // A rate close to 1.0 alone does not make 1.0 a speed.
+        np.supported_rates = vec![1.005];
+        assert_eq!(np.listed_rate(0.993), None);
+        np.supported_rates = vec![1.0];
+        assert!(np.accepts_rate(1.0));
+        assert!(!np.accepts_rate(1.5));
+        np.supported_rates = vec![1.0, 1.5];
+        assert!(np.accepts_rate(1.0) && np.accepts_rate(1.5));
+        // Agrees with `playback_speeds` for a speed close to 0.
+        np.supported_rates = vec![0.005];
+        assert!(np.playback_speeds().iter().all(|&r| np.accepts_rate(r)));
+        // Not sent when the command is not enabled.
+        np.commands.clear();
+        assert_eq!(np.listed_rate(0.005), None);
     }
 
     #[test]

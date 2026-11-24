@@ -505,6 +505,13 @@ fn supported_commands() -> proto::SupportedCommands {
             enabled: Some(true),
             ..Default::default()
         })
+        // Scan rates only, as in the Apple TV app.
+        .chain([proto::CommandInfo {
+            command: Some(Command::ChangePlaybackRate as i32),
+            enabled: Some(true),
+            supported_rates: vec![-8.0, 8.0],
+            ..Default::default()
+        }])
         .collect(),
     }
 }

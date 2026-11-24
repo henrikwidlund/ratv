@@ -35,7 +35,8 @@ pub enum Error {
     /// No address to connect to was given.
     #[error("no endpoints")]
     NoEndpoints,
-    /// A value is outside its range, for example a volume of NaN.
+    /// A value is outside its range, for example a volume of NaN, or the
+    /// current item does not list it, for example a playback rate.
     #[error("invalid {0}")]
     InvalidArgument(&'static str),
     /// No text field has focus on the device.
