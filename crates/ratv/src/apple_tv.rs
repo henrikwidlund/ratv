@@ -34,13 +34,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use tokio::net::TcpStream;
 use tokio::sync::watch;
+use tracing::Instrument;
 
 use crate::companion::{self, Account, App, ButtonState, HidCommand, MediaControl};
 use crate::mrp::{
     self, Artwork, Button, Command, LanguageOption, NowPlaying, PlaybackState, RepeatMode,
     ShuffleMode,
 };
-use crate::{ClientOptions, Credentials, Error, PairOptions, Siri, now_playing};
+use crate::{ClientOptions, Credentials, Error, PairOptions, Siri, log, now_playing};
 
 /// Where the device's services listen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -287,12 +288,17 @@ impl AppleTv {
         credentials: &Credentials,
         options: &ClientOptions,
     ) -> Result<Self, Error> {
-        let (companion, mrp) = connect_clients(endpoints, credentials, options, true, true).await;
-        let companion = split("Companion", companion);
-        let mrp = split("MRP", mrp);
-        let tv = Self::assemble(companion, mrp, Instant::now(), Arc::default())?;
-        tv.log_connect();
-        Ok(tv)
+        async {
+            let (companion, mrp) =
+                connect_clients(endpoints, credentials, options, true, true).await;
+            let companion = split("Companion", companion);
+            let mrp = split("MRP", mrp);
+            let tv = Self::assemble(companion, mrp, Instant::now(), Arc::default())?;
+            tv.log_connect();
+            Ok(tv)
+        }
+        .instrument(log::session("apple tv", None))
+        .await
     }
 
     /// Connects the protocols that are not open (see [`is_open`](Self::is_open)),
@@ -358,6 +364,19 @@ impl AppleTv {
         if companion.is_some() && mrp.is_some() {
             return Ok(None);
         }
+        self.connect_missing_inner(endpoints, credentials, options, companion, mrp)
+            .instrument(log::session("apple tv", None))
+            .await
+    }
+
+    async fn connect_missing_inner(
+        &self,
+        endpoints: &Endpoints,
+        credentials: &Credentials,
+        options: &ClientOptions,
+        companion: Option<&companion::Client>,
+        mrp: Option<&mrp::Client>,
+    ) -> Result<Option<Self>, Error> {
         let (new_companion, new_mrp) = connect_clients(
             endpoints,
             credentials,

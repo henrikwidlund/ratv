@@ -35,7 +35,8 @@ First release, version 0.1.0.
 - Features `companion`, `mrp` and `discovery` (on by default), `opus` and
   `sensitive-logs`.
 - Logs with `tracing` when feature `companion`, `mrp` or `discovery` is on,
-  with a `session` span for each connection and pairing.
+  with a `session` span for each connection and pairing, and for
+  `AppleTv::connect` and `connect_missing`.
 - Sans-IO protocol crates: `ratv-codec`, `ratv-hap`, `ratv-companion`,
   `ratv-airplay`, `ratv-mrp`, `ratv-discovery`.
 - Platforms: Linux, macOS and Windows on x64 and arm64, including

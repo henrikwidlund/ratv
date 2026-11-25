@@ -200,6 +200,10 @@ cargo build -p ratv --no-default-features --features companion --profile embedde
 
 The library logs with [`tracing`](https://docs.rs/tracing). Each connection
 and pairing has a `session` span with `protocol`, `id` and `addr`.
+`AppleTv::connect` and `connect_missing` have a `session` span with
+`protocol="apple tv"` and `id`. The spans of their connections are inside it.
+After `connect_missing`, protocols that stayed open keep the span of the
+earlier connect.
 
 - `warn`: the library continues with less function.
 - `debug`: connect, disconnect, handshake steps, failed or timed out requests, Siri steps.

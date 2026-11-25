@@ -46,7 +46,7 @@ impl LogBuffer {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
 
-    /// The `session{...}` span of the first line with the message `message`.
+    /// The innermost `session{...}` span of the first line with the message `message`.
     /// `message` can end with fields. A message with more words after
     /// `message` does not match.
     fn span_of(&self, message: &str) -> String {
@@ -69,8 +69,8 @@ impl LogBuffer {
             .to_owned()
     }
 
-    /// Panics if there are no logs, or if a line is not in one of the
-    /// `session{...}` spans `spans`.
+    /// Panics if there are no logs, or if the innermost `session{...}` span
+    /// of a line is not one of `spans`.
     fn assert_all_in(&self, spans: &[&str]) {
         let text = self.text();
         assert!(!text.is_empty(), "no logs");
@@ -78,6 +78,19 @@ impl LogBuffer {
             assert!(
                 session_span(line).is_some_and(|span| spans.contains(&span)),
                 "not in {spans:?}: {line}"
+            );
+        }
+    }
+
+    /// Panics if there are no logs, or if the outermost `session{...}` span
+    /// of a line is not one of `spans`.
+    fn assert_all_under(&self, spans: &[&str]) {
+        let text = self.text();
+        assert!(!text.is_empty(), "no logs");
+        for line in text.lines() {
+            assert!(
+                outer_session_span(line).is_some_and(|span| spans.contains(&span)),
+                "not under {spans:?}: {line}"
             );
         }
     }
@@ -96,10 +109,20 @@ fn split_line(line: &str) -> Option<(Option<&str>, &str)> {
     Some((spans, message))
 }
 
-/// The `session{...}` span of a log line.
+/// The innermost `session{...}` span of a log line.
 fn session_span(line: &str) -> Option<&str> {
+    session_span_at(line, |spans| spans.rfind("session{"))
+}
+
+/// The outermost `session{...}` span of a log line.
+fn outer_session_span(line: &str) -> Option<&str> {
+    session_span_at(line, |spans| spans.find("session{"))
+}
+
+/// The `session{...}` span of a log line that starts where `find` says.
+fn session_span_at(line: &str, find: impl Fn(&str) -> Option<usize>) -> Option<&str> {
     let spans = split_line(line)?.0?;
-    let start = spans.find("session{")?;
+    let start = find(spans)?;
     let end = start + spans[start..].find('}')?;
     Some(&spans[start..=end])
 }

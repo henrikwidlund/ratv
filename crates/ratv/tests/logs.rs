@@ -1,4 +1,5 @@
-//! Checks that logs are in the `session` span of their connection or pairing.
+//! Checks that logs are in the `session` span of their connection, pairing or
+//! `AppleTv` connect.
 //!
 //! One test in its own binary: no other test thread can register a log
 //! callsite while the capture starts, which could turn it off.
@@ -15,8 +16,11 @@ mod mrp_device {
         mod tests {
             use std::sync::{Arc, Mutex};
 
+            use ed25519_dalek::SigningKey;
             use ratv::companion::{self, HidCommand, SiriOptions};
             use ratv::mrp::{self, Button};
+            use ratv::{AppleTv, Endpoints};
+            use ratv_hap::accessory::PairedController;
             use tokio::net::TcpListener;
 
             use super as companion_fake;
@@ -28,6 +32,7 @@ mod mrp_device {
             async fn logs_are_in_session_span() {
                 companion_logs().await;
                 mrp_logs().await;
+                apple_tv_logs().await;
             }
 
             /// Pairing, connect, task, request and Siri logs are in a `session`
@@ -139,6 +144,70 @@ mod mrp_device {
                     assert_eq!(logs.span_of(message), session, "{message}");
                 }
                 logs.assert_all_in(&[&pairing, &session]);
+            }
+
+            /// `AppleTv::connect` and `connect_missing` logs are in a `session`
+            /// span with the protocol and a new id. The connection spans are
+            /// inside it. A protocol that stays open keeps the first span.
+            async fn apple_tv_logs() {
+                let (logs, _guard) = LogBuffer::capture();
+                let controller = PairedController {
+                    id: mrp_fake::CLIENT_ID.to_vec(),
+                    ltpk: SigningKey::from_bytes(&mrp_fake::CLIENT_SEED)
+                        .verifying_key()
+                        .to_bytes(),
+                    metadata: None,
+                };
+                let comp_addr = companion_fake::listen(controller, Arc::default()).await;
+                let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let closed_addr = closed.local_addr().unwrap();
+                drop(closed);
+                let credentials = mrp_fake::credentials();
+                let options = mrp_fake::options();
+                let first = Endpoints {
+                    companion: Some(comp_addr),
+                    airplay: Some(closed_addr),
+                };
+                let tv = AppleTv::connect(&first, &credentials, &options)
+                    .await
+                    .unwrap();
+                let device = mrp_fake::start_device().await;
+                let second = Endpoints {
+                    companion: Some(comp_addr),
+                    airplay: Some(format!("127.0.0.1:{}", device.port).parse().unwrap()),
+                };
+                let tv = tv
+                    .connect_missing(&second, &credentials, &options)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                tv.close().await.unwrap();
+
+                let first_span = logs.span_of("one protocol failed to connect");
+                let first_id = session_id(&first_span);
+                assert_eq!(
+                    first_span,
+                    format!("session{{protocol=\"apple tv\" id={first_id}}}")
+                );
+                assert_eq!(logs.span_of("connection failed"), first_span);
+                let second_span = logs.span_of("connected companion=true mrp=true");
+                let second_id = session_id(&second_span);
+                assert_eq!(
+                    second_span,
+                    format!("session{{protocol=\"apple tv\" id={second_id}}}")
+                );
+                assert_ne!(first_id, second_id);
+                let text = logs.text();
+                for inner in [
+                    format!("{first_span}:session{{protocol=\"companion\" id="),
+                    format!("{first_span}:session{{protocol=\"mrp\" id="),
+                    format!("{second_span}:session{{protocol=\"mrp\" id="),
+                ] {
+                    assert!(text.contains(&inner), "{inner}");
+                }
+                // Companion stayed connected, so the second connect did not open it.
+                assert!(!text.contains(&format!("{second_span}:session{{protocol=\"companion\"")));
+                logs.assert_all_under(&[&first_span, &second_span]);
             }
         }
     }
