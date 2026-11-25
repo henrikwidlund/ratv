@@ -17,6 +17,7 @@ bytes.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+allocation-counter.workspace = true
 ratv-hap = { workspace = true, features = ["accessory"] }
 proptest.workspace = true
 

@@ -23,6 +23,7 @@ proptest = "1.12.0"
 prost = { version = "0.14.6", default-features = false, features = ["std"] }
 rand_core = "0.10.1"
 ed25519-dalek = "3.0.0"
+allocation-counter = "0.8.1"
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.rust]

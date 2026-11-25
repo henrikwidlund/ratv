@@ -30,6 +30,7 @@ base16ct = { version = "1.0.0", features = ["alloc"] }
 crypto-bigint = { version = "0.7.10", default-features = false, features = ["zeroize"] }
 
 [dev-dependencies]
+allocation-counter.workspace = true
 criterion.workspace = true
 proptest.workspace = true
 

@@ -89,3 +89,10 @@ path = "fuzz_targets/archive.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "datastream"
+path = "fuzz_targets/datastream.rs"
+test = false
+doc = false
+bench = false

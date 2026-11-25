@@ -16,6 +16,9 @@ pub const MAX_DEPTH: usize = 32;
 /// Below it, a linear search is faster.
 const SET_FROM: usize = 32;
 
+/// Object table entries kept without allocating.
+const INLINE: usize = 16;
+
 const TERMINATOR: u8 = 0x03;
 const ENDLESS: usize = 0xF;
 
@@ -259,7 +262,7 @@ impl From<Vec<u8>> for Value<'_> {
 pub struct Encoder<'b> {
     out: &'b mut Vec<u8>,
     // Byte ranges in `out` of values in the object table.
-    objects: Vec<(usize, usize)>,
+    objects: Table<(usize, usize)>,
 }
 
 impl<'b> Encoder<'b> {
@@ -267,7 +270,7 @@ impl<'b> Encoder<'b> {
     pub const fn new(out: &'b mut Vec<u8>) -> Self {
         Self {
             out,
-            objects: Vec::new(),
+            objects: Table::new((0, 0)),
         }
     }
 
@@ -439,7 +442,7 @@ impl<'b> Encoder<'b> {
         let found = self
             .objects
             .iter()
-            .position(|&(s, e)| self.out[s..e] == *new);
+            .position(|(s, e)| self.out[s..e] == *new);
         match found {
             Some(index) => {
                 self.out.truncate(start);
@@ -480,25 +483,74 @@ pub fn decode(input: &[u8]) -> Result<Value<'_>, Error> {
 /// Decodes one OPACK value from the start of `input` and returns the remaining bytes.
 pub fn decode_prefix(input: &[u8]) -> Result<(Value<'_>, &[u8]), Error> {
     let mut d = Decoder {
-        input,
-        pos: 0,
-        objects: Vec::new(),
+        cur: Cursor { input, pos: 0 },
+        objects: Table::new(&[]),
         seen: None,
     };
     let value = d.value(0)?;
-    Ok((value, &input[d.pos..]))
+    Ok((value, &input[d.cur.pos..]))
 }
 
 struct Decoder<'a> {
-    input: &'a [u8],
-    pos: usize,
+    cur: Cursor<'a>,
     // Encoded byte ranges of values in the object table.
-    objects: Vec<&'a [u8]>,
+    objects: Table<&'a [u8]>,
     // Same values as `objects`, once the table is large.
     seen: Option<HashSet<&'a [u8]>>,
 }
 
-impl<'a> Decoder<'a> {
+/// Reads bytes and scalar values. Knows nothing about the object table.
+struct Cursor<'a> {
+    input: &'a [u8],
+    pos: usize,
+}
+
+/// Object table. The first [`INLINE`] entries need no allocation.
+struct Table<T> {
+    inline: [T; INLINE],
+    more: Vec<T>,
+    len: usize,
+}
+
+impl<T: Copy> Table<T> {
+    const fn new(empty: T) -> Self {
+        Self {
+            inline: [empty; INLINE],
+            more: Vec::new(),
+            len: 0,
+        }
+    }
+
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, value: T) {
+        if self.len < INLINE {
+            self.inline[self.len] = value;
+        } else {
+            self.more.push(value);
+        }
+        self.len += 1;
+    }
+
+    fn get(&self, index: usize) -> Option<T> {
+        if index < INLINE {
+            (index < self.len).then(|| self.inline[index])
+        } else {
+            self.more.get(index - INLINE).copied()
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = T> + '_ {
+        self.inline[..self.len.min(INLINE)]
+            .iter()
+            .chain(&self.more)
+            .copied()
+    }
+}
+
+impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
         let end = self.pos.checked_add(n).ok_or(Error::UnexpectedEof)?;
         let bytes = self.input.get(self.pos..end).ok_or(Error::UnexpectedEof)?;
@@ -528,15 +580,20 @@ impl<'a> Decoder<'a> {
         usize::try_from(self.uint(width)?).map_err(|_| Error::UnexpectedEof)
     }
 
-    fn value(&mut self, depth: usize) -> Result<Value<'a>, Error> {
-        let start = self.pos;
-        let tag = self.byte()?;
-        let value = match tag {
-            0x01 => return Ok(Value::Bool(true)),
-            0x02 => return Ok(Value::Bool(false)),
-            0x04 => return Ok(Value::Null),
-            0x07 => return Ok(Value::Int(-1)),
-            0x08..=0x2F => return Ok(Value::Int(i64::from(tag - 0x08))),
+    fn str(&mut self, n: usize) -> Result<Value<'a>, Error> {
+        let bytes = self.take(n)?;
+        let s = std::str::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)?;
+        Ok(Value::Str(Cow::Borrowed(s)))
+    }
+
+    /// Reads the scalar value after `tag`.
+    fn scalar(&mut self, tag: u8) -> Result<Value<'a>, Error> {
+        Ok(match tag {
+            0x01 => Value::Bool(true),
+            0x02 => Value::Bool(false),
+            0x04 => Value::Null,
+            0x07 => Value::Int(-1),
+            0x08..=0x2F => Value::Int(i64::from(tag - 0x08)),
             0x05 => Value::Uuid(self.take(16)?.try_into().expect("16 bytes")),
             0x06 => Value::Date(f64::from_le_bytes(
                 self.take(8)?.try_into().expect("8 bytes"),
@@ -577,56 +634,61 @@ impl<'a> Decoder<'a> {
                 let n = self.len(1 << (tag - 0x91))?;
                 Value::Data(Cow::Borrowed(self.take(n)?))
             }
-            0xA0..=0xC0 => return self.reference(usize::from(tag - 0xA0)),
-            0xC1..=0xC4 => {
-                let index = self.len(1 << (tag - 0xC1))?;
-                return self.reference(index);
-            }
-            0xD0..=0xDF => return self.array(usize::from(tag & 0x0F), depth),
-            0xE0..=0xEF => return self.dict(usize::from(tag & 0x0F), depth),
             _ => return Err(Error::InvalidTag(tag)),
-        };
-        let span = &self.input[start..self.pos];
-        if span.len() > 1 {
-            self.remember(span);
+        })
+    }
+}
+
+impl<'a> Decoder<'a> {
+    fn value(&mut self, depth: usize) -> Result<Value<'a>, Error> {
+        let start = self.cur.pos;
+        let tag = self.cur.byte()?;
+        match tag {
+            0xA0..=0xC0 => self.reference(usize::from(tag - 0xA0)),
+            0xC1..=0xC4 => {
+                let index = self.cur.len(1 << (tag - 0xC1))?;
+                self.reference(index)
+            }
+            0xD0..=0xDF => self.array(usize::from(tag & 0x0F), depth),
+            0xE0..=0xEF => self.dict(usize::from(tag & 0x0F), depth),
+            _ => {
+                let value = self.cur.scalar(tag)?;
+                let span = &self.cur.input[start..self.cur.pos];
+                if span.len() > 1 {
+                    self.remember(span);
+                }
+                Ok(value)
+            }
         }
-        Ok(value)
     }
 
     /// Adds `span` to the object table if it is not there yet.
     fn remember(&mut self, span: &'a [u8]) {
         let new = match &mut self.seen {
             Some(seen) => seen.insert(span),
-            None => !self.objects.contains(&span),
+            None => !self.objects.iter().any(|s| s == span),
         };
         if !new {
             return;
         }
         self.objects.push(span);
         if self.seen.is_none() && self.objects.len() >= SET_FROM {
-            self.seen = Some(self.objects.iter().copied().collect());
+            self.seen = Some(self.objects.iter().collect());
         }
     }
 
-    fn str(&mut self, n: usize) -> Result<Value<'a>, Error> {
-        let bytes = self.take(n)?;
-        let s = std::str::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)?;
-        Ok(Value::Str(Cow::Borrowed(s)))
-    }
-
     fn reference(&self, index: usize) -> Result<Value<'a>, Error> {
-        let span = *self
+        let span = self
             .objects
             .get(index)
             .ok_or(Error::InvalidReference(index))?;
-        // Table entries are always scalars, so this never recurses further.
-        let mut sub = Decoder {
+        // Table entries are always scalars.
+        let mut cur = Cursor {
             input: span,
             pos: 0,
-            objects: Vec::new(),
-            seen: None,
         };
-        sub.value(MAX_DEPTH)
+        let tag = cur.byte()?;
+        cur.scalar(tag)
     }
 
     fn items(
@@ -639,10 +701,10 @@ impl<'a> Decoder<'a> {
             return Err(Error::TooDeep);
         }
         if count == ENDLESS {
-            while self.peek()? != TERMINATOR {
+            while self.cur.peek()? != TERMINATOR {
                 f(self)?;
             }
-            self.pos += 1;
+            self.cur.pos += 1;
         } else {
             for _ in 0..count {
                 f(self)?;
@@ -893,6 +955,70 @@ mod tests {
         // s40 -> 1-byte index, s299 -> 2-byte index.
         assert_eq!(out[out.len() - 6..], [0xC1, 40, 0xC2, 0x2B, 0x01, 0x03]);
         assert_eq!(decode(&out).unwrap(), v);
+    }
+
+    #[test]
+    fn references_at_table_boundaries() {
+        // 40 values fill the 16 inline entries and the Vec after them. The
+        // hash set starts at 32.
+        let mut items: Vec<Value<'_>> = (0..40u32).map(|i| Value::from(format!("s{i}"))).collect();
+        for i in [0, 15, 16, 31, 32, 39] {
+            items.push(Value::from(format!("s{i}")));
+        }
+        let v = Value::Array(items);
+        let out = enc(&v);
+        // Indexes up to 32 take one byte, 39 takes 0xC1 and a 1-byte index.
+        // Then the terminator.
+        assert_eq!(
+            out[out.len() - 8..],
+            [
+                0xA0,
+                0xA0 + 15,
+                0xA0 + 16,
+                0xA0 + 31,
+                0xA0 + 32,
+                0xC1,
+                39,
+                0x03
+            ]
+        );
+        assert_eq!(decode(&out).unwrap(), v);
+    }
+
+    #[test]
+    fn reference_past_table_after_inline_entries() {
+        for (count, index) in [(16u8, 16u8), (20, 20), (20, 25)] {
+            let items: Vec<Value<'_>> = (0..count).map(|i| Value::from(format!("s{i}"))).collect();
+            let mut out = enc(&Value::Array(items));
+            // An array of 15 or more items ends with a terminator.
+            assert_eq!(out.pop(), Some(0x03));
+            out.extend_from_slice(&[0xC1, index, 0x03]);
+            assert_eq!(
+                decode(&out),
+                Err(Error::InvalidReference(usize::from(index)))
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_literal_after_inline_entries() {
+        // A literal copy of a known value is not added again, in both the
+        // linear search (20 values) and the hash set (40 values).
+        for (count, copy) in [(20u8, 18u8), (40, 35)] {
+            let mut out = Vec::new();
+            Encoder::new(&mut out).array(usize::from(count) + 2, |e| {
+                for i in 0..count {
+                    e.str(&format!("s{i}"));
+                }
+            });
+            assert_eq!(out.pop(), Some(0x03));
+            out.extend_from_slice(&enc(&Value::from(format!("s{copy}"))));
+            out.extend_from_slice(&[0xC1, count, 0x03]);
+            assert_eq!(
+                decode(&out),
+                Err(Error::InvalidReference(usize::from(count)))
+            );
+        }
     }
 
     #[test]

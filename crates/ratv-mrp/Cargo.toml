@@ -18,6 +18,7 @@ thiserror.workspace = true
 rusty-opus = { version = "1.0.2", optional = true }
 
 [dev-dependencies]
+allocation-counter.workspace = true
 criterion.workspace = true
 proptest.workspace = true
 

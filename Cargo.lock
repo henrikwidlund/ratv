@@ -31,6 +31,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocation-counter"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beb9e990c0a33699f1984d85a6abead615ccc72dd8130bf3e15dcabe2ca149c9"
+
+[[package]]
 name = "anes"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1005,6 +1011,7 @@ dependencies = [
 name = "ratv-airplay"
 version = "0.1.0"
 dependencies = [
+ "allocation-counter",
  "bytes",
  "proptest",
  "ratv-codec",
@@ -1016,6 +1023,7 @@ dependencies = [
 name = "ratv-codec"
 version = "0.1.0"
 dependencies = [
+ "allocation-counter",
  "criterion",
  "proptest",
  "thiserror",
@@ -1025,6 +1033,7 @@ dependencies = [
 name = "ratv-companion"
 version = "0.1.0"
 dependencies = [
+ "allocation-counter",
  "bytes",
  "criterion",
  "ratv-codec",
@@ -1044,6 +1053,7 @@ dependencies = [
 name = "ratv-hap"
 version = "0.1.0"
 dependencies = [
+ "allocation-counter",
  "base16ct",
  "chacha20poly1305",
  "criterion",
@@ -1065,6 +1075,7 @@ dependencies = [
 name = "ratv-mrp"
 version = "0.1.0"
 dependencies = [
+ "allocation-counter",
  "bytes",
  "criterion",
  "proptest",

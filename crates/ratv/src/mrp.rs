@@ -58,6 +58,7 @@ use crate::{Credentials, Error, log, rng, tcp};
 /// Encoded messages that are not sent yet. Checked before each push, so the
 /// outbox can be larger than this by one message. Button and Siri releases skip it.
 const MAX_OUTBOX: usize = 1 << 20;
+/// The docs of `Client::messages` name this value.
 const MESSAGE_CAPACITY: usize = 64;
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
 /// The device answers each feedback request. When the first request sent
@@ -659,6 +660,10 @@ impl Client {
     /// `RecvError::Lagged`. For state, use [`now_playing`](Self::now_playing)
     /// and [`volume`](Self::volume): they always have the latest value.
     /// The receiver closes when the connection closes.
+    ///
+    /// An [`Envelope`] shares memory with the read buffer it came from. Each
+    /// `Envelope` you keep, and each unread message (up to 64), keeps that
+    /// memory in use. Drop the receiver when you no longer read from it.
     #[must_use]
     pub fn messages(&self) -> broadcast::Receiver<Envelope> {
         crate::subscribe(&self.inner.messages)

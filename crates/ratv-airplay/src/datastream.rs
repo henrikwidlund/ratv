@@ -189,6 +189,9 @@ fn mrp_data(msg: &Bytes) -> Result<Option<Bytes>, Error> {
     if payload.is_empty() {
         return Ok(None);
     }
+    if let Some(data) = known_layout_data(payload) {
+        return Ok((!data.is_empty()).then(|| msg.slice_ref(data)));
+    }
     let plist = bplist::decode(payload)?;
     Ok(plist
         .get("params")
@@ -196,6 +199,49 @@ fn mrp_data(msg: &Bytes) -> Result<Option<Bytes>, Error> {
         .and_then(Value::as_bytes)
         .filter(|d| !d.is_empty())
         .map(|d| msg.slice_ref(d)))
+}
+
+/// `params.data` without decoding, if `payload` has the object layout that
+/// [`write_payload`] writes, with any integer and offset width. `None` for
+/// any other layout.
+fn known_layout_data(payload: &[u8]) -> Option<&[u8]> {
+    let rest = payload.strip_prefix(PAYLOAD_START)?;
+    let (&marker, rest) = rest.split_first()?;
+    let (len, rest) = match marker {
+        0x40..=0x4E => (usize::from(marker & 0x0F), rest),
+        0x4F => {
+            let (&int, rest) = rest.split_first()?;
+            let width = match int {
+                0x10 => 1,
+                0x11 => 2,
+                0x12 => 4,
+                0x13 => 8,
+                _ => return None,
+            };
+            let (n, rest) = rest.split_at_checked(width)?;
+            let mut be = [0u8; 8];
+            be[8 - width..].copy_from_slice(n);
+            (usize::try_from(u64::from_be_bytes(be)).ok()?, rest)
+        }
+        _ => return None,
+    };
+    let (data, tail) = rest.split_at_checked(len)?;
+    let table = payload.len() - tail.len();
+    let (offsets, trailer) = tail.split_at_checked(tail.len().checked_sub(32)?)?;
+    let offset_size = usize::from(trailer[6]);
+    let layout_ok = matches!(offset_size, 1 | 2 | 4 | 8)
+        && trailer[7] == 1
+        && trailer[8..16] == (PAYLOAD_OFFSETS.len() as u64).to_be_bytes()
+        && trailer[16..24] == [0; 8]
+        && trailer[24..32] == (table as u64).to_be_bytes()
+        && offsets.len() == offset_size * PAYLOAD_OFFSETS.len()
+        && offsets
+            .chunks_exact(offset_size)
+            .zip(PAYLOAD_OFFSETS)
+            .all(|(entry, want)| {
+                entry[offset_size - 1] == want && entry[..offset_size - 1].iter().all(|&b| b == 0)
+            });
+    layout_ok.then_some(data)
 }
 
 #[cfg(test)]
@@ -213,6 +259,107 @@ mod tests {
     fn deliver(from: &mut DataStream, to: &mut DataStream) {
         let bytes = from.take_transmit();
         to.receive_buffer(bytes.len()).extend_from_slice(&bytes);
+    }
+
+    /// `params.data` from a full plist decode.
+    fn decoded_data(payload: &[u8]) -> Option<Vec<u8>> {
+        bplist::decode(payload).ok().and_then(|plist| {
+            plist
+                .get("params")
+                .and_then(|p| p.get("data"))
+                .and_then(Value::as_bytes)
+                .map(<[u8]>::to_vec)
+        })
+    }
+
+    #[test]
+    fn known_layout_matches_decoder() {
+        for len in [0, 14, 15, 255, 256, 65_535, 65_536, 100_000] {
+            let data: Vec<u8> = (0..=255u8).cycle().take(len).collect();
+            let mut payload = Vec::new();
+            write_payload(&data, &mut payload);
+            assert_eq!(
+                known_layout_data(&payload),
+                Some(data.as_slice()),
+                "len {len}"
+            );
+            assert_eq!(decoded_data(&payload).as_deref(), Some(data.as_slice()));
+        }
+    }
+
+    #[test]
+    fn other_layout_is_decoded() {
+        // An extra key changes the layout: the full decoder still finds the data.
+        let value = Value::Dict(vec![
+            ("x".into(), Value::Int(1)),
+            (
+                "params".into(),
+                Value::Dict(vec![("data".into(), Value::Data([1, 2, 3][..].into()))]),
+            ),
+        ]);
+        let payload = value.encode();
+        assert_eq!(known_layout_data(&payload), None);
+        let mut msg = vec![0; HEADER_LEN];
+        msg.extend_from_slice(&payload);
+        let data = mrp_data(&Bytes::from(msg)).unwrap().unwrap();
+        assert_eq!(&data[..], [1, 2, 3]);
+    }
+
+    #[test]
+    fn known_layout_with_widest_fields() {
+        // 8-byte data length and 8-byte offset entries are valid, though
+        // `write_payload` uses smaller ones.
+        let data = [5u8; 20];
+        let mut payload = PAYLOAD_START.to_vec();
+        payload.extend_from_slice(&[0x4F, 0x13]);
+        payload.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        payload.extend_from_slice(&data);
+        let table = payload.len() as u64;
+        for offset in PAYLOAD_OFFSETS {
+            payload.extend_from_slice(&u64::from(offset).to_be_bytes());
+        }
+        payload.extend_from_slice(&[0, 0, 0, 0, 0, 0, 8, 1]);
+        payload.extend_from_slice(&(PAYLOAD_OFFSETS.len() as u64).to_be_bytes());
+        payload.extend_from_slice(&0u64.to_be_bytes());
+        payload.extend_from_slice(&table.to_be_bytes());
+        assert_eq!(known_layout_data(&payload), Some(&data[..]));
+        assert_eq!(decoded_data(&payload).as_deref(), Some(&data[..]));
+    }
+
+    #[test]
+    fn empty_data_is_none() {
+        let mut msg = vec![0; HEADER_LEN];
+        write_payload(&[], &mut msg);
+        assert_eq!(known_layout_data(&msg[HEADER_LEN..]), Some(&[][..]));
+        assert_eq!(mrp_data(&Bytes::from(msg)).unwrap(), None);
+    }
+
+    proptest::proptest! {
+        /// A changed, removed or added byte, or a cut-off end, either keeps the
+        /// known layout with the same result as the decoder, or makes the
+        /// layout unknown.
+        #[test]
+        fn known_layout_never_differs_from_decoder(
+            data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..300),
+            index in proptest::prelude::any::<proptest::sample::Index>(),
+            byte in proptest::prelude::any::<u8>(),
+            change in 0u8..4,
+        ) {
+            let mut payload = Vec::new();
+            write_payload(&data, &mut payload);
+            let i = index.index(payload.len());
+            match change {
+                0 => payload[i] = byte,
+                1 => {
+                    payload.remove(i);
+                }
+                2 => payload.truncate(i),
+                _ => payload.insert(i, byte),
+            }
+            if let Some(fast) = known_layout_data(&payload) {
+                proptest::prop_assert_eq!(Some(fast.to_vec()), decoded_data(&payload));
+            }
+        }
     }
 
     #[test]
