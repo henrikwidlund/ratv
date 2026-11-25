@@ -59,6 +59,7 @@ ratv-companion.workspace = true
 tokio = { version = "1", features = ["full", "test-util"] }
 ed25519-dalek.workspace = true
 prost.workspace = true
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[example]]
@@ -95,6 +96,10 @@ required-features = ["mrp"]
 
 [[test]]
 name = "both"
+required-features = ["companion", "mrp"]
+
+[[test]]
+name = "logs"
 required-features = ["companion", "mrp"]
 
 [lints]

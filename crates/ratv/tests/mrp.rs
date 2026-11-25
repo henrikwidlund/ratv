@@ -1312,29 +1312,6 @@ async fn apple_tv_fails_when_nothing_connects() {
     assert!(matches!(err, Error::Io(_)));
 }
 
-/// Fake AirPlay pair-setup. Returns the paired controller and the client names it saw.
-async fn pair_device(listener: TcpListener) -> (Option<PairedController>, Vec<String>) {
-    let (mut s, _) = listener.accept().await.unwrap();
-    let mut ch = Channel::new();
-    let mut server = PairSetupServer::new(DEVICE_ID, &DEVICE_LTSK, "1234", [9; 16], &[0x77; 32]);
-    let mut names = Vec::new();
-    while server.controller().is_none() {
-        let Some(req) = read_msg(&mut s, &mut ch).await else {
-            break;
-        };
-        names.extend(req.header("X-Apple-Client-Name").map(str::to_owned));
-        match (req.method().unwrap(), req.uri().unwrap()) {
-            ("POST", "/pair-pin-start") => reply(&mut s, &mut ch, &req, b"").await,
-            ("POST", "/pair-setup") => {
-                let out = server.handle(&req.body()).unwrap();
-                reply(&mut s, &mut ch, &req, &out).await;
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-    (server.controller().cloned(), names)
-}
-
 #[tokio::test]
 async fn pairing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
