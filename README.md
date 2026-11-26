@@ -199,7 +199,8 @@ cargo build -p ratv --no-default-features --features companion --profile embedde
 ## Logging
 
 The library logs with [`tracing`](https://docs.rs/tracing). Each connection
-and pairing has a `session` span with `protocol`, `id` and `addr`.
+and pairing has a `session` span with `protocol`, `id` and `addr`. A
+connection or pairing on a given stream has no `addr`.
 `AppleTv::connect` and `connect_missing` have a `session` span with
 `protocol="apple tv"` and `id`. The spans of their connections are inside it.
 After `connect_missing`, protocols that stayed open keep the span of the
@@ -209,8 +210,12 @@ earlier connect.
 - `debug`: connect, disconnect, handshake steps, failed or timed out requests, Siri steps.
 - `trace`: each message sent and received, with kind, id and size.
 
-Errors are returned, not logged. Credentials, keys, PINs, text, account data
-and audio are not logged. Feature `sensitive-logs` adds full messages at `trace`.
+Errors are returned. Some are also logged at `debug`, for example a failed
+connect step. `AppleTv` connect logs a `warn` when one protocol did not
+connect, because the connect can succeed without it.
+
+Credentials, keys, PINs, text, account data and audio are not logged. Feature
+`sensitive-logs` adds full messages at `trace`.
 
 ```sh
 RUST_LOG=ratv=debug cargo run --example remote -- tv.credentials play
