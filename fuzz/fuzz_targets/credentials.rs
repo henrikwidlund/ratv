@@ -13,5 +13,8 @@ fuzz_target!(|data: &[u8]| {
     };
     let again = credentials.to_secret_string();
     assert_eq!(again.expose_secret(), text.trim().to_ascii_lowercase());
-    assert_eq!(again.expose_secret().parse::<Credentials>().unwrap(), credentials);
+    assert_eq!(
+        again.expose_secret().parse::<Credentials>().unwrap(),
+        credentials
+    );
 });

@@ -252,6 +252,8 @@ cargo clippy --workspace --all-targets --all-features
 cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 cargo deny check
+cargo fmt --manifest-path fuzz/Cargo.toml
+cargo clippy --manifest-path fuzz/Cargo.toml --all-targets
 ```
 
 Fuzz targets: [`fuzz`](fuzz), for example `cargo +nightly fuzz run opack`.

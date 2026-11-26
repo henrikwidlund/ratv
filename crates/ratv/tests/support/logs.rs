@@ -39,6 +39,11 @@ impl LogBuffer {
             .with_writer(move || writer.clone())
             .finish()
             .set_default();
+        // A thread that starts to register a callsite before this dispatcher
+        // exists can store that the callsite is off, after the rebuild that
+        // `set_default` runs.
+        // A second rebuild turns such callsites on again.
+        tracing::callsite::rebuild_interest_cache();
         (logs, guard)
     }
 

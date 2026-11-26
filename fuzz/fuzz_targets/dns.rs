@@ -99,8 +99,7 @@ fuzz_target!(|data: &[u8]| {
                 assert!(!matches!(a.ip, IpAddr::V4(v4) if v4.is_broadcast()));
                 // Only link-local IPv6 addresses have a scope id.
                 assert!(
-                    a.scope_id == 0
-                        || matches!(a.ip, IpAddr::V6(ip) if ip.is_unicast_link_local())
+                    a.scope_id == 0 || matches!(a.ip, IpAddr::V6(ip) if ip.is_unicast_link_local())
                 );
                 // No duplicates, and never the same IP with and without a scope id.
                 for b in &addrs[i + 1..] {

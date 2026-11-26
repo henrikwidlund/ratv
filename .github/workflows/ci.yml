@@ -141,7 +141,7 @@ jobs:
         run: cargo build --locked -p ratv --profile embedded --target ${{ matrix.target }}
 
   fuzz:
-    name: Fuzz targets compile
+    name: Fuzz targets
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -150,7 +150,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        run: rustup update stable && rustup default stable
+        run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
 
       - name: Cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -158,8 +158,10 @@ jobs:
           workspaces: fuzz
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Check
-        run: cargo check --locked --manifest-path fuzz/Cargo.toml
+      - name: Format and clippy
+        run: |
+          cargo fmt --manifest-path fuzz/Cargo.toml --check
+          cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets
 
   coverage:
     name: Coverage

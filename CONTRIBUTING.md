@@ -55,6 +55,8 @@ Describe breaking changes in the PR and explain why they are needed.
     cargo test --locked --workspace --all-features
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --all-features
     cargo deny check
+    cargo fmt --manifest-path fuzz/Cargo.toml --check
+    RUSTFLAGS="-D warnings" cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets
     ```
     - All checks must pass.
 7. Create a PR against the **main** branch.

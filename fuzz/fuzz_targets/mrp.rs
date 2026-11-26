@@ -46,7 +46,11 @@ fuzz_target!(|data: &[u8]| {
             // Current automatic subtitles are always in the list.
             let subtitles = &np.subtitle_languages;
             assert!(!np.subtitles_auto() || subtitles.iter().any(|o| o.is_auto()));
-            assert!(np.chapters.iter().all(|c| c.duration.is_none_or(|d| d >= 0.0)));
+            assert!(
+                np.chapters
+                    .iter()
+                    .all(|c| c.duration.is_none_or(|d| d >= 0.0))
+            );
             // Normal speeds: sorted, above 0 and up to 2.0, with 1.0.
             let speeds = np.playback_speeds();
             assert!(speeds.is_sorted());
@@ -87,7 +91,10 @@ fuzz_target!(|data: &[u8]| {
                 assert!(v.is_none_or(f64::is_finite));
             }
             let _ = np.artwork_url_sized(100, 100);
-            let _ = (np.playback_speeds(), np.rate.map(|r| np.is_playback_speed(r)));
+            let _ = (
+                np.playback_speeds(),
+                np.rate.map(|r| np.is_playback_speed(r)),
+            );
             let _ = state.player_without_item();
         }
     }
