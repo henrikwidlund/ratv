@@ -956,7 +956,8 @@ impl Client {
     }
 
     /// Requests the image of the current item in about this size in pixels.
-    /// A size of 0 keeps the aspect ratio, as in [`NowPlaying::artwork_url_sized`].
+    /// A size of 0 keeps the aspect ratio. [`NowPlaying::artwork_url_sized`] has
+    /// another rule for 0.
     /// `None` if the item has no image.
     ///
     /// Right after connect the device may not answer with an image yet.

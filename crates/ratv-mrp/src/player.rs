@@ -246,7 +246,8 @@ impl NowPlaying {
     }
 
     /// Artwork URL for about this size, if the app provides one.
-    /// A size of 0 keeps the aspect ratio. Download it with any HTTP client.
+    /// If one size is 0, the other size is used for both. If both are 0, the
+    /// size is 600 x 600. Download it with any HTTP client.
     #[must_use]
     pub fn artwork_url_sized(&self, width: u32, height: u32) -> Option<String> {
         // Some apps send a URL template like `.../{w}x{h}bb.jpg`.
@@ -257,12 +258,16 @@ impl NowPlaying {
         let Some(template) = template else {
             return self.artwork_url.clone();
         };
-        // The image server keeps the aspect ratio for a large value.
-        let size = |v: u32| if v == 0 { 999_999 } else { v };
+        // The image server refuses very large sizes. Most images are square.
+        let (width, height) = match (width, height) {
+            (0, 0) => (600, 600),
+            (0, n) | (n, 0) => (n, n),
+            size => size,
+        };
         Some(
             template
-                .replace("{w}", &size(width).to_string())
-                .replace("{h}", &size(height).to_string())
+                .replace("{w}", &width.to_string())
+                .replace("{h}", &height.to_string())
                 .replace("{c}", "bb")
                 .replace("{f}", "jpg"),
         )
@@ -635,6 +640,9 @@ impl Client {
 pub struct NowPlayingState {
     clients: Vec<Client>,
     active_client: Option<String>,
+    /// A `SetNowPlayingClientMessage` with a bundle id was received. Until
+    /// then, the client of the now playing player is the active client.
+    client_message_seen: bool,
     /// Buffer for merging item updates.
     scratch: Vec<u8>,
 }
@@ -670,6 +678,7 @@ impl NowPlayingState {
             if let Some(c) = msg.client.as_ref().and_then(|c| self.client_mut(c)) {
                 let id = c.bundle_id.clone();
                 self.active_client = Some(id);
+                self.client_message_seen = true;
             }
         } else if env.is::<SetNowPlayingPlayerMessage>() {
             self.set_active_player(&env.payload()?);
@@ -698,11 +707,17 @@ impl NowPlayingState {
     }
 
     fn set_active_player(&mut self, msg: &SetNowPlayingPlayerMessage) {
+        let client_message_seen = self.client_message_seen;
         if let Some(path) = &msg.player_path
             && let Some(c) = path.client.as_ref().and_then(|c| self.client_mut(c))
         {
             let id = c.player_mut(path.player.as_ref()).id.clone();
             c.active_player = Some(id);
+            // tvOS 27.2 does not always send `SetNowPlayingClientMessage`.
+            if !client_message_seen {
+                let bundle_id = c.bundle_id.clone();
+                self.active_client = Some(bundle_id);
+            }
         }
     }
 
@@ -1378,8 +1393,20 @@ mod tests {
             ..NowPlaying::default()
         };
         assert_eq!(
-            templated.artwork_url_sized(600, 0).as_deref(),
-            Some("https://img.example.com/cover.jpg/600x999999bb.jpg")
+            templated.artwork_url_sized(500, 0).as_deref(),
+            Some("https://img.example.com/cover.jpg/500x500bb.jpg")
+        );
+        assert_eq!(
+            templated.artwork_url_sized(0, 300).as_deref(),
+            Some("https://img.example.com/cover.jpg/300x300bb.jpg")
+        );
+        assert_eq!(
+            templated.artwork_url_sized(0, 0).as_deref(),
+            Some("https://img.example.com/cover.jpg/600x600bb.jpg")
+        );
+        assert_eq!(
+            templated.artwork_url_sized(400, 300).as_deref(),
+            Some("https://img.example.com/cover.jpg/400x300bb.jpg")
         );
         assert_eq!(NowPlaying::default().artwork_url_sized(1, 1), None);
         // The state does not keep image data.
@@ -1924,6 +1951,68 @@ mod tests {
         assert_eq!(np.title.as_deref(), Some("Song"));
         assert_eq!(np.album.as_deref(), Some("Album"));
         assert_eq!(np.genre.as_deref(), Some("Rock"));
+    }
+
+    #[test]
+    fn active_client_from_player_without_client_message() {
+        let mut s = NowPlayingState::new();
+        let set_player = |s: &mut NowPlayingState, bundle: &str| {
+            let msg = SetNowPlayingPlayerMessage {
+                player_path: path(bundle, Some("p1")),
+            };
+            assert!(s.apply(&env(&msg)).unwrap());
+        };
+        let mut msg = playing();
+        msg.player_path = path("tv", Some("p1"));
+        s.apply(&env(&msg)).unwrap();
+        assert_eq!(s.active_app(), None);
+
+        set_player(&mut s, "tv");
+        assert_eq!(s.active_app(), Some("tv"));
+        assert_eq!(s.now_playing().state, Some(PlaybackState::Playing));
+
+        // A switch to another app follows the player.
+        set_player(&mut s, "other");
+        assert_eq!(s.active_app(), Some("other"));
+
+        // A player message without a bundle id is ignored.
+        let msg = SetNowPlayingPlayerMessage {
+            player_path: Some(PlayerPath {
+                client: Some(NowPlayingClient::default()),
+                ..Default::default()
+            }),
+        };
+        s.apply(&env(&msg)).unwrap();
+        assert_eq!(s.active_app(), Some("other"));
+
+        // A removed client is set again by the next player message.
+        let rm = RemoveClientMessage {
+            client: path("other", None).unwrap().client,
+        };
+        s.apply(&env(&rm)).unwrap();
+        assert_eq!(s.active_app(), None);
+        set_player(&mut s, "other");
+        assert_eq!(s.active_app(), Some("other"));
+
+        // A client message without a bundle id keeps the fallback.
+        let msg = SetNowPlayingClientMessage {
+            client: Some(NowPlayingClient::default()),
+        };
+        s.apply(&env(&msg)).unwrap();
+        set_player(&mut s, "tv");
+        assert_eq!(s.active_app(), Some("tv"));
+
+        // After a client message, only client messages set the active client.
+        set_client(&mut s, "other");
+        set_player(&mut s, "tv");
+        assert_eq!(s.active_app(), Some("other"));
+        // Also after the active client is removed.
+        let rm = RemoveClientMessage {
+            client: path("other", None).unwrap().client,
+        };
+        s.apply(&env(&rm)).unwrap();
+        set_player(&mut s, "tv");
+        assert_eq!(s.active_app(), None);
     }
 
     #[test]

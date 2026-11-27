@@ -90,7 +90,9 @@ fuzz_target!(|data: &[u8]| {
             for v in [np.duration, np.elapsed, np.elapsed_timestamp] {
                 assert!(v.is_none_or(f64::is_finite));
             }
-            let _ = np.artwork_url_sized(100, 100);
+            for (w, h) in [(100, 100), (0, 0), (0, 100)] {
+                let _ = np.artwork_url_sized(w, h);
+            }
             let _ = (
                 np.playback_speeds(),
                 np.rate.map(|r| np.is_playback_speed(r)),
