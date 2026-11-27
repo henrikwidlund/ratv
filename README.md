@@ -6,7 +6,7 @@ Protocols:
 
 - **Companion**: pairing, buttons, apps, power, volume, accounts, text input, touch,
   what is playing (title, state, rate, position, duration, artwork, subtitle state),
-  Siri voice input.
+  media controls of the app in front, Guide button support, Siri voice input.
 - **MRP over AirPlay 2**: what is playing (title, artist, position, state),
   artwork, playback, languages, chapters,
   play queue (Up Next), volume, output devices, Siri voice input.
@@ -188,7 +188,7 @@ The iPhone remote can also do these over Companion. ratv does not do them:
 | `companion`      | yes     | Companion protocol                                           |
 | `mrp`            | yes     | MRP over AirPlay 2                                           |
 | `discovery`      | yes     | mDNS scan                                                    |
-| `opus`           | no      | Siri input as PCM                                            |
+| `opus`           | no      | Siri input as PCM (turns on `mrp`)                           |
 | `sensitive-logs` | no      | Full messages in trace logs. They can contain personal data. |
 
 `AppleTv` needs `companion` and `mrp`. Small build for ARM boards:
