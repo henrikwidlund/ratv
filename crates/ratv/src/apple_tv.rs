@@ -36,7 +36,9 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::Instrument;
 
-use crate::companion::{self, Account, App, ButtonState, HidCommand, MediaControl};
+use crate::companion::{
+    self, Account, App, ButtonState, HidCommand, MediaControl, MediaControlFlags,
+};
 use crate::mrp::{
     self, Artwork, Button, Command, LanguageOption, NowPlaying, PlaybackState, RepeatMode,
     ShuffleMode,
@@ -1322,6 +1324,15 @@ impl AppleTv {
     #[must_use]
     pub fn guide_supported(&self) -> Option<bool> {
         self.open_companion()?.guide_supported()
+    }
+
+    /// Media controls that the app in front supports. Not zero while an app
+    /// shows a player, also when it is paused. Only Companion sends this.
+    /// `None` without an open Companion connection or if the device did not
+    /// say.
+    #[must_use]
+    pub fn media_controls(&self) -> Option<MediaControlFlags> {
+        self.open_companion()?.media_controls()
     }
 
     /// True until one of the connected protocols closes.

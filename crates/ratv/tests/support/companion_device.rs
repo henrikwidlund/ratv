@@ -602,6 +602,23 @@ async fn device_session(mut s: DuplexStream, controller: PairedController, log: 
                 send(&mut s, &mut conn, FrameType::E_OPACK, &ev).await;
                 Some(response(xid, &id, empty))
             }
+            // Test only: the device sends `MediaControlStatus` and `_iMC` with
+            // flags 0, as tvOS 27 does when a player closes.
+            "closePlayer" => {
+                for (event, key) in [("MediaControlStatus", "MediaControlFlags"), ("_iMC", "_mcF")] {
+                    let mut ev = Vec::new();
+                    Encoder::new(&mut ev).dict(4, |e| {
+                        e.str("_i").str(event);
+                        e.str("_x").int(5);
+                        e.str("_t").int(MessageType::Event as i64);
+                        e.str("_c").dict(1, |e| {
+                            e.str(key).int(0);
+                        });
+                    });
+                    send(&mut s, &mut conn, FrameType::E_OPACK, &ev).await;
+                }
+                Some(response(xid, &id, empty))
+            }
             "silent" | "filler" => None,
             _ => panic!("unexpected request {id}"),
         };

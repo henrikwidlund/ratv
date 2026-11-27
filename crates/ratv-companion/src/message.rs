@@ -608,6 +608,9 @@ impl Outgoing for FetchSupportedActions {
 #[allow(missing_docs)]
 pub mod event {
     pub const MEDIA_CONTROL: &str = "_iMC";
+    /// Sent with each `_iMC` on tvOS 27, with the same flags in the
+    /// `MediaControlFlags` key. Not parsed, `_iMC` has the same data.
+    pub const MEDIA_CONTROL_STATUS: &str = "MediaControlStatus";
     pub const SYSTEM_STATUS: &str = "SystemStatus";
     pub const TV_SYSTEM_STATUS: &str = "TVSystemStatus";
     pub const TEXT_INPUT_STARTED: &str = "_tiStarted";

@@ -1084,6 +1084,7 @@ async fn state_read_when_connecting() {
     let (client, _) = connect().await;
     assert_eq!(client.siri_enabled(), Some(true));
     assert_eq!(client.guide_supported(), Some(true));
+    assert_eq!(client.media_controls(), Some(MediaControlFlags(0x103)));
 }
 
 #[tokio::test]
@@ -1209,6 +1210,32 @@ async fn siri_status_event_updates_state() {
         client.start_siri(&companion::SiriOptions::default()).await,
         Err(Error::SiriDisabled)
     ));
+}
+
+#[tokio::test]
+async fn media_control_event_updates_state() {
+    struct ClosePlayer;
+    impl ratv_companion::message::Outgoing for ClosePlayer {
+        const ID: &str = "closePlayer";
+        fn content(&self, e: &mut Encoder<'_>) {
+            empty(e);
+        }
+    }
+    let (client, _) = connect().await;
+    let mut events = client.events();
+    client.request(&ClosePlayer).await.unwrap();
+    assert_eq!(
+        events.recv().await.unwrap(),
+        Event::MediaControl(MediaControlFlags(0))
+    );
+    // `MediaControlStatus` sends no event.
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(client.media_controls(), Some(MediaControlFlags(0)));
+    client.close().await.unwrap();
+    assert_eq!(client.media_controls(), Some(MediaControlFlags(0)));
 }
 
 #[tokio::test]
@@ -1462,6 +1489,7 @@ async fn apple_tv_siri_uses_companion() {
     assert_eq!(log.lock().unwrap().siri, ["start", "3", "stop"]);
     assert_eq!(tv.siri_enabled(), Some(true));
     assert_eq!(tv.guide_supported(), Some(true));
+    assert_eq!(tv.media_controls(), Some(MediaControlFlags(0x103)));
     // The argument is checked before the protocol.
     for (err, field) in [
         (tv.seek(f64::NAN).await.unwrap_err(), "position"),
@@ -1477,6 +1505,7 @@ async fn apple_tv_siri_uses_companion() {
     tv.close().await.unwrap();
     assert_eq!(tv.siri_enabled(), None);
     assert_eq!(tv.guide_supported(), None);
+    assert_eq!(tv.media_controls(), None);
 }
 
 /// A closed Companion connects again, and the new handle has the merged

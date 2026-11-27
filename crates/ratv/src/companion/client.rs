@@ -7,9 +7,9 @@ use bytes::Bytes;
 use ratv_companion::message::{
     self, Account, App, AttentionState, ButtonState, Event, FetchAccounts, FetchApps,
     FetchAttentionState, FetchSupportedActions, Hid, HidCommand, Interest, LaunchApp, MediaControl,
-    Message, MessageType, Outgoing, SessionStart, SessionStop, SiriEndpointReply, SwitchAccount,
-    SystemInfo, TextInputStart, TextInputStop, Touch, TouchPhase, TouchStart, TvRemoteSessionStart,
-    event,
+    MediaControlFlags, Message, MessageType, Outgoing, SessionStart, SessionStop,
+    SiriEndpointReply, SwitchAccount, SystemInfo, TextInputStart, TextInputStop, Touch, TouchPhase,
+    TouchStart, TvRemoteSessionStart, event,
 };
 use ratv_companion::now_playing::{FetchNowPlaying, NowPlaying};
 use ratv_companion::text_input::{self, TextInputCommand, TextSession};
@@ -98,6 +98,8 @@ struct Shared {
     guide_supported: AtomicU8,
     /// Siri on in the device settings, see [`to_flag`].
     siri_enabled: AtomicU8,
+    /// Last [`Event::MediaControl`] flags with [`MEDIA_KNOWN`] set, or 0 if unknown.
+    media_controls: AtomicU64,
     /// Number of [`Event::SiriEndpoint`] requests from the device. A full
     /// event channel can lose an event; a counter cannot.
     siri_endpoints: AtomicU32,
@@ -125,6 +127,9 @@ const fn from_flag(v: u8) -> Option<bool> {
         _ => None,
     }
 }
+
+/// Bit in [`Shared::media_controls`] that marks the flags as known.
+const MEDIA_KNOWN: u64 = 1 << 32;
 
 #[derive(Debug, Default)]
 struct Outbox {
@@ -630,6 +635,16 @@ impl Client {
     #[must_use]
     pub fn guide_supported(&self) -> Option<bool> {
         from_flag(self.inner.shared.guide_supported.load(Ordering::Relaxed))
+    }
+
+    /// Media controls that the app in front supports. Usually read when
+    /// connecting and updated with [`Event::MediaControl`]. Not zero while an
+    /// app shows a player, also when it is paused. `None` if the device did
+    /// not say. Keeps the last value after the connection closes.
+    #[must_use]
+    pub fn media_controls(&self) -> Option<MediaControlFlags> {
+        let v = self.inner.shared.media_controls.load(Ordering::Relaxed);
+        (v & MEDIA_KNOWN != 0).then_some(MediaControlFlags(v as u32))
     }
 
     /// Combined session id.
@@ -1201,10 +1216,13 @@ fn dispatch(
                         .siri_enabled
                         .store(to_flag(Some(enabled)), Ordering::Relaxed),
                     Event::SystemStatus(state) => shared.power_event(state),
+                    Event::MediaControl(flags) => shared
+                        .media_controls
+                        .store(MEDIA_KNOWN | u64::from(flags.0), Ordering::Relaxed),
                     _ => {}
                 }
                 let _ = events.send(event);
-            } else {
+            } else if msg.id() != Some(event::MEDIA_CONTROL_STATUS) {
                 // Debug, not trace: unknown events help to find tvOS changes.
                 tracing::debug!(id = ?msg.id(), "ignoring device event");
             }
