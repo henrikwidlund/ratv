@@ -5,7 +5,8 @@ Rust library to control Apple TV devices on the local network.
 Protocols:
 
 - **Companion**: pairing, buttons, apps, power, volume, accounts, text input, touch,
-  what is playing (title, state, rate, position, duration, artwork, subtitle state).
+  what is playing (title, state, rate, position, duration, artwork, subtitle state),
+  Siri voice input.
 - **MRP over AirPlay 2**: what is playing (title, artist, position, state),
   artwork, playback, languages, chapters,
   play queue (Up Next), volume, output devices, Siri voice input.
@@ -232,6 +233,9 @@ RUST_LOG=ratv=debug cargo run --example remote -- tv.credentials play
 | `ratv-airplay`   | AirPlay 2 RTSP, encrypted channel, data stream |
 | `ratv-mrp`       | MRP messages and player state                  |
 | `ratv-discovery` | mDNS queries and TXT records                   |
+
+Diagrams of the crates and the connection flow:
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Examples
 
