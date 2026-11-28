@@ -11,17 +11,13 @@ Protocols:
   artwork, playback, languages, chapters,
   play queue (Up Next), volume, output devices, Siri voice input.
 
-The Apple TV app sends some fields in a separate archive, not in the normal
-metadata fields. `NowPlaying` (from `AppleTv::now_playing`) reads them too:
-genre and age rating for movies and shows, and season, episode number and
-episode title for shows.
-
 `AppleTv` connects with both protocols. Each method uses the protocol that
-supports it. `AppleTv::now_playing` uses the MRP data, with state and
-position from Companion, which change about 0.5 s sooner.
+supports it.
 
 The protocol crates do no I/O. They take bytes and return bytes. The `ratv`
 crate runs them with tokio.
+
+The version is 0.1. The API can change.
 
 ## Platforms
 
@@ -42,9 +38,12 @@ ratv = { git = "https://github.com/henrikwidlund/ratv" }
 tokio = { version = "1", features = ["macros", "rt"] }
 ```
 
+`cargo doc -p ratv --open` shows the full API.
+
 Pair one time with the PIN that the TV shows. Save the credentials.
 They work for Companion and MRP. They contain a secret key, so only the
-owner must be able to read the file.
+owner must be able to read the file. Get `endpoints` from `scan`, as in the
+next example.
 
 ```rust
 use std::io::Write;
@@ -70,6 +69,11 @@ async fn pair(endpoints: &Endpoints) -> Result<(), Box<dyn std::error::Error>> {
 On Windows the file gets the permissions of its folder. Use a folder in the
 user profile.
 
+The TV lists the pairing in Settings > Remotes and Devices with
+`PairOptions::name` (default: `ratv`). Give each app its own name. When an
+entry is removed there, its credentials stop working. When several entries have
+the same name, removing one can remove the others too.
+
 Find the device and connect:
 
 ```rust
@@ -89,8 +93,7 @@ async fn control() -> Result<(), Box<dyn std::error::Error>> {
     let mut np = tv.now_playing();
     np.changed().await?;
     println!("{:?}", np.borrow().title);
-    // Returns when one connection closes. Close all, then connect again,
-    // or use `connect_missing`.
+    // Returns when one connection closes. See "Connections".
     let reason = tv.closed().await;
     println!("closed: {reason:?}");
     tv.close().await?;
@@ -98,8 +101,30 @@ async fn control() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Siri voice input. Siri must be on in the Apple TV settings (Settings > General >
-Siri). Audio is Opus, 16 kHz, mono, 20 ms per packet:
+## Connections
+
+- The TV closes an open Companion connection when a new one connects with
+  the same credentials. Share one client with `clone()` instead of
+  connecting again. `AppleTv` and the clients are fast to clone.
+- When a call fails with an error where `Error::is_closed` is true, the
+  connection is closed; connect again.
+- `AppleTv::closed` returns when one of its connections closes. Then close
+  all and connect again, or call `connect_missing`. `connect_missing` also
+  adds a protocol that did not connect (`Error::NotConnected`).
+
+## What is playing
+
+`AppleTv::now_playing` uses the MRP data, with state and position from
+Companion, which change about 0.5 s sooner.
+
+The Apple TV app sends some fields in a separate archive, not in the normal
+metadata fields. `NowPlaying` reads them too: genre and age rating for
+movies and shows, and season, episode number and episode title for shows.
+
+## Siri
+
+Siri must be on in the Apple TV settings (Settings > General > Siri). Audio
+is Opus, 16 kHz, mono, 20 ms per packet:
 
 ```rust
 async fn ask_siri(tv: &ratv::AppleTv, packets: Vec<Vec<u8>>) -> Result<(), ratv::Error> {
@@ -113,24 +138,18 @@ async fn ask_siri(tv: &ratv::AppleTv, packets: Vec<Vec<u8>>) -> Result<(), ratv:
 
 Siri uses Companion, as the iPhone remote does, and MRP if Companion is not
 connected. With feature `opus`, send 16-bit, 16 kHz, mono PCM in chunks of any
-size with `push_pcm` instead.
-`AppleTv` and the clients are fast to clone, and `Siri` can move to another task.
+size with `push_pcm` instead. `Siri` can move to another task.
+
 Over Companion, keep the connection open until Siri has answered, for example
 for 20 s after `finish`. On tvOS 27.2.1, when the connection closed a few
 seconds after `finish`, Siri did not answer. Over MRP this was not tested.
+
 On tvOS 27.2.1, when the TV stopped listening before `finish` (see
 `Siri::ended`), the dimmed Siri layer could stay on the screen after the
 answer, and no remote could navigate in the app for some minutes. Control
 Center still worked. Apple's Siri Remote does the same when it is held too
 long. To avoid it, call `finish` before the TV stops listening. Pressing Siri
 and then Back twice removed the Siri layer.
-
-The TV closes an open Companion connection when a new one connects with the
-same credentials. Share one client with `clone()` instead of connecting again.
-When a call fails with an error where `Error::is_closed` is true, the
-connection is closed; connect again. With `AppleTv`, use `connect_missing`.
-`connect_missing` also adds a protocol that did not connect
-(`Error::NotConnected`).
 
 ## Networks
 
