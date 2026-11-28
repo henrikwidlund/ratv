@@ -1,31 +1,4 @@
 //! One handle for a device: Companion and MRP together.
-//!
-//! [`AppleTv::connect`] opens both protocols in parallel, returns when both
-//! have connected or failed, and keeps the ones that connect.
-//! [`AppleTv::connect_missing`] adds the others later. Each
-//! method uses the protocol that supports it:
-//!
-//! | Feature | Protocol |
-//! |---------|----------|
-//! | buttons | Companion, else MRP |
-//! | play, pause, next, previous, skip, fast forward, rewind | MRP, else Companion |
-//! | seek, stop, shuffle, repeat, speed, rating, like, languages, chapters, queue, artwork, volume state, mute | MRP |
-//! | now playing | MRP, with Companion merged in, else Companion |
-//! | volume | MRP, else Companion |
-//! | power, apps, accounts, text input, swipe, tap | Companion |
-//! | Siri | Companion, else MRP |
-//!
-//! ```no_run
-//! # async fn run(endpoints: ratv::Endpoints, credentials: ratv::Credentials) -> Result<(), ratv::Error> {
-//! use ratv::{AppleTv, ClientOptions, Key};
-//!
-//! let tv = AppleTv::connect(&endpoints, &credentials, &ClientOptions::default()).await?;
-//! tv.press(Key::Select).await?;
-//! tv.pause().await?;
-//! println!("{:?}", tv.now_playing().borrow().title);
-//! # Ok(())
-//! # }
-//! ```
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -256,12 +229,39 @@ impl Scrubs {
 
 /// A connected Apple TV.
 ///
+/// [`AppleTv::connect`] opens both protocols in parallel, returns when both
+/// have connected or failed, and keeps the ones that connect.
+/// [`AppleTv::connect_missing`] adds the others later. Each method uses the
+/// protocol that supports it:
+///
+/// | Feature | Protocol |
+/// |---------|----------|
+/// | buttons | Companion, else MRP |
+/// | play, pause, next, previous, skip, fast forward, rewind | MRP, else Companion |
+/// | seek, stop, shuffle, repeat, speed, rating, like, languages, chapters, queue, artwork, volume state, mute | MRP |
+/// | now playing | MRP, with Companion merged in, else Companion |
+/// | volume | MRP, else Companion |
+/// | power, apps, accounts, text input, swipe, tap | Companion |
+/// | Siri | Companion, else MRP |
+///
 /// Clones share the connections. If one protocol closes, calls that the
 /// other protocol supports use the other one.
 ///
 /// Playback calls check [`NowPlaying::commands`]. If the app does not list a
 /// command, they use another way to do the same, for example a key press.
 /// In the first second after connect, they first wait until the list arrives.
+///
+/// ```no_run
+/// # async fn run(endpoints: ratv::Endpoints, credentials: ratv::Credentials) -> Result<(), ratv::Error> {
+/// use ratv::{AppleTv, ClientOptions, Key};
+///
+/// let tv = AppleTv::connect(&endpoints, &credentials, &ClientOptions::default()).await?;
+/// tv.press(Key::Select).await?;
+/// tv.pause().await?;
+/// println!("{:?}", tv.now_playing().borrow().title);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct AppleTv {
     companion: Option<companion::Client>,
